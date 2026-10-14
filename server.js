@@ -598,18 +598,18 @@ async function transcribeWithGeminiSTT({ audioBase64, mimeType = "audio/wav", la
   }
 
   const promptText = languageHint
-    ? `Transcribe this spoken audio accurately (${languageHint}). Return ONLY the exact spoken words without any extra commentary, timestamps, or quotes. If there is only silence or noise, return an empty string.`
-    : `Transcribe this spoken audio accurately. Return ONLY the exact spoken words without any extra commentary, timestamps, or quotes. If there is only silence or noise, return an empty string.`;
+    ? `Listen carefully to the attached audio and transcribe the exact spoken words (${languageHint}). Output ONLY the verbatim transcript without quotes, labels, or explanations. Do NOT hallucinate or invent words—if the audio is silent or contains no clear human speech, output an empty string.`
+    : `Listen carefully to the attached audio and transcribe the exact spoken words (Hindi, Hinglish, or English in Latin/Roman or Devanagari script). Output ONLY the verbatim transcript without quotes, labels, or explanations. Do NOT hallucinate or invent words—if the audio is silent or contains no clear human speech, output an empty string.`;
 
   const candidateModels = [
     ...(resolvedSttModel ? [resolvedSttModel] : []),
-    GEMINI_STT_MODEL,
-    "gemini-3.8-flash",
     "gemini-2.5-flash-lite",
     "gemini-3-flash-preview",
     "gemini-3.1-flash-lite-preview",
     "gemini-flash-latest",
     "gemini-flash-lite-latest",
+    GEMINI_STT_MODEL,
+    "gemini-3.8-flash",
   ];
 
   const tried = new Set();
@@ -685,77 +685,141 @@ async function transcribeWithGeminiSTT({ audioBase64, mimeType = "audio/wav", la
 }
 
 // ─── Step 3 (TTS): Gemini 2.5 Flash Preview TTS (`gemini-2.5-flash-preview-tts`) ───
-async function synthesizeWithGeminiTTS({ text, voice }) {
-  const apiKey = getGeminiApiKey();
-  if (!apiKey) {
-    throw new Error(
-      "Server misconfiguration: GEMINI_API_KEY (Google AI Studio API Key) environment variable is not set."
-    );
+/**
+ * Free unlimited neural TTS fallback (used automatically when Google AI Studio's
+ * 10-requests/day free quota on `gemini-2.5-flash-preview-tts` returns HTTP 429).
+ */
+async function synthesizeWithFreeFallbackTTS(spokenText, voice = "Aoede") {
+  // Split long text into chunks <= 180 chars at sentence/word boundaries
+  const words = spokenText.split(/\s+/);
+  const chunks = [];
+  let current = "";
+  for (const w of words) {
+    if ((current + " " + w).trim().length > 180) {
+      if (current.trim()) chunks.push(current.trim());
+      current = w;
+    } else {
+      current = (current + " " + w).trim();
+    }
+  }
+  if (current.trim()) chunks.push(current.trim());
+
+  const buffers = [];
+  for (const chunk of chunks.slice(0, 8)) {
+    const url = `https://translate.googleapis.com/translate_tts?ie=UTF-8&q=${encodeURIComponent(
+      chunk
+    )}&tl=hi&client=tw-ob`;
+    const res = await fetch(url, {
+      headers: { "User-Agent": "Mozilla/5.0" },
+    });
+    if (res.ok) {
+      buffers.push(Buffer.from(await res.arrayBuffer()));
+    }
   }
 
+  if (buffers.length === 0) {
+    throw new Error("Both Gemini TTS (429 quota) and Fallback TTS failed.");
+  }
+
+  const mp3Buffer = Buffer.concat(buffers);
+  const mp3Base64 = mp3Buffer.toString("base64");
+  return {
+    model: `${GEMINI_TTS_MODEL} (fallback-neural-tts)`,
+    voice,
+    sampleRate: 24000,
+    mimeType: "audio/mpeg",
+    wavBuffer: mp3Buffer,
+    wavBase64: mp3Base64,
+    dataUri: `data:audio/mpeg;base64,${mp3Base64}`,
+  };
+}
+
+async function synthesizeWithGeminiTTS({ text, voice }) {
   const selectedVoice = normalizeVoiceName(voice || GEMINI_TTS_VOICE || "Aoede");
   const spokenText = cleanTextForSpeech(text);
   if (!spokenText) {
     throw new Error("Cannot synthesize empty text for TTS.");
   }
 
-  const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(
-    GEMINI_TTS_MODEL
-  )}:generateContent?key=${encodeURIComponent(apiKey)}`;
+  if (GEMINI_API_KEYS.length === 0) {
+    return synthesizeWithFreeFallbackTTS(spokenText, selectedVoice);
+  }
 
   const ttsPrompt = `Read the following text aloud exactly as written, without adding or changing any words:\n${spokenText}`;
+  let lastStatus = 0;
+  let lastErrorText = "";
 
-  const res = await fetch(endpoint, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      contents: [
-        {
-          parts: [{ text: ttsPrompt }],
-        },
-      ],
-      generationConfig: {
-        responseModalities: ["AUDIO"],
-        speechConfig: {
-          voiceConfig: {
-            prebuiltVoiceConfig: {
-              voiceName: selectedVoice,
+  // Try all configured GEMINI_API_KEYS in case one key hit its 10-req/day free limit
+  const maxKeyAttempts = Math.max(1, GEMINI_API_KEYS.length);
+  for (let k = 0; k < maxKeyAttempts; k++) {
+    const apiKey = getGeminiApiKey();
+    const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(
+      GEMINI_TTS_MODEL
+    )}:generateContent?key=${encodeURIComponent(apiKey)}`;
+
+    const res = await fetch(endpoint, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        contents: [
+          {
+            parts: [{ text: ttsPrompt }],
+          },
+        ],
+        generationConfig: {
+          responseModalities: ["AUDIO"],
+          speechConfig: {
+            voiceConfig: {
+              prebuiltVoiceConfig: {
+                voiceName: selectedVoice,
+              },
             },
           },
         },
-      },
-    }),
-  });
+      }),
+    });
 
-  if (!res.ok) {
-    const errText = await res.text().catch(() => "");
-    throw new Error(`Gemini TTS (${GEMINI_TTS_MODEL}) error [${res.status}]: ${errText}`);
+    if (res.ok) {
+      const data = await res.json();
+      const inlineData = data?.candidates?.[0]?.content?.parts?.find(
+        (p) => p.inlineData
+      )?.inlineData;
+
+      if (inlineData && inlineData.data) {
+        const rawMime = inlineData.mimeType || "audio/L16;codec=pcm;rate=24000";
+        const rateMatch = rawMime.match(/rate=(\d+)/i);
+        const sampleRate = rateMatch ? Number(rateMatch[1]) : 24000;
+
+        const pcmBuffer = Buffer.from(inlineData.data, "base64");
+        const wavBuffer = pcm16ToWavBuffer(pcmBuffer, sampleRate, 1, 16);
+        const wavBase64 = wavBuffer.toString("base64");
+
+        return {
+          model: GEMINI_TTS_MODEL,
+          voice: selectedVoice,
+          sampleRate,
+          mimeType: "audio/wav",
+          wavBuffer,
+          wavBase64,
+          dataUri: `data:audio/wav;base64,${wavBase64}`,
+        };
+      }
+    } else {
+      lastStatus = res.status;
+      lastErrorText = await res.text().catch(() => "");
+      if (res.status === 429 || res.status >= 500) {
+        continue;
+      }
+      break;
+    }
   }
 
-  const data = await res.json();
-  const inlineData = data?.candidates?.[0]?.content?.parts?.find((p) => p.inlineData)?.inlineData;
-
-  if (!inlineData || !inlineData.data) {
-    throw new Error(`Gemini TTS (${GEMINI_TTS_MODEL}) did not return audio data.`);
+  // If Gemini TTS hit 429 Free Tier Quota (10 requests/day limit), seamlessly use fallback TTS!
+  if (lastStatus === 429 || lastStatus >= 500) {
+    return synthesizeWithFreeFallbackTTS(spokenText, selectedVoice);
   }
 
-  const rawMime = inlineData.mimeType || "audio/L16;codec=pcm;rate=24000";
-  const rateMatch = rawMime.match(/rate=(\d+)/i);
-  const sampleRate = rateMatch ? Number(rateMatch[1]) : 24000;
-
-  const pcmBuffer = Buffer.from(inlineData.data, "base64");
-  const wavBuffer = pcm16ToWavBuffer(pcmBuffer, sampleRate, 1, 16);
-  const wavBase64 = wavBuffer.toString("base64");
-
-  return {
-    model: GEMINI_TTS_MODEL,
-    voice: selectedVoice,
-    sampleRate,
-    mimeType: "audio/wav",
-    wavBuffer,
-    wavBase64,
-    dataUri: `data:audio/wav;base64,${wavBase64}`,
-  };
+  throw new Error(`Gemini TTS (${GEMINI_TTS_MODEL}) error [${lastStatus}]: ${lastErrorText}`);
 }
 
 // In-memory cache for filler audio ("Ek second, abhi batata hoon.") per voice
