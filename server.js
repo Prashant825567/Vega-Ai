@@ -73,7 +73,19 @@ const UPSTREAM_URLS = [
 const DEFAULT_MODEL = process.env.DEFAULT_MODEL || "mimo-v2.6-flash-free";
 const GEMINI_STT_MODEL = process.env.GEMINI_STT_MODEL || "gemini-2.5-flash";
 const GEMINI_TTS_MODEL = process.env.GEMINI_TTS_MODEL || "gemini-2.5-flash-preview-tts";
-const GEMINI_TTS_VOICE = process.env.GEMINI_TTS_VOICE || "Puck"; // Puck, Charon, Kore, Fenrir, Aoede
+
+function normalizeVoiceName(voiceInput) {
+  const raw = String(voiceInput || "Aoede").trim();
+  const lower = raw.toLowerCase();
+  if (lower === "adeode" || lower === "aoede" || lower === "aode") return "Aoede";
+  if (lower === "puck") return "Puck";
+  if (lower === "charon") return "Charon";
+  if (lower === "kore") return "Kore";
+  if (lower === "fenrir") return "Fenrir";
+  return raw.charAt(0).toUpperCase() + raw.slice(1);
+}
+
+const GEMINI_TTS_VOICE = normalizeVoiceName(process.env.GEMINI_TTS_VOICE || "Aoede"); // Default: Aoede
 
 const AI_NAME = process.env.AI_NAME || "Max v1.0";
 const APP_NAME = process.env.APP_NAME || "Vega";

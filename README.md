@@ -24,7 +24,7 @@ No API keys are hardcoded in the code. Add these in Render **Environment Variabl
 | `DEFAULT_MODEL` | `mimo-v2.6-flash-free` |
 | `GEMINI_STT_MODEL` | `gemini-2.5-flash` |
 | `GEMINI_TTS_MODEL` | `gemini-2.5-flash-preview-tts` |
-| `GEMINI_TTS_VOICE` | `Puck` *(or `Charon`, `Kore`, `Fenrir`, `Aoede`)* |
+| `GEMINI_TTS_VOICE` | `Aoede` *(or `Puck`, `Charon`, `Kore`, `Fenrir`)* |
 
 ---
 

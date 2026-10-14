@@ -20,7 +20,7 @@ services:
       - key: GEMINI_TTS_MODEL
         value: gemini-2.5-flash-preview-tts
       - key: GEMINI_TTS_VOICE
-        value: Puck
+        value: Aoede
       - key: OPENCODE_API_KEY
         sync: false
       - key: GEMINI_API_KEY
