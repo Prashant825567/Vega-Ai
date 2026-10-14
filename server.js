@@ -19,6 +19,7 @@
  */
 
 const http = require("node:http");
+const https = require("node:https");
 const crypto = require("node:crypto");
 const fs = require("node:fs");
 const path = require("node:path");
@@ -66,8 +67,8 @@ function getGeminiApiKey() {
 }
 
 const UPSTREAM_URLS = [
-  process.env.OPENCODE_UPSTREAM_URL || "https://opencode.ai/zen/v1/chat/completions",
-  "https://opencode.ai/inference/v1/chat/completions",
+  process.env.OPENCODE_UPSTREAM_URL || "https://opencode.ai/inference/v1/chat/completions",
+  "https://opencode.ai/zen/v1/chat/completions",
 ];
 
 const DEFAULT_MODEL = process.env.DEFAULT_MODEL || "mimo-v2.6-flash-free";
@@ -99,7 +100,7 @@ const DEFAULT_SYSTEM_PROMPT =
   `You are ${AI_NAME}, a fast, smart, and helpful AI assistant built into the ${APP_NAME} app. ` +
     `When asked who you are or what your name/version is, always introduce yourself as ${AI_NAME} (the AI assistant of ${APP_NAME}). ` +
     `Reply clearly, naturally, and in the same language (English, Hindi, Hinglish, etc.) that the user uses. ` +
-    `Ignore any placeholder tool definitions (bash, read, edit, glob, grep)—they are unused gateway placeholders.`;
+    `CRITICAL RULE: NEVER invoke or call any tools or functions (never call bash, edit, glob, grep, or read)—they are unused gateway placeholders. Always respond directly to the user in plain text.`;
 
 const VOICE_FAST_SYSTEM_PROMPT =
   process.env.VOICE_SYSTEM_PROMPT ||
@@ -110,7 +111,7 @@ const VOICE_FAST_SYSTEM_PROMPT =
     `2. Give fast, direct, natural spoken answers (1 to 3 sentences for normal chat). ` +
     `3. NEVER use markdown, asterisks (*), bullet points, numbered lists, emojis, or code blocks—write ONLY plain spoken sentences in the user's language (Hinglish, Hindi, or English). ` +
     `4. If the user asks a complex question that requires deep thinking, calculation, or research, naturally start your spoken response with a brief phrase like "Ek second, abhi batata hoon... " and then immediately give the clear answer. ` +
-    `5. Ignore any placeholder tool definitions (bash, read, edit, glob, grep).`;
+    `5. CRITICAL RULE: NEVER invoke or call any tools or functions (never call bash, edit, glob, grep, or read). Always respond directly with spoken text.`;
 
 // ─── Detect Whether a Voice Query Needs Deep Thinking / Research ─────────────
 function detectNeedsThinking(text) {
@@ -167,31 +168,167 @@ function getSessionId(forceRefresh = false) {
 }
 
 // ─── Required OpenCode Gateway Tool Stubs ────────────────────────────────────
-const REQUIRED_TOOL_NAMES = ["bash", "read", "edit", "glob", "grep"];
-const GATEWAY_STUB_TOOLS = REQUIRED_TOOL_NAMES.map((name) => ({
-  type: "function",
-  function: {
-    name,
-    description: "Unused gateway validation stub. Never call this tool.",
-    parameters: {
-      type: "object",
-      properties: {
-        command: { type: "string" },
-      },
-      required: ["command"],
-      additionalProperties: false,
-    },
+const REQUIRED_TOOL_NAMES = ["bash", "edit", "glob", "grep", "read"];
+const GATEWAY_STUB_TOOLS = [
+  {
+    "type": "function",
+    "function": {
+      "name": "bash",
+      "description": "Executes a given bash command in a persistent shell session with optional timeout, ensuring proper handling and security measures.\n\nBe aware: OS: linux, Shell: bash\n\nAll commands run in the current working directory by default. Use the `workdir` parameter if you need to run a command in a different directory. AVOID using `cd <directory> && <command>` patterns - use `workdir` instead.\n\nUse `/tmp/opencode` for temporary work outside the workspace. This directory has already been created, already exists, and is pre-approved for external directory access.\n\nIMPORTANT: This tool is for terminal operations like git, npm, docker, etc. DO NOT use it for file operations (reading, writing, editing, searching, finding files) - use the specialized tools for this instead.\n\nBefore executing the command, please follow these steps:\n\n1. Directory Verification:\n   - If the command will create new directories or files, first use `ls` to verify the parent directory exists and is the correct location\n   - For example, before running \"mkdir foo/bar\", first use `ls foo` to check that \"foo\" exists and is the intended parent directory\n\n2. Command Execution:\n   - Always quote file paths that contain spaces with double quotes (e.g., rm \"path with spaces/file.txt\")\n   - Examples of proper quoting:\n     - mkdir \"/Users/name/My Documents\" (correct)\n     - mkdir /Users/name/My Documents (incorrect - will fail)\n     - python \"/path/with spaces/script.py\" (correct)\n     - python /path/with spaces/script.py (incorrect - will fail)\n   - After ensuring proper quoting, execute the command.\n   - Capture the output of the command.\n\nUsage notes:\n  - The command argument is required.\n  - You can specify an optional timeout in milliseconds. If not specified, commands will time out after 120000ms.\n  - If the output exceeds 2000 lines or 51200 bytes, it will be truncated and the full output will be written to a file. You can use Read with offset/limit to read specific sections or Grep to search the full content. Do NOT use `head`, `tail`, or other truncation commands to limit output; the full output will already be captured to a file for more precise searching.\n\n  - Avoid using Bash with the `find`, `grep`, `cat`, `head`, `tail`, `sed`, `awk`, or `echo` commands, unless explicitly instructed or when these commands are truly necessary for the task. Instead, always prefer using the dedicated tools for these commands:\n    - File search: Use Glob (NOT find or ls)\n    - Content search: Use Grep (NOT grep or rg)\n    - Read files: Use Read (NOT cat/head/tail)\n    - Edit files: Use Edit (NOT sed/awk)\n    - Write files: Use Write (NOT echo >/cat <<EOF)\n    - Communication: Output text directly (NOT echo/printf)\n  - When issuing multiple commands:\n    - If the commands are independent and can run in parallel, make multiple bash tool calls in a single message. For example, if you need to run \"git status\" and \"git diff\", send a single message with two bash tool calls in parallel.\n    - If the commands depend on each other and must run sequentially, use a single Bash call with '&&' to chain them together (e.g., `git add . && git commit -m \"message\" && git push`). For instance, if one operation must complete before another starts (like mkdir before cp, Write before Bash for git operations, or git add before git commit), run these operations sequentially instead.\n    - Use ';' only when you need to run commands sequentially but don't care if earlier commands fail\n    - DO NOT use newlines to separate commands (newlines are ok in quoted strings)\n  - AVOID using `cd <directory> && <command>`. Use the `workdir` parameter to change directories instead.\n    <good-example>\n    Use workdir=\"/foo/bar\" with command: pytest tests\n    </good-example>\n    <bad-example>\n    cd /foo/bar && pytest tests\n    </bad-example>\n\n# Git and GitHub\n- Only commit, amend, push, or create PRs when explicitly requested.\n- Before committing, inspect `git status`, `git diff`, and `git log --oneline -10`; stage only intended files and never commit secrets.\n- Write a concise commit message that matches the repo style.\n- Do not update git config, skip hooks, use interactive `-i`, force-push, or create empty commits unless explicitly requested.\n- If a commit fails or hooks reject it, fix the issue and create a new commit; do not amend the failed commit.\n- Before creating a PR, inspect status, diff, remote tracking, recent commits, and the diff from the base branch.\n- Review all commits included in the PR, not just the latest commit.\n- Use `gh` for GitHub tasks, including PRs, issues, checks, and releases; return the PR URL when done.\n",
+      "parameters": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "command": {
+            "type": "string",
+            "description": "The command to execute"
+          },
+          "timeout": {
+            "minimum": -9007199254740991,
+            "exclusiveMinimum": 0,
+            "type": "integer",
+            "maximum": 9007199254740991,
+            "description": "Optional timeout in milliseconds"
+          },
+          "workdir": {
+            "type": "string",
+            "description": "The working directory to run the command in. Defaults to the current directory. Use this instead of 'cd' commands."
+          }
+        },
+        "required": [
+          "command"
+        ]
+      }
+    }
   },
-}));
+  {
+    "type": "function",
+    "function": {
+      "name": "edit",
+      "description": "Performs exact string replacements in files. \n\nUsage:\n- You must use your `Read` tool at least once in the conversation before editing. This tool will error if you attempt an edit without reading the file. \n- When editing text from Read tool output, ensure you preserve the exact indentation (tabs/spaces) as it appears AFTER the line number prefix. The line number prefix format is: line number + colon + space (e.g., `1: `). Everything after that space is the actual file content to match. Never include any part of the line number prefix in the oldString or newString.\n- ALWAYS prefer editing existing files in the codebase. NEVER write new files unless explicitly required.\n- Only use emojis if the user explicitly requests it. Avoid adding emojis to files unless asked.\n- The edit will FAIL if `oldString` is not found in the file with an error \"oldString not found in content\".\n- The edit will FAIL if `oldString` is found multiple times in the file with an error \"Found multiple matches for oldString. Provide more surrounding lines in oldString to identify the correct match.\" Either provide a larger string with more surrounding context to make it unique or use `replaceAll` to change every instance of `oldString`. \n- Use `replaceAll` for replacing and renaming strings across the file. This parameter is useful if you want to rename a variable for instance.\n",
+      "parameters": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "filePath": {
+            "type": "string",
+            "description": "The absolute path to the file to modify"
+          },
+          "oldString": {
+            "type": "string",
+            "description": "The text to replace"
+          },
+          "newString": {
+            "type": "string",
+            "description": "The text to replace it with (must be different from oldString)"
+          },
+          "replaceAll": {
+            "type": "boolean",
+            "description": "Replace all occurrences of oldString (default false)"
+          }
+        },
+        "required": [
+          "filePath",
+          "oldString",
+          "newString"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "glob",
+      "description": "- Fast file pattern matching tool that works with any codebase size\n- Supports glob patterns like \"**/*.js\" or \"src/**/*.ts\"\n- Returns matching file paths\n- Use this tool when you need to find files by name patterns\n- When you are doing an open-ended search that may require multiple rounds of globbing and grepping, use the Task tool instead\n- You have the capability to call multiple tools in a single response. It is always better to speculatively perform multiple searches as a batch that are potentially useful.\n",
+      "parameters": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "pattern": {
+            "type": "string",
+            "description": "The glob pattern to match files against"
+          },
+          "path": {
+            "type": "string",
+            "description": "The directory to search in. If not specified, the current working directory will be used. IMPORTANT: Omit this field to use the default directory. DO NOT enter \"undefined\" or \"null\" - simply omit it for the default behavior. Must be a valid directory path if provided."
+          }
+        },
+        "required": [
+          "pattern"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "grep",
+      "description": "- Fast content search tool that works with any codebase size\n- Searches file contents using regular expressions\n- Supports full regex syntax (eg. \"log.*Error\", \"function\\s+\\w+\", etc.)\n- Filter files by pattern with the include parameter (eg. \"*.js\", \"*.{ts,tsx}\")\n- Returns file paths and line numbers with matching lines\n- Use this tool when you need to find files containing specific patterns\n- If you need to identify/count the number of matches within files, use the Bash tool with `rg` (ripgrep) directly. Do NOT use `grep`.\n- When you are doing an open-ended search that may require multiple rounds of globbing and grepping, use the Task tool instead\n",
+      "parameters": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "pattern": {
+            "type": "string",
+            "description": "The regex pattern to search for in file contents"
+          },
+          "path": {
+            "type": "string",
+            "description": "The directory to search in. Defaults to the current working directory."
+          },
+          "include": {
+            "type": "string",
+            "description": "File pattern to include in the search (e.g. \"*.js\", \"*.{ts,tsx}\")"
+          }
+        },
+        "required": [
+          "pattern"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "read",
+      "description": "Read a file or directory from the local filesystem. If the path does not exist, an error is returned.\n\nUsage:\n- The filePath parameter should be an absolute path.\n- By default, this tool returns up to 2000 lines from the start of the file.\n- The offset parameter is the line number to start from (1-indexed).\n- To read later sections, call this tool again with a larger offset.\n- Use the grep tool to find specific content in large files or files with long lines.\n- If you are unsure of the correct file path, use the glob tool to look up filenames by glob pattern.\n- Contents are returned with each line prefixed by its line number as `<line>: <content>`. For example, if a file has contents \"foo\\n\", you will receive \"1: foo\\n\". For directories, entries are returned one per line (without line numbers) with a trailing `/` for subdirectories.\n- Any line longer than 2000 characters is truncated.\n- Call this tool in parallel when you know there are multiple files you want to read.\n- Avoid tiny repeated slices (30 line chunks). If you need more context, read a larger window.\n- This tool can read image files and PDFs and return them as file attachments.\n",
+      "parameters": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "filePath": {
+            "type": "string",
+            "description": "The absolute path to the file or directory to read"
+          },
+          "offset": {
+            "minimum": 0,
+            "type": "integer",
+            "maximum": 9007199254740991,
+            "description": "The line number to start reading from (1-indexed)"
+          },
+          "limit": {
+            "minimum": 0,
+            "type": "integer",
+            "maximum": 9007199254740991,
+            "description": "The maximum number of lines to read (defaults to 2000)"
+          }
+        },
+        "required": [
+          "filePath"
+        ]
+      }
+    }
+  }
+];
 
 function buildOpenCodeHeaders(sessionId) {
   const reqId = generateOpencodeRequestId();
   return {
-    Authorization: `Bearer ${OPENCODE_API_KEY}`,
+    Authorization: `Bearer ${OPENCODE_API_KEY || "public"}`,
     "Content-Type": "application/json",
     "User-Agent": "opencode/1.19.0 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14",
     "x-opencode-client": "cli",
-    "x-opencode-project": "global",
+    "x-opencode-project": "a070fc6ab60b2140452f8e06012ae52a1ed73781",
     "x-opencode-session": sessionId,
     "x-opencode-session-id": sessionId,
     "x-opencode-request": reqId,
@@ -333,15 +470,6 @@ function normalizeMessages(body, defaultSystem = DEFAULT_SYSTEM_PROMPT) {
 
 // ─── Step 2 (LLM): OpenCode Upstream Call (`mimo-v2.6-flash-free`) ──────────
 async function callOpenCodeUpstream(payload) {
-  if (!OPENCODE_API_KEY) {
-    return {
-      ok: false,
-      status: 500,
-      errorText:
-        "Server misconfiguration: OPENCODE_API_KEY environment variable is not set.",
-    };
-  }
-
   const existingTools = Array.isArray(payload.tools) ? payload.tools : [];
   const existingNames = new Set(
     existingTools
@@ -352,7 +480,6 @@ async function callOpenCodeUpstream(payload) {
     (s) => !existingNames.has(s.function.name)
   );
 
-  const userProvidedRealTools = existingTools.length > 0;
   const disableReasoning = payload.disableReasoning === true;
 
   const upstreamBody = {
@@ -360,7 +487,7 @@ async function callOpenCodeUpstream(payload) {
     messages: payload.messages,
     stream: true,
     tools: [...existingTools, ...missingStubs],
-    tool_choice: userProvidedRealTools ? payload.tool_choice || "auto" : "none",
+    tool_choice: payload.tool_choice && payload.tool_choice !== "none" ? payload.tool_choice : "auto",
     ...(disableReasoning
       ? {
           reasoning_effort: "none",
@@ -379,9 +506,13 @@ async function callOpenCodeUpstream(payload) {
 
   const bodyJson = JSON.stringify(upstreamBody);
 
-  for (let attempt = 0; attempt < 2; attempt++) {
+  let lastStatus = 502;
+  let lastErrorText = "";
+
+  for (let attempt = 0; attempt < 3; attempt++) {
     const sessionId = getSessionId(attempt > 0);
-    const upstreamUrl = UPSTREAM_URLS[attempt % UPSTREAM_URLS.length];
+    // Attempt 0 & 1 use primary inference endpoint with cached vs fresh session; attempt 2 tries fallback endpoint
+    const upstreamUrl = attempt < 2 ? UPSTREAM_URLS[0] : UPSTREAM_URLS[1 % UPSTREAM_URLS.length];
 
     const response = await fetch(upstreamUrl, {
       method: "POST",
@@ -393,17 +524,20 @@ async function callOpenCodeUpstream(payload) {
       return { ok: true, response, model: upstreamBody.model, sessionId };
     }
 
-    const errText = await response.text().catch(() => "");
-    if (response.status === 403 && attempt === 0) {
+    lastStatus = response.status;
+    lastErrorText = await response.text().catch(() => "");
+    if (response.status === 403 || response.status >= 500) {
       continue;
     }
 
-    return {
-      ok: false,
-      status: response.status,
-      errorText: errText || `Upstream returned HTTP ${response.status}`,
-    };
+    break;
   }
+
+  return {
+    ok: false,
+    status: lastStatus,
+    errorText: lastErrorText || `Upstream returned HTTP ${lastStatus}`,
+  };
 }
 
 async function collectSSEStream(response, fallbackModel) {
@@ -685,6 +819,265 @@ async function transcribeWithGeminiSTT({ audioBase64, mimeType = "audio/wav", la
 }
 
 // ─── Step 3 (TTS): Gemini 2.5 Flash Preview TTS (`gemini-2.5-flash-preview-tts`) ───
+
+/**
+ * Gemini Live Audio WebSocket TTS (`BidiGenerateContent`) using the same GEMINI_API_KEY
+ * and exact `Aoede` voice (`audio/wav` 24kHz PCM). Used automatically when REST
+ * `gemini-2.5-flash-preview-tts` hits its 10-requests/day free tier quota (HTTP 429).
+ */
+function synthesizeWithGeminiLiveAudio({ spokenText, selectedVoice, apiKey, liveModel = "models/gemini-2.5-flash-native-audio-preview-12-2025" }) {
+  return new Promise((resolve, reject) => {
+    const wsKey = crypto.randomBytes(16).toString("base64");
+    const wsPath = `/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent?key=${encodeURIComponent(apiKey)}`;
+
+    const req = https.request({
+      hostname: "generativelanguage.googleapis.com",
+      port: 443,
+      path: wsPath,
+      method: "GET",
+      headers: {
+        Connection: "Upgrade",
+        Upgrade: "websocket",
+        "Sec-WebSocket-Version": "13",
+        "Sec-WebSocket-Key": wsKey,
+      },
+    });
+
+    const timeout = setTimeout(() => {
+      req.destroy();
+      reject(new Error("Gemini Live Audio WebSocket timed out."));
+    }, 18000);
+
+    function sendWsJson(socket, obj) {
+      const payload = Buffer.from(JSON.stringify(obj), "utf8");
+      const mask = crypto.randomBytes(4);
+      let header;
+      if (payload.length < 126) {
+        header = Buffer.alloc(2);
+        header[0] = 0x81;
+        header[1] = 0x80 | payload.length;
+      } else if (payload.length < 65536) {
+        header = Buffer.alloc(4);
+        header[0] = 0x81;
+        header[1] = 0x80 | 126;
+        header.writeUInt16BE(payload.length, 2);
+      } else {
+        header = Buffer.alloc(10);
+        header[0] = 0x81;
+        header[1] = 0x80 | 127;
+        header.writeBigUInt64BE(BigInt(payload.length), 2);
+      }
+      const masked = Buffer.alloc(payload.length);
+      for (let i = 0; i < payload.length; i++) {
+        masked[i] = payload[i] ^ mask[i & 3];
+      }
+      socket.write(Buffer.concat([header, mask, masked]));
+    }
+
+    req.on("error", (err) => {
+      clearTimeout(timeout);
+      reject(err);
+    });
+
+    req.on("response", (res) => {
+      clearTimeout(timeout);
+      reject(new Error(`Gemini Live WebSocket upgrade rejected: HTTP ${res.statusCode}`));
+    });
+
+    req.on("upgrade", (res, socket, head) => {
+      let buf = head && head.length ? Buffer.from(head) : Buffer.alloc(0);
+      const pcmChunks = [];
+      let setupDone = false;
+      let finished = false;
+      let fragOpcode = 0;
+      let fragChunks = [];
+
+      function finishSuccess() {
+        if (finished) return;
+        finished = true;
+        clearTimeout(timeout);
+        try {
+          socket.end();
+        } catch {}
+        if (pcmChunks.length === 0) {
+          return reject(new Error("Gemini Live Audio returned 0 PCM chunks."));
+        }
+        const pcmBuffer = Buffer.concat(pcmChunks);
+        const wavBuffer = pcm16ToWavBuffer(pcmBuffer, 24000, 1, 16);
+        const wavBase64 = wavBuffer.toString("base64");
+        resolve({
+          model: liveModel.replace(/^models\//, ""),
+          voice: selectedVoice,
+          sampleRate: 24000,
+          mimeType: "audio/wav",
+          wavBuffer,
+          wavBase64,
+          dataUri: `data:audio/wav;base64,${wavBase64}`,
+        });
+      }
+
+      function handleJsonMessage(msg) {
+        if (msg.error) {
+          if (!finished) {
+            finished = true;
+            clearTimeout(timeout);
+            socket.destroy();
+            reject(new Error(`Gemini Live error: ${JSON.stringify(msg.error)}`));
+          }
+          return;
+        }
+        if (msg.setupComplete !== undefined && !setupDone) {
+          setupDone = true;
+          sendWsJson(socket, {
+            clientContent: {
+              turns: [
+                {
+                  role: "user",
+                  parts: [
+                    {
+                      text: `Read the following text aloud verbatim, word for word, without adding or changing any words:\n${spokenText}`,
+                    },
+                  ],
+                },
+              ],
+              turnComplete: true,
+            },
+          });
+          return;
+        }
+        const parts = msg?.serverContent?.modelTurn?.parts;
+        if (Array.isArray(parts)) {
+          for (const p of parts) {
+            if (p?.inlineData?.data) {
+              pcmChunks.push(Buffer.from(p.inlineData.data, "base64"));
+            }
+          }
+        }
+        if (msg?.serverContent?.turnComplete) {
+          finishSuccess();
+        }
+      }
+
+      socket.on("data", (chunk) => {
+        buf = Buffer.concat([buf, chunk]);
+        while (buf.length >= 2) {
+          const b0 = buf[0];
+          const b1 = buf[1];
+          const fin = (b0 & 0x80) !== 0;
+          const opcode = b0 & 0x0f;
+          const isMasked = (b1 & 0x80) !== 0;
+          let len = b1 & 0x7f;
+          let offset = 2;
+          if (len === 126) {
+            if (buf.length < 4) break;
+            len = buf.readUInt16BE(2);
+            offset = 4;
+          } else if (len === 127) {
+            if (buf.length < 10) break;
+            len = Number(buf.readBigUInt64BE(2));
+            offset = 10;
+          }
+          let maskKey = null;
+          if (isMasked) {
+            if (buf.length < offset + 4) break;
+            maskKey = buf.subarray(offset, offset + 4);
+            offset += 4;
+          }
+          if (buf.length < offset + len) break;
+          let payload = buf.subarray(offset, offset + len);
+          buf = buf.subarray(offset + len);
+          if (isMasked && maskKey) {
+            const unmasked = Buffer.alloc(payload.length);
+            for (let i = 0; i < payload.length; i++) {
+              unmasked[i] = payload[i] ^ maskKey[i & 3];
+            }
+            payload = unmasked;
+          }
+
+          if (opcode === 0x08) {
+            // Close frame
+            if (pcmChunks.length > 0) {
+              finishSuccess();
+            } else if (!finished) {
+              finished = true;
+              clearTimeout(timeout);
+              const reason = payload.length > 2 ? payload.subarray(2).toString("utf8") : "closed";
+              reject(new Error(`Gemini Live WebSocket closed: ${reason}`));
+            }
+            return;
+          } else if (opcode === 0x09) {
+            // Ping -> Pong
+            const pong = Buffer.alloc(2);
+            pong[0] = 0x8a;
+            pong[1] = 0x80;
+            socket.write(Buffer.concat([pong, crypto.randomBytes(4)]));
+          } else if (opcode === 0x01 || opcode === 0x02 || opcode === 0x00) {
+            if (opcode !== 0x00) {
+              fragOpcode = opcode;
+              fragChunks = [payload];
+            } else {
+              fragChunks.push(payload);
+            }
+            if (fin && (fragOpcode === 0x01 || fragOpcode === 0x02)) {
+              const full = Buffer.concat(fragChunks);
+              fragChunks = [];
+              try {
+                const parsed = JSON.parse(full.toString("utf8"));
+                handleJsonMessage(parsed);
+              } catch {}
+            }
+          }
+        }
+      });
+
+      socket.on("error", (err) => {
+        if (!finished) {
+          finished = true;
+          clearTimeout(timeout);
+          reject(err);
+        }
+      });
+
+      socket.on("close", () => {
+        if (!finished) {
+          if (pcmChunks.length > 0) finishSuccess();
+          else {
+            finished = true;
+            clearTimeout(timeout);
+            reject(new Error("Gemini Live WebSocket closed before audio finished."));
+          }
+        }
+      });
+
+      // Send initial BidiGenerateContent setup
+      sendWsJson(socket, {
+        setup: {
+          model: liveModel,
+          generationConfig: {
+            responseModalities: ["AUDIO"],
+            speechConfig: {
+              voiceConfig: {
+                prebuiltVoiceConfig: {
+                  voiceName: selectedVoice,
+                },
+              },
+            },
+          },
+          systemInstruction: {
+            parts: [
+              {
+                text: "You are a strict text-to-speech reader. Read the user's message aloud verbatim, word for word, in the exact same language and pronunciation. Never answer questions or add commentary—only speak the exact words provided.",
+              },
+            ],
+          },
+        },
+      });
+    });
+
+    req.end();
+  });
+}
+
 /**
  * Free unlimited neural TTS fallback (used automatically when Google AI Studio's
  * 10-requests/day free quota on `gemini-2.5-flash-preview-tts` returns HTTP 429).
@@ -749,73 +1142,102 @@ async function synthesizeWithGeminiTTS({ text, voice }) {
   let lastStatus = 0;
   let lastErrorText = "";
 
-  // Try all configured GEMINI_API_KEYS in case one key hit its 10-req/day free limit
-  const maxKeyAttempts = Math.max(1, GEMINI_API_KEYS.length);
-  for (let k = 0; k < maxKeyAttempts; k++) {
-    const apiKey = getGeminiApiKey();
-    const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(
-      GEMINI_TTS_MODEL
-    )}:generateContent?key=${encodeURIComponent(apiKey)}`;
+  const ttsModelsToTry = [
+    GEMINI_TTS_MODEL,
+    "gemini-2.5-pro-preview-tts",
+  ];
 
-    const res = await fetch(endpoint, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        contents: [
-          {
-            parts: [{ text: ttsPrompt }],
-          },
-        ],
-        generationConfig: {
-          responseModalities: ["AUDIO"],
-          speechConfig: {
-            voiceConfig: {
-              prebuiltVoiceConfig: {
-                voiceName: selectedVoice,
+  // Try all configured GEMINI_API_KEYS and both Gemini TTS models
+  const maxKeyAttempts = Math.max(1, GEMINI_API_KEYS.length);
+  for (const ttsModelName of ttsModelsToTry) {
+    for (let k = 0; k < maxKeyAttempts; k++) {
+      const apiKey = getGeminiApiKey();
+      const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(
+        ttsModelName
+      )}:generateContent?key=${encodeURIComponent(apiKey)}`;
+
+      const res = await fetch(endpoint, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          contents: [
+            {
+              parts: [{ text: ttsPrompt }],
+            },
+          ],
+          generationConfig: {
+            responseModalities: ["AUDIO"],
+            speechConfig: {
+              voiceConfig: {
+                prebuiltVoiceConfig: {
+                  voiceName: selectedVoice,
+                },
               },
             },
           },
-        },
-      }),
-    });
+        }),
+      });
 
-    if (res.ok) {
-      const data = await res.json();
-      const inlineData = data?.candidates?.[0]?.content?.parts?.find(
-        (p) => p.inlineData
-      )?.inlineData;
+      if (res.ok) {
+        const data = await res.json();
+        const inlineData = data?.candidates?.[0]?.content?.parts?.find(
+          (p) => p.inlineData
+        )?.inlineData;
 
-      if (inlineData && inlineData.data) {
-        const rawMime = inlineData.mimeType || "audio/L16;codec=pcm;rate=24000";
-        const rateMatch = rawMime.match(/rate=(\d+)/i);
-        const sampleRate = rateMatch ? Number(rateMatch[1]) : 24000;
+        if (inlineData && inlineData.data) {
+          const rawMime = inlineData.mimeType || "audio/L16;codec=pcm;rate=24000";
+          const rateMatch = rawMime.match(/rate=(\d+)/i);
+          const sampleRate = rateMatch ? Number(rateMatch[1]) : 24000;
 
-        const pcmBuffer = Buffer.from(inlineData.data, "base64");
-        const wavBuffer = pcm16ToWavBuffer(pcmBuffer, sampleRate, 1, 16);
-        const wavBase64 = wavBuffer.toString("base64");
+          const pcmBuffer = Buffer.from(inlineData.data, "base64");
+          const wavBuffer = pcm16ToWavBuffer(pcmBuffer, sampleRate, 1, 16);
+          const wavBase64 = wavBuffer.toString("base64");
 
-        return {
-          model: GEMINI_TTS_MODEL,
-          voice: selectedVoice,
-          sampleRate,
-          mimeType: "audio/wav",
-          wavBuffer,
-          wavBase64,
-          dataUri: `data:audio/wav;base64,${wavBase64}`,
-        };
+          return {
+            model: ttsModelName,
+            voice: selectedVoice,
+            sampleRate,
+            mimeType: "audio/wav",
+            wavBuffer,
+            wavBase64,
+            dataUri: `data:audio/wav;base64,${wavBase64}`,
+          };
+        }
+      } else {
+        lastStatus = res.status;
+        lastErrorText = await res.text().catch(() => "");
+        if (res.status === 429 || res.status >= 500) {
+          continue;
+        }
+        break;
       }
-    } else {
-      lastStatus = res.status;
-      lastErrorText = await res.text().catch(() => "");
-      if (res.status === 429 || res.status >= 500) {
-        continue;
-      }
-      break;
     }
   }
 
-  // If Gemini TTS hit 429 Free Tier Quota (10 requests/day limit), seamlessly use fallback TTS!
+  // If REST Gemini TTS hit 429 Free Tier Quota (10 requests/day limit), try Gemini Live Audio (Aoede WAV) on the same API key!
   if (lastStatus === 429 || lastStatus >= 500) {
+    const liveModels = [
+      "models/gemini-2.5-flash-native-audio-preview-12-2025",
+      "models/gemini-3.1-flash-live-preview",
+    ];
+    for (const liveModel of liveModels) {
+      for (let k = 0; k < maxKeyAttempts; k++) {
+        try {
+          const apiKey = getGeminiApiKey();
+          const liveResult = await synthesizeWithGeminiLiveAudio({
+            spokenText,
+            selectedVoice,
+            apiKey,
+            liveModel,
+          });
+          if (liveResult && liveResult.wavBase64) {
+            return liveResult;
+          }
+        } catch {
+          // Continue to next live model or fallback
+        }
+      }
+    }
     return synthesizeWithFreeFallbackTTS(spokenText, selectedVoice);
   }
 
@@ -829,7 +1251,10 @@ const fillerAudioCache = new Map();
 async function getFillerAudio(voice = GEMINI_TTS_VOICE, customFillerText = DEFAULT_FILLER_TEXT) {
   const key = `${voice}::${customFillerText}`;
   if (fillerAudioCache.has(key)) {
-    return fillerAudioCache.get(key);
+    const existing = fillerAudioCache.get(key);
+    if (existing && existing.mimeType === "audio/wav") {
+      return existing;
+    }
   }
   const tts = await synthesizeWithGeminiTTS({
     text: customFillerText,
@@ -843,7 +1268,9 @@ async function getFillerAudio(voice = GEMINI_TTS_VOICE, customFillerText = DEFAU
     base64: tts.wavBase64,
     dataUri: tts.dataUri,
   };
-  fillerAudioCache.set(key, cached);
+  if (cached.mimeType === "audio/wav") {
+    fillerAudioCache.set(key, cached);
+  }
   return cached;
 }
 
