@@ -72,18 +72,154 @@ const UPSTREAM_URLS = [
 ];
 
 const DEFAULT_MODEL = process.env.DEFAULT_MODEL || "mimo-v2.6-flash-free";
-const GEMINI_STT_MODEL = process.env.GEMINI_STT_MODEL || "gemini-2.5-flash";
-const GEMINI_TTS_MODEL = process.env.GEMINI_TTS_MODEL || "gemini-2.5-flash-preview-tts";
+const GEMINI_STT_MODEL = process.env.GEMINI_STT_MODEL || "gemini-3.1-flash-lite-preview";
+
+// Always use Gemini Live Native Audio (`gemini-2.5-flash-native-audio-preview-12-2025`) directly for TTS,
+// even if an older env var still says `gemini-2.5-flash-preview-tts`.
+const rawTtsEnv = (process.env.GEMINI_TTS_MODEL || "").trim();
+const GEMINI_TTS_MODEL =
+  !rawTtsEnv || rawTtsEnv === "gemini-2.5-flash-preview-tts"
+    ? "gemini-2.5-flash-native-audio-preview-12-2025"
+    : rawTtsEnv;
+
+// ─── Smooth & Beautiful Female Voices Catalog (Gemini Live Native Audio) ─────
+const SMOOTH_FEMALE_VOICES = [
+  {
+    id: "Aoede",
+    name: "Aoede (Default)",
+    gender: "female",
+    style: "Ultra-smooth, warm, melodic & natural female voice (Best for Hinglish/Hindi/English)",
+    isDefault: true,
+  },
+  {
+    id: "Kore",
+    name: "Kore",
+    gender: "female",
+    style: "Soft, calm, soothing & crystal-clear female voice",
+    isDefault: false,
+  },
+  {
+    id: "Leda",
+    name: "Leda",
+    gender: "female",
+    style: "Sweet, bright, youthful & expressive female voice",
+    isDefault: false,
+  },
+  {
+    id: "Zephyr",
+    name: "Zephyr",
+    gender: "female",
+    style: "Airy, gentle, smooth & friendly conversational female voice",
+    isDefault: false,
+  },
+  {
+    id: "Callirrhoe",
+    name: "Callirrhoe",
+    gender: "female",
+    style: "Rich, graceful, pleasant & velvety smooth female voice",
+    isDefault: false,
+  },
+  {
+    id: "Despina",
+    name: "Despina",
+    gender: "female",
+    style: "Sweet, lively, warm & engaging female voice",
+    isDefault: false,
+  },
+  {
+    id: "Autonoe",
+    name: "Autonoe",
+    gender: "female",
+    style: "Polite, articulate, warm & soothing female voice",
+    isDefault: false,
+  },
+  {
+    id: "Erinome",
+    name: "Erinome",
+    gender: "female",
+    style: "Serene, smooth, soft & relaxing female voice",
+    isDefault: false,
+  },
+  {
+    id: "Laomedeia",
+    name: "Laomedeia",
+    gender: "female",
+    style: "Natural, expressive & charming female voice",
+    isDefault: false,
+  },
+  {
+    id: "Pulcherrima",
+    name: "Pulcherrima",
+    gender: "female",
+    style: "Melodic, refined, soft & beautiful female voice",
+    isDefault: false,
+  },
+  {
+    id: "Sulafat",
+    name: "Sulafat",
+    gender: "female",
+    style: "Warm, friendly, smooth & comforting female voice",
+    isDefault: false,
+  },
+  {
+    id: "Vindemiatrix",
+    name: "Vindemiatrix",
+    gender: "female",
+    style: "Calm, gentle & composed female voice",
+    isDefault: false,
+  },
+];
 
 function normalizeVoiceName(voiceInput) {
   const raw = String(voiceInput || "Aoede").trim();
   const lower = raw.toLowerCase();
-  if (lower === "adeode" || lower === "aoede" || lower === "aode") return "Aoede";
+
+  // Default & Aoede aliases
+  if (
+    !lower ||
+    lower === "adeode" ||
+    lower === "aoede" ||
+    lower === "aode" ||
+    lower === "aodeo" ||
+    lower === "default" ||
+    lower === "female" ||
+    lower === "female1" ||
+    lower === "female-1" ||
+    lower === "smooth"
+  ) {
+    return "Aoede";
+  }
+
+  // Other smooth beautiful female voices + friendly aliases
+  if (lower === "kore" || lower === "female2" || lower === "female-2" || lower === "soothing" || lower === "calm") {
+    return "Kore";
+  }
+  if (lower === "leda" || lower === "female3" || lower === "female-3" || lower === "sweet" || lower === "cute") {
+    return "Leda";
+  }
+  if (lower === "zephyr" || lower === "female4" || lower === "female-4" || lower === "gentle" || lower === "airy") {
+    return "Zephyr";
+  }
+  if (lower === "callirrhoe" || lower === "female5" || lower === "female-5" || lower === "beautiful" || lower === "graceful") {
+    return "Callirrhoe";
+  }
+  if (lower === "despina" || lower === "female6" || lower === "female-6" || lower === "lively") {
+    return "Despina";
+  }
+  if (lower === "autonoe") return "Autonoe";
+  if (lower === "erinome") return "Erinome";
+  if (lower === "laomedeia") return "Laomedeia";
+  if (lower === "pulcherrima") return "Pulcherrima";
+  if (lower === "sulafat") return "Sulafat";
+  if (lower === "vindemiatrix") return "Vindemiatrix";
+
+  // Optional male voices if ever explicitly requested
   if (lower === "puck") return "Puck";
   if (lower === "charon") return "Charon";
-  if (lower === "kore") return "Kore";
   if (lower === "fenrir") return "Fenrir";
-  return raw.charAt(0).toUpperCase() + raw.slice(1);
+  if (lower === "orus") return "Orus";
+
+  return raw.charAt(0).toUpperCase() + raw.slice(1).toLowerCase();
 }
 
 const GEMINI_TTS_VOICE = normalizeVoiceName(process.env.GEMINI_TTS_VOICE || "Aoede"); // Default: Aoede
@@ -818,17 +954,25 @@ async function transcribeWithGeminiSTT({ audioBase64, mimeType = "audio/wav", la
   throw new Error(lastError || "Gemini STT failed");
 }
 
-// ─── Step 3 (TTS): Gemini 2.5 Flash Preview TTS (`gemini-2.5-flash-preview-tts`) ───
+// ─── Step 3 (TTS): Direct Gemini Live Native Audio (`gemini-2.5-flash-native-audio-preview-12-2025`) ───
 
 /**
- * Gemini Live Audio WebSocket TTS (`BidiGenerateContent`) using the same GEMINI_API_KEY
- * and exact `Aoede` voice (`audio/wav` 24kHz PCM). Used automatically when REST
- * `gemini-2.5-flash-preview-tts` hits its 10-requests/day free tier quota (HTTP 429).
+ * Direct Gemini Live Native Audio WebSocket TTS (`BidiGenerateContent`) using `GEMINI_API_KEY`.
+ * Default voice is `Aoede` (plus 11 other smooth, beautiful female voices).
+ * Outputs 24kHz 16-bit PCM wrapped as playable `audio/wav` (`data:audio/wav;base64,UklGR...`).
  */
-function synthesizeWithGeminiLiveAudio({ spokenText, selectedVoice, apiKey, liveModel = "models/gemini-2.5-flash-native-audio-preview-12-2025" }) {
+function synthesizeWithGeminiLiveAudio({
+  spokenText,
+  selectedVoice,
+  apiKey,
+  liveModel = "models/gemini-2.5-flash-native-audio-preview-12-2025",
+}) {
   return new Promise((resolve, reject) => {
+    const fullModel = liveModel.startsWith("models/") ? liveModel : `models/${liveModel}`;
     const wsKey = crypto.randomBytes(16).toString("base64");
-    const wsPath = `/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent?key=${encodeURIComponent(apiKey)}`;
+    const wsPath = `/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent?key=${encodeURIComponent(
+      apiKey
+    )}`;
 
     const req = https.request({
       hostname: "generativelanguage.googleapis.com",
@@ -845,8 +989,8 @@ function synthesizeWithGeminiLiveAudio({ spokenText, selectedVoice, apiKey, live
 
     const timeout = setTimeout(() => {
       req.destroy();
-      reject(new Error("Gemini Live Audio WebSocket timed out."));
-    }, 18000);
+      reject(new Error(`Gemini Live Audio (${fullModel}) WebSocket timed out.`));
+    }, 20000);
 
     function sendWsJson(socket, obj) {
       const payload = Buffer.from(JSON.stringify(obj), "utf8");
@@ -897,16 +1041,19 @@ function synthesizeWithGeminiLiveAudio({ spokenText, selectedVoice, apiKey, live
         finished = true;
         clearTimeout(timeout);
         try {
+          // Send clean masked WebSocket Close frame (0x88)
+          const closeFrame = Buffer.from([0x88, 0x80, 0, 0, 0, 0]);
+          socket.write(closeFrame);
           socket.end();
         } catch {}
         if (pcmChunks.length === 0) {
-          return reject(new Error("Gemini Live Audio returned 0 PCM chunks."));
+          return reject(new Error(`Gemini Live Audio (${fullModel}) returned 0 PCM chunks.`));
         }
         const pcmBuffer = Buffer.concat(pcmChunks);
         const wavBuffer = pcm16ToWavBuffer(pcmBuffer, 24000, 1, 16);
         const wavBase64 = wavBuffer.toString("base64");
         resolve({
-          model: liveModel.replace(/^models\//, ""),
+          model: fullModel.replace(/^models\//, ""),
           voice: selectedVoice,
           sampleRate: 24000,
           mimeType: "audio/wav",
@@ -922,7 +1069,7 @@ function synthesizeWithGeminiLiveAudio({ spokenText, selectedVoice, apiKey, live
             finished = true;
             clearTimeout(timeout);
             socket.destroy();
-            reject(new Error(`Gemini Live error: ${JSON.stringify(msg.error)}`));
+            reject(new Error(`Gemini Live (${fullModel}) error: ${JSON.stringify(msg.error)}`));
           }
           return;
         }
@@ -935,7 +1082,7 @@ function synthesizeWithGeminiLiveAudio({ spokenText, selectedVoice, apiKey, live
                   role: "user",
                   parts: [
                     {
-                      text: `Read the following text aloud verbatim, word for word, without adding or changing any words:\n${spokenText}`,
+                      text: `Please read the following text aloud verbatim, word for word, in a smooth, sweet, warm, and natural voice without adding or changing any words:\n${spokenText}`,
                     },
                   ],
                 },
@@ -995,18 +1142,16 @@ function synthesizeWithGeminiLiveAudio({ spokenText, selectedVoice, apiKey, live
           }
 
           if (opcode === 0x08) {
-            // Close frame
             if (pcmChunks.length > 0) {
               finishSuccess();
             } else if (!finished) {
               finished = true;
               clearTimeout(timeout);
               const reason = payload.length > 2 ? payload.subarray(2).toString("utf8") : "closed";
-              reject(new Error(`Gemini Live WebSocket closed: ${reason}`));
+              reject(new Error(`Gemini Live (${fullModel}) WebSocket closed: ${reason}`));
             }
             return;
           } else if (opcode === 0x09) {
-            // Ping -> Pong
             const pong = Buffer.alloc(2);
             pong[0] = 0x8a;
             pong[1] = 0x80;
@@ -1044,15 +1189,15 @@ function synthesizeWithGeminiLiveAudio({ spokenText, selectedVoice, apiKey, live
           else {
             finished = true;
             clearTimeout(timeout);
-            reject(new Error("Gemini Live WebSocket closed before audio finished."));
+            reject(new Error(`Gemini Live (${fullModel}) WebSocket closed before audio finished.`));
           }
         }
       });
 
-      // Send initial BidiGenerateContent setup
+      // Send initial BidiGenerateContent setup with smooth female voice persona & zero thinking delay
       sendWsJson(socket, {
         setup: {
-          model: liveModel,
+          model: fullModel,
           generationConfig: {
             responseModalities: ["AUDIO"],
             speechConfig: {
@@ -1066,7 +1211,11 @@ function synthesizeWithGeminiLiveAudio({ spokenText, selectedVoice, apiKey, live
           systemInstruction: {
             parts: [
               {
-                text: "You are a strict text-to-speech reader. Read the user's message aloud verbatim, word for word, in the exact same language and pronunciation. Never answer questions or add commentary—only speak the exact words provided.",
+                text:
+                  "You are a professional, ultra-smooth, sweet, warm, and natural female voice artist. " +
+                  "Speak with a soft, melodious, expressive, and crystal-clear human tone. " +
+                  "Read the user's provided text aloud verbatim, word for word, in the exact same language (Hinglish, Hindi, or English) with natural Indian flow and gentle warmth. " +
+                  "Never answer questions, never add extra commentary, and never skip words—only speak the exact words provided in a beautiful, soothing voice.",
               },
             ],
           },
@@ -1078,170 +1227,56 @@ function synthesizeWithGeminiLiveAudio({ spokenText, selectedVoice, apiKey, live
   });
 }
 
-/**
- * Free unlimited neural TTS fallback (used automatically when Google AI Studio's
- * 10-requests/day free quota on `gemini-2.5-flash-preview-tts` returns HTTP 429).
- */
-async function synthesizeWithFreeFallbackTTS(spokenText, voice = "Aoede") {
-  // Split long text into chunks <= 180 chars at sentence/word boundaries
-  const words = spokenText.split(/\s+/);
-  const chunks = [];
-  let current = "";
-  for (const w of words) {
-    if ((current + " " + w).trim().length > 180) {
-      if (current.trim()) chunks.push(current.trim());
-      current = w;
-    } else {
-      current = (current + " " + w).trim();
-    }
-  }
-  if (current.trim()) chunks.push(current.trim());
-
-  const buffers = [];
-  for (const chunk of chunks.slice(0, 8)) {
-    const url = `https://translate.googleapis.com/translate_tts?ie=UTF-8&q=${encodeURIComponent(
-      chunk
-    )}&tl=hi&client=tw-ob`;
-    const res = await fetch(url, {
-      headers: { "User-Agent": "Mozilla/5.0" },
-    });
-    if (res.ok) {
-      buffers.push(Buffer.from(await res.arrayBuffer()));
-    }
-  }
-
-  if (buffers.length === 0) {
-    throw new Error("Both Gemini TTS (429 quota) and Fallback TTS failed.");
-  }
-
-  const mp3Buffer = Buffer.concat(buffers);
-  const mp3Base64 = mp3Buffer.toString("base64");
-  return {
-    model: `${GEMINI_TTS_MODEL} (fallback-neural-tts)`,
-    voice,
-    sampleRate: 24000,
-    mimeType: "audio/mpeg",
-    wavBuffer: mp3Buffer,
-    wavBase64: mp3Base64,
-    dataUri: `data:audio/mpeg;base64,${mp3Base64}`,
-  };
-}
-
 async function synthesizeWithGeminiTTS({ text, voice }) {
+  if (GEMINI_API_KEYS.length === 0) {
+    throw new Error(
+      "Server misconfiguration: GEMINI_API_KEY (Google AI Studio API Key) environment variable is not set."
+    );
+  }
+
   const selectedVoice = normalizeVoiceName(voice || GEMINI_TTS_VOICE || "Aoede");
   const spokenText = cleanTextForSpeech(text);
   if (!spokenText) {
     throw new Error("Cannot synthesize empty text for TTS.");
   }
 
-  if (GEMINI_API_KEYS.length === 0) {
-    return synthesizeWithFreeFallbackTTS(spokenText, selectedVoice);
-  }
-
-  const ttsPrompt = `Read the following text aloud exactly as written, without adding or changing any words:\n${spokenText}`;
-  let lastStatus = 0;
-  let lastErrorText = "";
-
-  const ttsModelsToTry = [
+  const liveModelsToTry = [
     GEMINI_TTS_MODEL,
-    "gemini-2.5-pro-preview-tts",
+    "models/gemini-2.5-flash-native-audio-preview-12-2025",
+    "models/gemini-2.5-flash-native-audio-latest",
+    "models/gemini-3.1-flash-live-preview",
   ];
 
-  // Try all configured GEMINI_API_KEYS and both Gemini TTS models
+  const triedModels = new Set();
   const maxKeyAttempts = Math.max(1, GEMINI_API_KEYS.length);
-  for (const ttsModelName of ttsModelsToTry) {
+  let lastErr = null;
+
+  for (const rawModel of liveModelsToTry) {
+    const cleanModel = rawModel.replace(/^models\//, "");
+    if (!cleanModel || triedModels.has(cleanModel)) continue;
+    triedModels.add(cleanModel);
+
     for (let k = 0; k < maxKeyAttempts; k++) {
-      const apiKey = getGeminiApiKey();
-      const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(
-        ttsModelName
-      )}:generateContent?key=${encodeURIComponent(apiKey)}`;
-
-      const res = await fetch(endpoint, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          contents: [
-            {
-              parts: [{ text: ttsPrompt }],
-            },
-          ],
-          generationConfig: {
-            responseModalities: ["AUDIO"],
-            speechConfig: {
-              voiceConfig: {
-                prebuiltVoiceConfig: {
-                  voiceName: selectedVoice,
-                },
-              },
-            },
-          },
-        }),
-      });
-
-      if (res.ok) {
-        const data = await res.json();
-        const inlineData = data?.candidates?.[0]?.content?.parts?.find(
-          (p) => p.inlineData
-        )?.inlineData;
-
-        if (inlineData && inlineData.data) {
-          const rawMime = inlineData.mimeType || "audio/L16;codec=pcm;rate=24000";
-          const rateMatch = rawMime.match(/rate=(\d+)/i);
-          const sampleRate = rateMatch ? Number(rateMatch[1]) : 24000;
-
-          const pcmBuffer = Buffer.from(inlineData.data, "base64");
-          const wavBuffer = pcm16ToWavBuffer(pcmBuffer, sampleRate, 1, 16);
-          const wavBase64 = wavBuffer.toString("base64");
-
-          return {
-            model: ttsModelName,
-            voice: selectedVoice,
-            sampleRate,
-            mimeType: "audio/wav",
-            wavBuffer,
-            wavBase64,
-            dataUri: `data:audio/wav;base64,${wavBase64}`,
-          };
+      try {
+        const apiKey = getGeminiApiKey();
+        const result = await synthesizeWithGeminiLiveAudio({
+          spokenText,
+          selectedVoice,
+          apiKey,
+          liveModel: `models/${cleanModel}`,
+        });
+        if (result && result.wavBase64) {
+          return result;
         }
-      } else {
-        lastStatus = res.status;
-        lastErrorText = await res.text().catch(() => "");
-        if (res.status === 429 || res.status >= 500) {
-          continue;
-        }
-        break;
+      } catch (err) {
+        lastErr = err;
       }
     }
   }
 
-  // If REST Gemini TTS hit 429 Free Tier Quota (10 requests/day limit), try Gemini Live Audio (Aoede WAV) on the same API key!
-  if (lastStatus === 429 || lastStatus >= 500) {
-    const liveModels = [
-      "models/gemini-2.5-flash-native-audio-preview-12-2025",
-      "models/gemini-3.1-flash-live-preview",
-    ];
-    for (const liveModel of liveModels) {
-      for (let k = 0; k < maxKeyAttempts; k++) {
-        try {
-          const apiKey = getGeminiApiKey();
-          const liveResult = await synthesizeWithGeminiLiveAudio({
-            spokenText,
-            selectedVoice,
-            apiKey,
-            liveModel,
-          });
-          if (liveResult && liveResult.wavBase64) {
-            return liveResult;
-          }
-        } catch {
-          // Continue to next live model or fallback
-        }
-      }
-    }
-    return synthesizeWithFreeFallbackTTS(spokenText, selectedVoice);
-  }
-
-  throw new Error(`Gemini TTS (${GEMINI_TTS_MODEL}) error [${lastStatus}]: ${lastErrorText}`);
+  throw new Error(
+    lastErr?.message || `Gemini Live Native Audio TTS (${GEMINI_TTS_MODEL}) failed.`
+  );
 }
 
 // In-memory cache for filler audio ("Ek second, abhi batata hoon.") per voice
@@ -1352,6 +1387,7 @@ const server = http.createServer(async (req, res) => {
         tts: GEMINI_TTS_MODEL,
         ttsDefaultVoice: GEMINI_TTS_VOICE,
       },
+      availableFemaleVoices: SMOOTH_FEMALE_VOICES,
       voiceAgentConfig: {
         fastNoReasoningByDefault: true,
         smartFillerEnabled: true,
@@ -1366,12 +1402,25 @@ const server = http.createServer(async (req, res) => {
         visionChat: "POST /api/vision",
         voiceAgent: "POST /api/voice",
         voiceFillerAudio: "GET /api/voice/filler",
+        voicesCatalog: "GET /api/voices",
         speechToText: "POST /api/stt",
         textToSpeech: "POST /api/tts",
         openAICompatible: "POST /v1/chat/completions",
         models: "GET /v1/models",
         health: "GET /api/health",
       },
+    });
+  }
+
+  // 1b. Smooth Female Voices Catalog Endpoint: GET /api/voices
+  if (req.method === "GET" && (pathname === "/api/voices" || pathname === "/voices")) {
+    return sendJson(res, 200, {
+      success: true,
+      ai: AI_NAME,
+      app: APP_NAME,
+      ttsModel: GEMINI_TTS_MODEL,
+      defaultVoice: GEMINI_TTS_VOICE,
+      voices: SMOOTH_FEMALE_VOICES,
     });
   }
 
@@ -1542,7 +1591,7 @@ const server = http.createServer(async (req, res) => {
     }
 
     const wantsStream = body.stream === true;
-    const selectedVoice = (body.voice || GEMINI_TTS_VOICE || "Puck").trim();
+    const selectedVoice = normalizeVoiceName(body.voice || GEMINI_TTS_VOICE || "Aoede");
 
     try {
       // Step 1: Speech-to-Text (`gemini-2.5-flash`)
