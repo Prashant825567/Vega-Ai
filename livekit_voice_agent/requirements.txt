@@ -1,0 +1,14 @@
+# LiveKit Agents Core + Silero VAD + OpenAI Plugin + Google Gemini Plugin
+livekit-agents[silero,openai,google]>=1.4.0,<2.0.0
+livekit-api>=1.0.0
+
+# FastAPI Server for Expo React Native Room Token & /health Endpoints
+fastapi>=0.115.0
+uvicorn[standard]>=0.32.0
+pydantic>=2.9.0
+python-dotenv>=1.0.1
+
+# Low-latency HTTP/2 & WebSocket streaming clients for Gemini 3.1 STT, MiMo 2.6 LLM, and Gemini 2.5 Native Audio TTS
+httpx[http2]>=0.27.2
+websockets>=13.1
+loguru>=0.7.2
