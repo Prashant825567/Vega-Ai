@@ -1933,18 +1933,19 @@ async function synthesizeWithGeminiTTS({ text, voice }) {
     throw new Error("Cannot synthesize empty text for TTS.");
   }
 
-  // 1. Try Pipecat-style pre-warmed WebSocket session first (0ms handshake/setup latency!)
+  // 1. Try Pipecat-style pre-warmed WebSocket session first (if created < 3.5s ago during LLM turn)
   const warm = warmSessionPool.get(selectedVoice);
-  if (warm && Date.now() - warm.createdAt < 45000) {
+  if (warm && Date.now() - warm.createdAt < 3500) {
     try {
       const warmRes = await warm.speak(spokenText);
       if (warmRes && warmRes.wavBase64) {
-        setTimeout(() => prewarmGeminiLiveForVoice(selectedVoice), 50);
         return warmRes;
       }
     } catch {
       // Fallback to fresh session below
     }
+  } else if (warm) {
+    warmSessionPool.delete(selectedVoice);
   }
 
   const liveModelsToTry = [
@@ -1973,7 +1974,6 @@ async function synthesizeWithGeminiTTS({ text, voice }) {
           liveModel: `models/${cleanModel}`,
         });
         if (result && result.wavBase64) {
-          setTimeout(() => prewarmGeminiLiveForVoice(selectedVoice), 50);
           return result;
         }
       } catch (err) {
@@ -2303,13 +2303,6 @@ const server = http.createServer(async (req, res) => {
     const wantsStream = body.stream === true;
     const selectedVoice = normalizeVoiceName(body.voice || GEMINI_TTS_VOICE || "Aoede");
 
-    // Pipecat-Style Parallel Pipeline Optimization:
-    // Pre-warm the Gemini Live Native Audio WebSocket (TLS + WS upgrade + setupComplete)
-    // in parallel while STT and Middle LLM (`mimo-v2.6-flash-free`) are running!
-    if (body.tts !== false) {
-      prewarmGeminiLiveForVoice(selectedVoice);
-    }
-
     try {
       // Step 1: Speech-to-Text (`gemini-2.5-flash`)
       let userTranscript = (body.text ?? body.message ?? "").trim();
@@ -2342,6 +2335,12 @@ const server = http.createServer(async (req, res) => {
         typeof body.thinking === "boolean"
           ? body.thinking
           : detectNeedsThinking(userTranscript);
+
+      // Pipecat-Style Parallel Pre-Warming:
+      // Open Gemini Live WebSocket in parallel right when the fast LLM turn starts!
+      if (!needsThinking && body.tts !== false) {
+        prewarmGeminiLiveForVoice(selectedVoice);
+      }
 
       // By default in voice mode: disable reasoning for ultra-fast response!
       // Only enable reasoning if the user explicitly asked for deep thinking (`body.reasoning === true`).
