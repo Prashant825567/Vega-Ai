@@ -1,0 +1,22 @@
+{
+  "name": "vega-max-v1-backend",
+  "version": "1.0.0",
+  "description": "Max v1.0 AI Backend Server for Vega App (Powered by OpenCode mimo-v2.6-flash-free, Render-ready)",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "keywords": [
+    "vega",
+    "max-v1.0",
+    "opencode",
+    "mimo-v2.6-flash-free",
+    "ai-backend",
+    "render"
+  ],
+  "license": "MIT"
+}

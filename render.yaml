@@ -1,0 +1,27 @@
+services:
+  - type: web
+    name: vega-max-v1-backend
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /api/health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: AI_NAME
+        value: Max v1.0
+      - key: APP_NAME
+        value: Vega
+      - key: DEFAULT_MODEL
+        value: mimo-v2.6-flash-free
+      - key: GEMINI_STT_MODEL
+        value: gemini-2.5-flash
+      - key: GEMINI_TTS_MODEL
+        value: gemini-2.5-flash-preview-tts
+      - key: GEMINI_TTS_VOICE
+        value: Puck
+      - key: OPENCODE_API_KEY
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false
