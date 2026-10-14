@@ -63,5 +63,36 @@ const { filler } = await res.json();
 // filler.dataUri -> "data:audio/wav;base64,..." (Cached in memory on server for 0ms response!)
 ```
 
-### 3. Streaming Voice Mode (`POST /api/voice` with `"stream": true`)
+### 3. Normal Agent: Text-to-Text & Image + Text-to-Text (`POST /api/chat`)
+
+#### A. Text-to-Text (`POST /api/chat`)
+```javascript
+const response = await fetch("https://YOUR-RENDER-URL.onrender.com/api/chat", {
+  method: "POST",
+  headers: { "Content-Type": "application/json" },
+  body: JSON.stringify({
+    message: "Hello Max, kaise ho?",
+    history: []
+  })
+});
+const data = await response.json();
+console.log(data.reply);
+```
+
+#### B. Image + Text-to-Text / Vision (`POST /api/chat` or `POST /api/vision`)
+```javascript
+const response = await fetch("https://YOUR-RENDER-URL.onrender.com/api/chat", {
+  method: "POST",
+  headers: { "Content-Type": "application/json" },
+  body: JSON.stringify({
+    message: "Is image mein kya hai?",
+    image: base64OrDataUriOrImageUrl, // Base64 string, "data:image/jpeg;base64,...", or "https://..."
+    mimeType: "image/jpeg"            // Optional (auto-detected for PNG/JPEG/WEBP/GIF)
+  })
+});
+const data = await response.json();
+console.log(data.reply);
+```
+
+### 4. Streaming Voice Mode (`POST /api/voice` with `"stream": true`)
 Emits Server-Sent Events (`event: transcript`, `event: filler` with instant WAV audio if `needsThinking` is true, and `event: response` with the final WAV audio).

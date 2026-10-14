@@ -203,21 +203,105 @@ function resolveModel(requestedModel) {
   return requestedModel.replace(/^opencode\//i, "");
 }
 
+function toImageDataUri(imgInput, fallbackMime = "image/jpeg") {
+  if (!imgInput || typeof imgInput !== "string") return null;
+  const trimmed = imgInput.trim();
+  if (!trimmed) return null;
+  if (
+    trimmed.startsWith("data:image/") ||
+    trimmed.startsWith("http://") ||
+    trimmed.startsWith("https://")
+  ) {
+    return trimmed;
+  }
+  // Auto-detect common base64 image signatures (PNG, JPEG, GIF, WEBP)
+  let mime = fallbackMime || "image/jpeg";
+  if (trimmed.startsWith("iVBORw0KGgo")) mime = "image/png";
+  else if (trimmed.startsWith("/9j/")) mime = "image/jpeg";
+  else if (trimmed.startsWith("R0lGOD")) mime = "image/gif";
+  else if (trimmed.startsWith("UklGR")) mime = "image/webp";
+
+  return `data:${mime};base64,${trimmed.replace(/\s+/g, "")}`;
+}
+
+function buildMultimodalContent(text, imageInputs, fallbackMime = "image/jpeg") {
+  const parts = [];
+  if (typeof text === "string" && text.trim()) {
+    parts.push({ type: "text", text: text.trim() });
+  } else {
+    parts.push({ type: "text", text: "Describe or answer based on this image." });
+  }
+
+  for (const img of imageInputs) {
+    const url = toImageDataUri(
+      typeof img === "object" && img !== null ? img.url || img.data || img.base64 : img,
+      (typeof img === "object" && img?.mimeType) || fallbackMime
+    );
+    if (url) {
+      parts.push({
+        type: "image_url",
+        image_url: { url },
+      });
+    }
+  }
+  return parts;
+}
+
 function normalizeMessages(body, defaultSystem = DEFAULT_SYSTEM_PROMPT) {
   let messages = [];
 
   if (Array.isArray(body.messages) && body.messages.length > 0) {
-    messages = [...body.messages];
+    messages = body.messages.map((m) => {
+      if (!m || typeof m !== "object") return m;
+      const msgImages = [
+        ...(m.image ? [m.image] : []),
+        ...(Array.isArray(m.images) ? m.images : []),
+      ];
+      if (msgImages.length > 0 && typeof m.content === "string") {
+        return {
+          role: m.role || "user",
+          content: buildMultimodalContent(m.content, msgImages, m.mimeType || body.mimeType),
+        };
+      }
+      return m;
+    });
   } else {
     if (Array.isArray(body.history)) {
       for (const item of body.history) {
         if (item && item.role && item.content) {
-          messages.push({ role: item.role, content: String(item.content) });
+          const histImages = [
+            ...(item.image ? [item.image] : []),
+            ...(Array.isArray(item.images) ? item.images : []),
+          ];
+          messages.push({
+            role: item.role,
+            content:
+              histImages.length > 0
+                ? buildMultimodalContent(String(item.content), histImages, item.mimeType)
+                : String(item.content),
+          });
         }
       }
     }
-    const userText = body.message ?? body.prompt ?? body.text ?? body.query;
-    if (typeof userText === "string" && userText.trim()) {
+
+    const userText = body.message ?? body.prompt ?? body.text ?? body.query ?? "";
+    const topImages = [
+      ...(body.image ? [body.image] : []),
+      ...(body.imageUrl ? [body.imageUrl] : []),
+      ...(body.imageBase64 ? [body.imageBase64] : []),
+      ...(Array.isArray(body.images) ? body.images : []),
+    ];
+
+    if (topImages.length > 0) {
+      messages.push({
+        role: "user",
+        content: buildMultimodalContent(
+          typeof userText === "string" ? userText : "",
+          topImages,
+          body.mimeType || "image/jpeg"
+        ),
+      });
+    } else if (typeof userText === "string" && userText.trim()) {
       messages.push({ role: "user", content: userText.trim() });
     }
   }
@@ -665,11 +749,12 @@ const server = http.createServer(async (req, res) => {
         GEMINI_API_KEY: GEMINI_API_KEYS.length > 0,
       },
       endpoints: {
+        textAndImageChat: "POST /api/chat",
+        visionChat: "POST /api/vision",
         voiceAgent: "POST /api/voice",
         voiceFillerAudio: "GET /api/voice/filler",
         speechToText: "POST /api/stt",
         textToSpeech: "POST /api/tts",
-        textChat: "POST /api/chat",
         openAICompatible: "POST /v1/chat/completions",
         models: "GET /v1/models",
         health: "GET /api/health",
@@ -1021,8 +1106,14 @@ const server = http.createServer(async (req, res) => {
     }
   }
 
-  // 7. Simple Vega App Text Chat Endpoint: POST /api/chat
-  if (req.method === "POST" && (pathname === "/api/chat" || pathname === "/chat")) {
+  // 7. Vega App Normal Agent (Text-to-Text AND Image + Text-to-Text): POST /api/chat (or /api/vision)
+  if (
+    req.method === "POST" &&
+    (pathname === "/api/chat" ||
+      pathname === "/chat" ||
+      pathname === "/api/vision" ||
+      pathname === "/vision")
+  ) {
     let body;
     try {
       body = await readJsonBody(req);
