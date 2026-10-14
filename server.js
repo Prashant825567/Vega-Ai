@@ -603,9 +603,9 @@ async function transcribeWithGeminiSTT({ audioBase64, mimeType = "audio/wav", la
 
   const candidateModels = [
     ...(resolvedSttModel ? [resolvedSttModel] : []),
-    "gemini-2.5-flash-lite",
-    "gemini-3-flash-preview",
     "gemini-3.1-flash-lite-preview",
+    "gemini-3-flash-preview",
+    "gemini-2.5-flash-lite",
     "gemini-flash-latest",
     "gemini-flash-lite-latest",
     GEMINI_STT_MODEL,
