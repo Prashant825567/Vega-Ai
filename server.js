@@ -1159,6 +1159,8 @@ function cleanTextForSpeech(text) {
     .replace(/\*\*([^*]+)\*\*/g, "$1")
     .replace(/\*([^*]+)\*/g, "$1")
     .replace(/^#+\s+/gm, "")
+    .replace(/~/g, "")
+    .replace(/\s*[–—]\s*/g, " to ")
     .replace(/\s+/g, " ")
     .trim();
 }
@@ -1346,10 +1348,15 @@ function synthesizeWithGeminiLiveAudio({
       },
     });
 
+    let finishSuccessRef = null;
     const timeout = setTimeout(() => {
+      if (typeof finishSuccessRef === "function") {
+        finishSuccessRef();
+        return;
+      }
       req.destroy();
       reject(new Error(`Gemini Live Audio (${fullModel}) WebSocket timed out.`));
-    }, 20000);
+    }, 15000);
 
     function sendWsJson(socket, obj) {
       const payload = Buffer.from(JSON.stringify(obj), "utf8");
@@ -1394,13 +1401,14 @@ function synthesizeWithGeminiLiveAudio({
       let finished = false;
       let fragOpcode = 0;
       let fragChunks = [];
+      let chunkIdleTimer = null;
 
       function finishSuccess() {
         if (finished) return;
         finished = true;
         clearTimeout(timeout);
+        if (chunkIdleTimer) clearTimeout(chunkIdleTimer);
         try {
-          // Send clean masked WebSocket Close frame (0x88)
           const closeFrame = Buffer.from([0x88, 0x80, 0, 0, 0, 0]);
           socket.write(closeFrame);
           socket.end();
@@ -1421,12 +1429,23 @@ function synthesizeWithGeminiLiveAudio({
           dataUri: `data:audio/wav;base64,${wavBase64}`,
         });
       }
+      finishSuccessRef = () => {
+        if (pcmChunks.length > 0) finishSuccess();
+        else {
+          req.destroy();
+          reject(new Error(`Gemini Live Audio (${fullModel}) WebSocket timed out.`));
+        }
+      };
 
       function handleJsonMessage(msg) {
         if (msg.error) {
           if (!finished) {
+            if (pcmChunks.length > 0) {
+              return finishSuccess();
+            }
             finished = true;
             clearTimeout(timeout);
+            if (chunkIdleTimer) clearTimeout(chunkIdleTimer);
             socket.destroy();
             reject(new Error(`Gemini Live (${fullModel}) error: ${JSON.stringify(msg.error)}`));
           }
@@ -1456,10 +1475,14 @@ function synthesizeWithGeminiLiveAudio({
           for (const p of parts) {
             if (p?.inlineData?.data) {
               pcmChunks.push(Buffer.from(p.inlineData.data, "base64"));
+              if (chunkIdleTimer) clearTimeout(chunkIdleTimer);
+              chunkIdleTimer = setTimeout(() => {
+                if (pcmChunks.length > 0) finishSuccess();
+              }, 900);
             }
           }
         }
-        if (msg?.serverContent?.turnComplete) {
+        if (msg?.serverContent?.turnComplete && pcmChunks.length > 0) {
           finishSuccess();
         }
       }
@@ -2026,11 +2049,7 @@ const server = http.createServer(async (req, res) => {
       }
 
       // Step 2: Middle LLM (`mimo-v2.6-flash-free` via OpenCode as Max v1.0 + Built-in OpenCode Web Search)
-      let fillerPromise =
-        !wantsStream && needsThinking && body.tts !== false
-          ? getFillerAudio(selectedVoice, body.fillerText || DEFAULT_FILLER_TEXT).catch(() => null)
-          : null;
-
+      const fillerCacheKey = `${selectedVoice}::${body.fillerText || DEFAULT_FILLER_TEXT}`;
       const llmMessages = normalizeMessages(
         {
           history: body.history,
@@ -2069,11 +2088,6 @@ const server = http.createServer(async (req, res) => {
               type: "websearch",
               queries,
             });
-          } else if (!fillerPromise && body.tts !== false) {
-            fillerPromise = getFillerAudio(
-              selectedVoice,
-              body.fillerText || DEFAULT_FILLER_TEXT
-            ).catch(() => null);
           }
         }
       );
@@ -2120,7 +2134,7 @@ const server = http.createServer(async (req, res) => {
         };
       }
 
-      const fillerAudio = fillerPromise ? await fillerPromise : null;
+      const fillerAudio = fillerAudioCache.get(fillerCacheKey) || null;
 
       const finalPayload = {
         success: true,
