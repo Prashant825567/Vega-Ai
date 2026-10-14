@@ -461,20 +461,37 @@ async function collectSSEStream(response, fallbackModel) {
 }
 
 // ─── Audio / WAV Helpers for Gemini STT & TTS ────────────────────────────────
+function normalizeAudioMimeType(rawMime, fallback = "audio/wav") {
+  const clean = String(rawMime || fallback)
+    .split(";")[0]
+    .trim()
+    .toLowerCase();
+  if (!clean || !clean.includes("/")) return fallback;
+  return clean;
+}
+
 function parseBase64AudioInput(audioInput, fallbackMimeType = "audio/wav") {
   if (!audioInput || typeof audioInput !== "string") {
     throw new Error("Missing or invalid 'audio' base64 string in request body.");
   }
   const trimmed = audioInput.trim();
-  const match = trimmed.match(/^data:([^;]+)(?:;[^,]*)?,base64,(.+)$/i);
-  if (match) {
-    return {
-      mimeType: match[1].trim(),
-      base64Data: match[2].replace(/\s+/g, ""),
-    };
+
+  // Handle any Data URI: e.g. "data:audio/webm;codecs=opus;base64,GkXfo..." or "data:audio/wav;base64,UklGR..."
+  if (trimmed.startsWith("data:")) {
+    const commaIdx = trimmed.indexOf(",");
+    if (commaIdx !== -1) {
+      const header = trimmed.slice(5, commaIdx); // e.g. "audio/webm;codecs=opus;base64"
+      const dataPart = trimmed.slice(commaIdx + 1);
+      const mimeType = normalizeAudioMimeType(header, fallbackMimeType);
+      return {
+        mimeType,
+        base64Data: dataPart.replace(/\s+/g, ""),
+      };
+    }
   }
+
   return {
-    mimeType: fallbackMimeType,
+    mimeType: normalizeAudioMimeType(fallbackMimeType, "audio/wav"),
     base64Data: trimmed.replace(/\s+/g, ""),
   };
 }
@@ -584,16 +601,24 @@ async function transcribeWithGeminiSTT({ audioBase64, mimeType = "audio/wav", la
     ? `Transcribe this spoken audio accurately (${languageHint}). Return ONLY the exact spoken words without any extra commentary, timestamps, or quotes. If there is only silence or noise, return an empty string.`
     : `Transcribe this spoken audio accurately. Return ONLY the exact spoken words without any extra commentary, timestamps, or quotes. If there is only silence or noise, return an empty string.`;
 
-  const candidateModels = resolvedSttModel
-    ? [resolvedSttModel, GEMINI_STT_MODEL, "gemini-3.8-flash", "gemini-2.5-flash-lite", "gemini-flash-latest"]
-    : [GEMINI_STT_MODEL, "gemini-3.8-flash", "gemini-2.5-flash-lite", "gemini-flash-latest"];
+  const candidateModels = [
+    ...(resolvedSttModel ? [resolvedSttModel] : []),
+    GEMINI_STT_MODEL,
+    "gemini-3.8-flash",
+    "gemini-2.5-flash-lite",
+    "gemini-3-flash-preview",
+    "gemini-3.1-flash-lite-preview",
+    "gemini-flash-latest",
+    "gemini-flash-lite-latest",
+  ];
 
   const tried = new Set();
   let lastError = "";
+  const cleanMimeType = normalizeAudioMimeType(mimeType, "audio/wav");
 
   for (let i = 0; i < candidateModels.length; i++) {
     let modelName = candidateModels[i];
-    if (tried.has(modelName)) continue;
+    if (!modelName || tried.has(modelName)) continue;
     tried.add(modelName);
 
     const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(
@@ -610,7 +635,7 @@ async function transcribeWithGeminiSTT({ audioBase64, mimeType = "audio/wav", la
             parts: [
               {
                 inlineData: {
-                  mimeType,
+                  mimeType: cleanMimeType,
                   data: audioBase64,
                 },
               },
@@ -642,11 +667,13 @@ async function transcribeWithGeminiSTT({ audioBase64, mimeType = "audio/wav", la
     const errText = await res.text().catch(() => "");
     lastError = `Gemini STT (${modelName}) error [${res.status}]: ${errText}`;
 
-    // If 404 (e.g., gemini-2.5-flash deprecated for new users in Oct 2026), discover active Flash model
-    if (res.status === 404) {
-      const discovered = await resolveWorkingGeminiSttModel(apiKey);
-      if (discovered && !tried.has(discovered)) {
-        candidateModels.splice(i + 1, 0, discovered);
+    // Retry with next Flash model on 404 (not found), 429 (rate limit), or 503/500 (high demand)
+    if (res.status === 404 || res.status === 429 || res.status >= 500) {
+      if (res.status === 404) {
+        const discovered = await resolveWorkingGeminiSttModel(apiKey);
+        if (discovered && !tried.has(discovered)) {
+          candidateModels.splice(i + 1, 0, discovered);
+        }
       }
       continue;
     }
