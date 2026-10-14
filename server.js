@@ -517,7 +517,61 @@ function cleanTextForSpeech(text) {
     .trim();
 }
 
-// ─── Step 1 (STT): Gemini 2.5 Flash Speech-to-Text (`gemini-2.5-flash`) ──────
+// ─── Step 1 (STT): Gemini Speech-to-Text (with automatic model fallback) ─────
+let resolvedSttModel = null;
+
+async function resolveWorkingGeminiSttModel(apiKey) {
+  if (resolvedSttModel) return resolvedSttModel;
+  try {
+    const listUrl = `https://generativelanguage.googleapis.com/v1beta/models?key=${encodeURIComponent(
+      apiKey
+    )}`;
+    const res = await fetch(listUrl);
+    if (res.ok) {
+      const data = await res.json();
+      const models = (data.models || [])
+        .filter(
+          (m) =>
+            Array.isArray(m.supportedGenerationMethods) &&
+            m.supportedGenerationMethods.includes("generateContent")
+        )
+        .map((m) => String(m.name || "").replace(/^models\//, ""))
+        .filter(
+          (name) =>
+            name.startsWith("gemini-") &&
+            !name.includes("tts") &&
+            !name.includes("image") &&
+            !name.includes("embedding") &&
+            !name.includes("veo") &&
+            !name.includes("imagen")
+        );
+
+      const preferredOrder = [
+        "gemini-3.8-flash",
+        "gemini-2.5-flash-lite",
+        "gemini-3-flash-preview",
+        "gemini-3.1-flash-lite-preview",
+        "gemini-flash-latest",
+        "gemini-flash-lite-latest",
+      ];
+      for (const pref of preferredOrder) {
+        if (models.includes(pref)) {
+          resolvedSttModel = pref;
+          return resolvedSttModel;
+        }
+      }
+      const anyFlash = models.find((n) => n.includes("flash"));
+      if (anyFlash) {
+        resolvedSttModel = anyFlash;
+        return resolvedSttModel;
+      }
+    }
+  } catch {
+    // Ignore model listing errors
+  }
+  return "gemini-3.8-flash";
+}
+
 async function transcribeWithGeminiSTT({ audioBase64, mimeType = "audio/wav", languageHint = "" }) {
   const apiKey = getGeminiApiKey();
   if (!apiKey) {
@@ -526,54 +580,81 @@ async function transcribeWithGeminiSTT({ audioBase64, mimeType = "audio/wav", la
     );
   }
 
-  const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(
-    GEMINI_STT_MODEL
-  )}:generateContent?key=${encodeURIComponent(apiKey)}`;
-
   const promptText = languageHint
     ? `Transcribe this spoken audio accurately (${languageHint}). Return ONLY the exact spoken words without any extra commentary, timestamps, or quotes. If there is only silence or noise, return an empty string.`
     : `Transcribe this spoken audio accurately. Return ONLY the exact spoken words without any extra commentary, timestamps, or quotes. If there is only silence or noise, return an empty string.`;
 
-  const res = await fetch(endpoint, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      contents: [
-        {
-          role: "user",
-          parts: [
-            {
-              inlineData: {
-                mimeType,
-                data: audioBase64,
-              },
-            },
-            { text: promptText },
-          ],
-        },
-      ],
-      generationConfig: {
-        temperature: 0.1,
-      },
-    }),
-  });
+  const candidateModels = resolvedSttModel
+    ? [resolvedSttModel, GEMINI_STT_MODEL, "gemini-3.8-flash", "gemini-2.5-flash-lite", "gemini-flash-latest"]
+    : [GEMINI_STT_MODEL, "gemini-3.8-flash", "gemini-2.5-flash-lite", "gemini-flash-latest"];
 
-  if (!res.ok) {
+  const tried = new Set();
+  let lastError = "";
+
+  for (let i = 0; i < candidateModels.length; i++) {
+    let modelName = candidateModels[i];
+    if (tried.has(modelName)) continue;
+    tried.add(modelName);
+
+    const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(
+      modelName
+    )}:generateContent?key=${encodeURIComponent(apiKey)}`;
+
+    const res = await fetch(endpoint, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        contents: [
+          {
+            role: "user",
+            parts: [
+              {
+                inlineData: {
+                  mimeType,
+                  data: audioBase64,
+                },
+              },
+              { text: promptText },
+            ],
+          },
+        ],
+        generationConfig: {
+          temperature: 0.1,
+        },
+      }),
+    });
+
+    if (res.ok) {
+      resolvedSttModel = modelName;
+      const data = await res.json();
+      const transcript = (
+        data?.candidates?.[0]?.content?.parts
+          ?.map((p) => p.text || "")
+          .join(" ") || ""
+      ).trim();
+
+      return {
+        model: modelName,
+        transcript,
+      };
+    }
+
     const errText = await res.text().catch(() => "");
-    throw new Error(`Gemini STT (${GEMINI_STT_MODEL}) error [${res.status}]: ${errText}`);
+    lastError = `Gemini STT (${modelName}) error [${res.status}]: ${errText}`;
+
+    // If 404 (e.g., gemini-2.5-flash deprecated for new users in Oct 2026), discover active Flash model
+    if (res.status === 404) {
+      const discovered = await resolveWorkingGeminiSttModel(apiKey);
+      if (discovered && !tried.has(discovered)) {
+        candidateModels.splice(i + 1, 0, discovered);
+      }
+      continue;
+    }
+
+    break;
   }
 
-  const data = await res.json();
-  const transcript = (
-    data?.candidates?.[0]?.content?.parts
-      ?.map((p) => p.text || "")
-      .join(" ") || ""
-  ).trim();
-
-  return {
-    model: GEMINI_STT_MODEL,
-    transcript,
-  };
+  throw new Error(lastError || "Gemini STT failed");
 }
 
 // ─── Step 3 (TTS): Gemini 2.5 Flash Preview TTS (`gemini-2.5-flash-preview-tts`) ───
@@ -585,7 +666,7 @@ async function synthesizeWithGeminiTTS({ text, voice }) {
     );
   }
 
-  const selectedVoice = (voice || GEMINI_TTS_VOICE || "Puck").trim();
+  const selectedVoice = normalizeVoiceName(voice || GEMINI_TTS_VOICE || "Aoede");
   const spokenText = cleanTextForSpeech(text);
   if (!spokenText) {
     throw new Error("Cannot synthesize empty text for TTS.");
@@ -595,13 +676,15 @@ async function synthesizeWithGeminiTTS({ text, voice }) {
     GEMINI_TTS_MODEL
   )}:generateContent?key=${encodeURIComponent(apiKey)}`;
 
+  const ttsPrompt = `Read the following text aloud exactly as written, without adding or changing any words:\n${spokenText}`;
+
   const res = await fetch(endpoint, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       contents: [
         {
-          parts: [{ text: spokenText }],
+          parts: [{ text: ttsPrompt }],
         },
       ],
       generationConfig: {
