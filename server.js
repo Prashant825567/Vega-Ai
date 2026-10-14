@@ -236,26 +236,29 @@ const DEFAULT_SYSTEM_PROMPT =
   `You are ${AI_NAME}, a fast, smart, and helpful AI assistant built into the ${APP_NAME} app. ` +
     `When asked who you are or what your name/version is, always introduce yourself as ${AI_NAME} (the AI assistant of ${APP_NAME}). ` +
     `Reply clearly, naturally, and in the same language (English, Hindi, Hinglish, etc.) that the user uses. ` +
-    `CRITICAL RULE: NEVER invoke or call any tools or functions (never call bash, edit, glob, grep, or read)—they are unused gateway placeholders. Always respond directly to the user in plain text.`;
+    `WEB SEARCH RULE: You have real-time internet access via the 'websearch' and 'webfetch' tools. Whenever the user asks about current events, latest news, live prices/rates (crypto, stocks, gold), weather, sports scores, recent releases, or asks you to search/check something online, call the 'websearch' tool first and answer using the live results. ` +
+    `CRITICAL RULE: NEVER invoke or call local shell/file tools (bash, edit, glob, grep, or read)—they are unused gateway placeholders.`;
 
 const VOICE_FAST_SYSTEM_PROMPT =
   process.env.VOICE_SYSTEM_PROMPT ||
   `You are ${AI_NAME}, the real-time voice AI agent inside the ${APP_NAME} app. ` +
     `When asked who you are, always say you are ${AI_NAME}, the voice AI of ${APP_NAME}. ` +
-    `IMPORTANT VOICE RULES: ` +
+    `IMPORTANT VOICE & WEB SEARCH RULES: ` +
     `1. Your reply will be converted directly into speech via TTS and played in the ${APP_NAME} app. ` +
     `2. Give fast, direct, natural spoken answers (1 to 3 sentences for normal chat). ` +
     `3. NEVER use markdown, asterisks (*), bullet points, numbered lists, emojis, or code blocks—write ONLY plain spoken sentences in the user's language (Hinglish, Hindi, or English). ` +
-    `4. If the user asks a complex question that requires deep thinking, calculation, or research, naturally start your spoken response with a brief phrase like "Ek second, abhi batata hoon... " and then immediately give the clear answer. ` +
-    `5. CRITICAL RULE: NEVER invoke or call any tools or functions (never call bash, edit, glob, grep, or read). Always respond directly with spoken text.`;
+    `4. You have real-time internet access via the 'websearch' and 'webfetch' tools! Whenever the user asks about live/current news, prices, weather, scores, facts, or says "search karke batao" / "pata karke batao", call the 'websearch' tool first. ` +
+    `5. Whenever you use 'websearch' or answer a complex question that requires research/thinking, ALWAYS start your spoken response with "Ek second, abhi batata hoon... " and then immediately give the clear spoken answer. ` +
+    `6. CRITICAL RULE: NEVER invoke or call local shell/file tools (bash, edit, glob, grep, or read).`;
 
-// ─── Detect Whether a Voice Query Needs Deep Thinking / Research ─────────────
+// ─── Detect Whether a Voice Query Needs Deep Thinking / Web Search ───────────
 function detectNeedsThinking(text) {
   const q = String(text || "").toLowerCase().trim();
   if (!q) return false;
   const thinkingPatterns = [
     /\b(research|analyze|analyse|compare|calculate|solve|explain in detail|deep dive|step by step|history of|difference between|write code|algorithm|debug)\b/i,
-    /\b(soch ke|soch kar|check karke|pata karke|research karke|detail me|detail mein|vistar se|samjhao|hisab laga|solve kar)\b/i,
+    /\b(search|web search|google|latest|current|today|news|price|rate|weather|score|live|update|2025|2026)\b/i,
+    /\b(soch ke|soch kar|check karke|pata karke|research karke|search karke|nikal ke|dhundh ke|detail me|detail mein|vistar se|samjhao|hisab laga|solve kar|aaj ka|abhi ka)\b/i,
   ];
   if (q.length > 140) return true;
   return thinkingPatterns.some((re) => re.test(q));
@@ -454,8 +457,218 @@ const GATEWAY_STUB_TOOLS = [
         ]
       }
     }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "webfetch",
+      "description": "- Fetches content from a specified URL\n- Takes a URL and optional format as input\n- Fetches the URL content, converts to requested format (markdown by default)\n- Returns the content in the specified format\n- Use this tool when you need to retrieve and analyze web content\n\nUsage notes:\n  - IMPORTANT: if another tool is present that offers better web fetching capabilities, is more targeted to the task, or has fewer restrictions, prefer using that tool instead of this one.\n  - The URL must be a fully-formed valid URL\n  - HTTP URLs will be automatically upgraded to HTTPS\n  - Format options: \"markdown\" (default), \"text\", or \"html\"\n  - This tool is read-only and does not modify any files\n  - Results may be summarized if the content is very large\n",
+      "parameters": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "url": {
+            "type": "string",
+            "description": "The URL to fetch content from"
+          },
+          "format": {
+            "type": "string",
+            "enum": ["text", "markdown", "html"],
+            "description": "The format to return the content in (text, markdown, or html). Defaults to markdown.",
+            "default": "markdown"
+          },
+          "timeout": {
+            "type": "number",
+            "description": "Optional timeout in seconds (max 120)"
+          }
+        },
+        "required": ["url"]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "websearch",
+      "description": "- Search the web using the session's web search provider - performs real-time web searches and can scrape content from specific URLs\n- Provides up-to-date information for current events and recent data\n- Supports configurable result counts and returns the content from the most relevant websites\n- Use this tool for accessing information beyond knowledge cutoff\n- Searches are performed automatically within a single API call\n\nUsage notes:\n  - Supports live crawling modes when available: 'fallback' (backup if cached unavailable) or 'preferred' (prioritize live crawling)\n  - Search types when available: 'auto' (balanced), 'fast' (quick results), 'deep' (comprehensive search)\n  - Configurable context length for optimal LLM integration\n  - Domain filtering and advanced search options available\n\nThe current year is 2026. You MUST use this year when searching for recent information or current events\n- Example: If the current year is 2026 and the user asks for \"latest AI news\", search for \"AI news 2026\", NOT \"AI news 2025\"\n",
+      "parameters": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string",
+            "description": "Websearch query"
+          },
+          "numResults": {
+            "type": "number",
+            "description": "Number of search results to return (default: 8)"
+          },
+          "livecrawl": {
+            "type": "string",
+            "enum": ["fallback", "preferred"],
+            "description": "Live crawl mode - 'fallback': use live crawling as backup if cached content unavailable, 'preferred': prioritize live crawling (default: 'fallback')"
+          },
+          "type": {
+            "type": "string",
+            "enum": ["auto", "fast", "deep"],
+            "description": "Search type - 'auto': balanced search (default), 'fast': quick results, 'deep': comprehensive search"
+          },
+          "contextMaxCharacters": {
+            "type": "number",
+            "description": "Maximum characters for context string optimized for LLMs (default: 10000)"
+          }
+        },
+        "required": ["query"]
+      }
+    }
   }
 ];
+
+// ─── OpenCode Native Web Search (`websearch` & `webfetch`) Implementation ────
+function parseMcpWebSearchResponse(rawText) {
+  if (!rawText || typeof rawText !== "string") return "";
+  const trimmed = rawText.trim();
+
+  function extractFromJsonStr(str) {
+    try {
+      const parsed = JSON.parse(str);
+      const textItem = parsed?.result?.content?.find((c) => typeof c?.text === "string");
+      if (textItem && textItem.text && !parsed?.result?._meta?.["ai.exa/rateLimited"]) {
+        return textItem.text;
+      }
+    } catch {}
+    return "";
+  }
+
+  if (trimmed.startsWith("{")) {
+    const direct = extractFromJsonStr(trimmed);
+    if (direct) return direct;
+  }
+
+  for (const line of trimmed.split(/\r?\n/)) {
+    if (line.startsWith("data: ")) {
+      const fromSse = extractFromJsonStr(line.slice(6).trim());
+      if (fromSse) return fromSse;
+    }
+  }
+  return "";
+}
+
+async function executeOpenCodeWebSearch(args = {}, sessionId = getSessionId()) {
+  const query = String(args.query || args.objective || "").trim();
+  if (!query) return "No search query provided.";
+
+  // 1. Primary OpenCode Web Search Provider: Parallel MCP (`https://search.parallel.ai/mcp`)
+  try {
+    const parHeaders = {
+      "Content-Type": "application/json",
+      Accept: "application/json, text/event-stream",
+      "User-Agent": "opencode/1.19.0",
+    };
+    if (process.env.PARALLEL_API_KEY) {
+      parHeaders.Authorization = `Bearer ${process.env.PARALLEL_API_KEY}`;
+    }
+
+    const parRes = await fetch("https://search.parallel.ai/mcp", {
+      method: "POST",
+      headers: parHeaders,
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "tools/call",
+        params: {
+          name: "web_search",
+          arguments: {
+            objective: query,
+            search_queries: [query],
+            session_id: sessionId,
+            model_name: DEFAULT_MODEL,
+          },
+        },
+      }),
+    });
+
+    if (parRes.ok) {
+      const raw = await parRes.text();
+      const parsedText = parseMcpWebSearchResponse(raw);
+      if (parsedText) {
+        return parsedText.slice(0, args.contextMaxCharacters || 14000);
+      }
+    }
+  } catch {
+    // Fallback to Exa MCP below
+  }
+
+  // 2. Secondary OpenCode Web Search Provider: Exa MCP (`https://mcp.exa.ai/mcp`)
+  try {
+    const exaUrl = process.env.EXA_API_KEY
+      ? `https://mcp.exa.ai/mcp?exaApiKey=${encodeURIComponent(process.env.EXA_API_KEY)}`
+      : "https://mcp.exa.ai/mcp";
+
+    const exaRes = await fetch(exaUrl, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Accept: "application/json, text/event-stream",
+        "User-Agent": "opencode/1.19.0",
+      },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "tools/call",
+        params: {
+          name: "web_search_exa",
+          arguments: {
+            query,
+            type: args.type || "auto",
+            numResults: args.numResults || 8,
+            livecrawl: args.livecrawl || "fallback",
+            contextMaxCharacters: args.contextMaxCharacters || 10000,
+          },
+        },
+      }),
+    });
+
+    if (exaRes.ok) {
+      const raw = await exaRes.text();
+      const parsedText = parseMcpWebSearchResponse(raw);
+      if (parsedText) {
+        return parsedText.slice(0, args.contextMaxCharacters || 14000);
+      }
+    }
+  } catch {}
+
+  return "No search results found for that query.";
+}
+
+async function executeOpenCodeWebFetch(args = {}) {
+  const targetUrl = String(args.url || "").trim();
+  if (!targetUrl || (!targetUrl.startsWith("http://") && !targetUrl.startsWith("https://"))) {
+    return "Invalid URL provided to webfetch.";
+  }
+  try {
+    const res = await fetch(targetUrl, {
+      headers: {
+        "User-Agent":
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36",
+        Accept: "text/markdown, text/plain, text/html, application/json;q=0.9, */*;q=0.8",
+      },
+    });
+    if (!res.ok) {
+      return `Failed to fetch ${targetUrl}: HTTP ${res.status}`;
+    }
+    const html = await res.text();
+    const cleaned = html
+      .replace(/<script[\s\S]*?<\/script>/gi, " ")
+      .replace(/<style[\s\S]*?<\/style>/gi, " ")
+      .replace(/<[^>]+>/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+    return cleaned.slice(0, 12000) || "Page returned empty content.";
+  } catch (err) {
+    return `Error fetching ${targetUrl}: ${err.message}`;
+  }
+}
 
 function buildOpenCodeHeaders(sessionId) {
   const reqId = generateOpencodeRequestId();
@@ -688,6 +901,7 @@ async function collectSSEStream(response, fallbackModel) {
   let reasoning = "";
   let finishReason = "stop";
   let usage = null;
+  const toolCallsMap = new Map();
 
   while (true) {
     const { value, done } = await reader.read();
@@ -720,6 +934,24 @@ async function collectSSEStream(response, fallbackModel) {
           if (typeof delta.reasoning === "string") {
             reasoning += delta.reasoning;
           }
+          if (Array.isArray(delta.tool_calls)) {
+            for (const tc of delta.tool_calls) {
+              const idx = tc.index ?? 0;
+              if (!toolCallsMap.has(idx)) {
+                toolCallsMap.set(idx, {
+                  id: tc.id || `call_${Date.now()}_${idx}`,
+                  type: "function",
+                  function: { name: "", arguments: "" },
+                });
+              }
+              const entry = toolCallsMap.get(idx);
+              if (tc.id) entry.id = tc.id;
+              if (tc.function?.name) entry.function.name += tc.function.name;
+              if (typeof tc.function?.arguments === "string") {
+                entry.function.arguments += tc.function.arguments;
+              }
+            }
+          }
         }
       } catch {
         // Ignore keep-alive comments
@@ -727,7 +959,134 @@ async function collectSSEStream(response, fallbackModel) {
     }
   }
 
-  return { id, created, model, content, reasoning, finishReason, usage };
+  const toolCalls = Array.from(toolCallsMap.values()).filter((tc) => tc.function.name);
+  return { id, created, model, content, reasoning, finishReason, usage, toolCalls };
+}
+
+/**
+ * Runs OpenCode `mimo-v2.6-flash-free` with automatic execution of OpenCode's
+ * built-in `websearch` and `webfetch` tools (up to 3 turns).
+ */
+async function runOpenCodeAgentWithTools(payload, onWebSearchStart = null) {
+  const workingMessages = Array.isArray(payload.messages) ? [...payload.messages] : [];
+  let usedWebSearch = false;
+  const searchQueries = [];
+  let lastAssembled = null;
+
+  for (let turn = 0; turn < 3; turn++) {
+    const upstream = await callOpenCodeUpstream({
+      ...payload,
+      messages: workingMessages,
+    });
+
+    if (!upstream.ok) {
+      return {
+        ok: false,
+        status: upstream.status,
+        errorText: upstream.errorText,
+        usedWebSearch,
+        searchQueries,
+      };
+    }
+
+    const assembled = await collectSSEStream(upstream.response, upstream.model);
+    lastAssembled = assembled;
+
+    // If model did not request any tool calls, or already produced final answer with no web tools, return!
+    if (!assembled.toolCalls || assembled.toolCalls.length === 0) {
+      return {
+        ok: true,
+        assembled,
+        usedWebSearch,
+        searchQueries,
+      };
+    }
+
+    const webCalls = assembled.toolCalls.filter(
+      (tc) => tc.function.name === "websearch" || tc.function.name === "webfetch"
+    );
+
+    if (webCalls.length === 0) {
+      // Model attempted to call a placeholder tool (bash/read/etc.); instruct it to reply in text directly
+      workingMessages.push({
+        role: "assistant",
+        content: assembled.content || "",
+        tool_calls: assembled.toolCalls,
+      });
+      for (const tc of assembled.toolCalls) {
+        workingMessages.push({
+          role: "tool",
+          tool_call_id: tc.id,
+          content: "Local shell/file tools are disabled. Answer the user directly in plain text.",
+        });
+      }
+      continue;
+    }
+
+    usedWebSearch = true;
+    const turnQueries = [];
+    for (const tc of webCalls) {
+      try {
+        const parsed = JSON.parse(tc.function.arguments || "{}");
+        const q = parsed.query || parsed.url || "";
+        if (q) {
+          searchQueries.push(q);
+          turnQueries.push(q);
+        }
+      } catch {}
+    }
+
+    if (typeof onWebSearchStart === "function") {
+      try {
+        await onWebSearchStart(turnQueries);
+      } catch {}
+    }
+
+    // Append assistant tool_calls message
+    workingMessages.push({
+      role: "assistant",
+      content: assembled.content || "",
+      tool_calls: assembled.toolCalls,
+    });
+
+    // Execute all requested tool calls in parallel
+    const toolResults = await Promise.all(
+      assembled.toolCalls.map(async (tc) => {
+        let args = {};
+        try {
+          args = JSON.parse(tc.function.arguments || "{}");
+        } catch {}
+
+        if (tc.function.name === "websearch") {
+          const resultText = await executeOpenCodeWebSearch(args, upstream.sessionId);
+          return { tool_call_id: tc.id, content: resultText };
+        }
+        if (tc.function.name === "webfetch") {
+          const resultText = await executeOpenCodeWebFetch(args);
+          return { tool_call_id: tc.id, content: resultText };
+        }
+        return {
+          tool_call_id: tc.id,
+          content: "Tool disabled in chat mode; reply directly in text.",
+        };
+      })
+    );
+
+    for (const tr of toolResults) {
+      workingMessages.push({
+        role: "tool",
+        tool_call_id: tr.tool_call_id,
+        content: tr.content,
+      });
+    }
+  }
+
+  return {
+    ok: true,
+    assembled: lastAssembled,
+    usedWebSearch,
+    searchQueries,
+  };
 }
 
 // ─── Audio / WAV Helpers for Gemini STT & TTS ────────────────────────────────
@@ -1391,6 +1750,7 @@ const server = http.createServer(async (req, res) => {
       voiceAgentConfig: {
         fastNoReasoningByDefault: true,
         smartFillerEnabled: true,
+        webSearchEnabled: true,
         defaultFillerPhrase: DEFAULT_FILLER_TEXT,
       },
       configuredKeys: {
@@ -1403,6 +1763,7 @@ const server = http.createServer(async (req, res) => {
         voiceAgent: "POST /api/voice",
         voiceFillerAudio: "GET /api/voice/filler",
         voicesCatalog: "GET /api/voices",
+        webSearch: "POST /api/websearch",
         speechToText: "POST /api/stt",
         textToSpeech: "POST /api/tts",
         openAICompatible: "POST /v1/chat/completions",
@@ -1620,8 +1981,8 @@ const server = http.createServer(async (req, res) => {
         });
       }
 
-      // Check if this voice query requires deep thinking / research
-      const needsThinking =
+      // Check if this voice query requires deep thinking / web search
+      let needsThinking =
         typeof body.thinking === "boolean"
           ? body.thinking
           : detectNeedsThinking(userTranscript);
@@ -1629,6 +1990,7 @@ const server = http.createServer(async (req, res) => {
       // By default in voice mode: disable reasoning for ultra-fast response!
       // Only enable reasoning if the user explicitly asked for deep thinking (`body.reasoning === true`).
       const disableReasoning = body.reasoning === true ? false : true;
+      let fillerSentInStream = false;
 
       // If client requested SSE stream (`stream: true`), emit transcript & instant filler audio first!
       if (wantsStream) {
@@ -1651,6 +2013,7 @@ const server = http.createServer(async (req, res) => {
               selectedVoice,
               body.fillerText || DEFAULT_FILLER_TEXT
             );
+            fillerSentInStream = true;
             sendSSEEvent(res, "filler", {
               type: "filler",
               text: filler.text,
@@ -1662,12 +2025,11 @@ const server = http.createServer(async (req, res) => {
         }
       }
 
-      // Step 2: Middle LLM (`mimo-v2.6-flash-free` via OpenCode as Max v1.0)
-      // Start filler audio generation in parallel if needsThinking is true (for non-streaming JSON mode)
-      const fillerPromise =
+      // Step 2: Middle LLM (`mimo-v2.6-flash-free` via OpenCode as Max v1.0 + Built-in OpenCode Web Search)
+      let fillerPromise =
         !wantsStream && needsThinking && body.tts !== false
           ? getFillerAudio(selectedVoice, body.fillerText || DEFAULT_FILLER_TEXT).catch(() => null)
-          : Promise.resolve(null);
+          : null;
 
       const llmMessages = normalizeMessages(
         {
@@ -1678,32 +2040,71 @@ const server = http.createServer(async (req, res) => {
         VOICE_FAST_SYSTEM_PROMPT
       );
 
-      const llmUpstream = await callOpenCodeUpstream({
-        model: body.model || DEFAULT_MODEL,
-        messages: llmMessages,
-        temperature: body.temperature ?? 0.6,
-        max_tokens: body.max_tokens,
-        disableReasoning,
-      });
+      const agentResult = await runOpenCodeAgentWithTools(
+        {
+          model: body.model || DEFAULT_MODEL,
+          messages: llmMessages,
+          temperature: body.temperature ?? 0.6,
+          max_tokens: body.max_tokens,
+          disableReasoning,
+        },
+        async (queries) => {
+          needsThinking = true;
+          if (wantsStream) {
+            if (!fillerSentInStream && body.tts !== false) {
+              try {
+                const filler = await getFillerAudio(
+                  selectedVoice,
+                  body.fillerText || DEFAULT_FILLER_TEXT
+                );
+                fillerSentInStream = true;
+                sendSSEEvent(res, "filler", {
+                  type: "filler",
+                  text: filler.text,
+                  audio: filler,
+                });
+              } catch {}
+            }
+            sendSSEEvent(res, "websearch", {
+              type: "websearch",
+              queries,
+            });
+          } else if (!fillerPromise && body.tts !== false) {
+            fillerPromise = getFillerAudio(
+              selectedVoice,
+              body.fillerText || DEFAULT_FILLER_TEXT
+            ).catch(() => null);
+          }
+        }
+      );
 
-      if (!llmUpstream.ok) {
+      if (!agentResult.ok) {
         const errPayload = {
           success: false,
           error: "Middle LLM (OpenCode mimo-v2.6-flash-free) error",
-          details: llmUpstream.errorText,
+          details: agentResult.errorText,
           transcript: userTranscript,
         };
         if (wantsStream) {
           sendSSEEvent(res, "error", errPayload);
           return res.end();
         }
-        return sendJson(res, llmUpstream.status || 502, errPayload);
+        return sendJson(res, agentResult.status || 502, errPayload);
       }
 
-      const assembled = await collectSSEStream(llmUpstream.response, llmUpstream.model);
-      const replyText = assembled.content.trim();
+      const assembled = agentResult.assembled;
+      let replyText = assembled.content.trim();
 
-      // Step 3: Text-to-Speech (`gemini-2.5-flash-preview-tts`)
+      // Ensure that when Max v1.0 performs a Web Search in voice mode, it speaks "Ek second, abhi batata hoon..."
+      if (
+        (agentResult.usedWebSearch || needsThinking) &&
+        replyText &&
+        !/^ek\s+second/i.test(replyText)
+      ) {
+        replyText = `Ek second, abhi batata hoon... ${replyText}`;
+      }
+
+      // Step 3: Text-to-Speech (`gemini-2.5-flash-native-audio-preview-12-2025`)
       let audioOutput = null;
       if (body.tts !== false && replyText) {
         const ttsResult = await synthesizeWithGeminiTTS({
@@ -1719,7 +2120,7 @@ const server = http.createServer(async (req, res) => {
         };
       }
 
-      const fillerAudio = await fillerPromise;
+      const fillerAudio = fillerPromise ? await fillerPromise : null;
 
       const finalPayload = {
         success: true,
@@ -1732,6 +2133,8 @@ const server = http.createServer(async (req, res) => {
           voice: selectedVoice,
           fastNoReasoning: disableReasoning,
           needsThinking,
+          usedWebSearch: agentResult.usedWebSearch,
+          searchQueries: agentResult.searchQueries,
         },
         transcript: userTranscript,
         ...(needsThinking
@@ -1768,7 +2171,43 @@ const server = http.createServer(async (req, res) => {
     }
   }
 
-  // 7. Vega App Normal Agent (Text-to-Text AND Image + Text-to-Text): POST /api/chat (or /api/vision)
+  // 6b. Standalone OpenCode Web Search Endpoint: POST /api/websearch
+  if (req.method === "POST" && (pathname === "/api/websearch" || pathname === "/websearch")) {
+    let body;
+    try {
+      body = await readJsonBody(req);
+    } catch (err) {
+      return sendJson(res, 400, { success: false, error: err.message });
+    }
+    const query = String(body.query || body.q || body.message || "").trim();
+    if (!query) {
+      return sendJson(res, 400, {
+        success: false,
+        error: 'Please provide "query" (string) in the JSON body.',
+      });
+    }
+    try {
+      const resultsText = await executeOpenCodeWebSearch({
+        query,
+        numResults: body.numResults || 8,
+        type: body.type || "auto",
+      });
+      return sendJson(res, 200, {
+        success: true,
+        ai: AI_NAME,
+        app: APP_NAME,
+        query,
+        results: resultsText,
+      });
+    } catch (err) {
+      return sendJson(res, 500, {
+        success: false,
+        error: err.message || "Web search failed",
+      });
+    }
+  }
+
+  // 7. Vega App Normal Agent (Text-to-Text, Image + Text-to-Text & Live Web Search): POST /api/chat (or /api/vision)
   if (
     req.method === "POST" &&
     (pathname === "/api/chat" ||
@@ -1793,23 +2232,24 @@ const server = http.createServer(async (req, res) => {
 
     try {
       const disableReasoning = body.fast === true || body.reasoning === false;
-      const result = await callOpenCodeUpstream({
-        model: body.model || DEFAULT_MODEL,
-        messages,
-        temperature: body.temperature,
-        max_tokens: body.max_tokens,
-        disableReasoning,
-      });
-
-      if (!result.ok) {
-        return sendJson(res, result.status || 502, {
-          success: false,
-          error: "Upstream OpenCode API error",
-          details: result.errorText,
-        });
-      }
 
       if (body.stream === true) {
+        const result = await callOpenCodeUpstream({
+          model: body.model || DEFAULT_MODEL,
+          messages,
+          temperature: body.temperature,
+          max_tokens: body.max_tokens,
+          disableReasoning,
+        });
+
+        if (!result.ok) {
+          return sendJson(res, result.status || 502, {
+            success: false,
+            error: "Upstream OpenCode API error",
+            details: result.errorText,
+          });
+        }
+
         res.writeHead(200, {
           "Content-Type": "text/event-stream; charset=utf-8",
           "Cache-Control": "no-cache",
@@ -1824,12 +2264,30 @@ const server = http.createServer(async (req, res) => {
         return res.end();
       }
 
-      const assembled = await collectSSEStream(result.response, result.model);
+      const agentResult = await runOpenCodeAgentWithTools({
+        model: body.model || DEFAULT_MODEL,
+        messages,
+        temperature: body.temperature,
+        max_tokens: body.max_tokens,
+        disableReasoning,
+      });
+
+      if (!agentResult.ok) {
+        return sendJson(res, agentResult.status || 502, {
+          success: false,
+          error: "Upstream OpenCode API error",
+          details: agentResult.errorText,
+        });
+      }
+
+      const assembled = agentResult.assembled;
       return sendJson(res, 200, {
         success: true,
         ai: AI_NAME,
         app: APP_NAME,
         model: assembled.model,
+        usedWebSearch: agentResult.usedWebSearch,
+        searchQueries: agentResult.searchQueries,
         reply: assembled.content,
         reasoning: assembled.reasoning || null,
         usage: assembled.usage,
