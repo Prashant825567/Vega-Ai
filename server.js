@@ -553,7 +553,7 @@ function parseMcpWebSearchResponse(rawText) {
   return "";
 }
 
-function formatCompactSearchResults(rawText, maxResults = 6, maxExcerptChars = 480) {
+function formatCompactSearchResults(rawText, maxResults = 5, maxExcerptChars = 320) {
   if (!rawText || typeof rawText !== "string") return "";
   const trimmed = rawText.trim();
   try {
@@ -966,14 +966,17 @@ async function collectSSEStream(response, fallbackModel) {
   let streamDone = false;
   while (!streamDone) {
     let readResult;
+    let readTimer = null;
     try {
       readResult = await Promise.race([
         reader.read(),
-        new Promise((_, rej) =>
-          setTimeout(() => rej(new Error("SSE read idle timeout")), 12000)
-        ),
+        new Promise((_, rej) => {
+          readTimer = setTimeout(() => rej(new Error("SSE read idle timeout")), 12000);
+        }),
       ]);
+      if (readTimer) clearTimeout(readTimer);
     } catch {
+      if (readTimer) clearTimeout(readTimer);
       try {
         reader.cancel().catch(() => {});
       } catch {}
