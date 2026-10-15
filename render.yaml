@@ -31,3 +31,7 @@ services:
         value: https://vega-storage.onrender.com
       - key: ZENTRAGRID_API_KEY
         sync: false
+      - key: IMAGE_API_URL
+        value: https://image-api.pr3095079.workers.dev
+      - key: IMAGE_API_KEY
+        sync: false

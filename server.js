@@ -222,6 +222,12 @@ const AI_NAME = process.env.AI_NAME || "Max v1.0";
 const APP_NAME = process.env.APP_NAME || "Vega";
 const BACKEND_API_KEY = (process.env.BACKEND_API_KEY || "").trim();
 
+// Image Generation & Editing Worker Configuration
+const IMAGE_API_URL = (
+  process.env.IMAGE_API_URL || "https://image-api.pr3095079.workers.dev"
+).replace(/\/+$/, "");
+const IMAGE_API_KEY = (process.env.IMAGE_API_KEY || "noida123").trim();
+
 const DEFAULT_FILLER_TEXT =
   process.env.VOICE_FILLER_TEXT || "Ek second, abhi batata hoon.";
 
@@ -1113,6 +1119,263 @@ function extractLatestUserText(messages) {
     }
   }
   return "";
+}
+
+/**
+ * Extracts `{ dataUri, rawBase64, mimeType }` from `body` or the latest user message in `messages`.
+ */
+function extractLatestImageInput(body = {}, messages = []) {
+  let rawCandidate =
+    body.image ||
+    body.imageBase64 ||
+    body.imageUrl ||
+    (Array.isArray(body.images) && body.images.length > 0 ? body.images[0] : null);
+
+  if (!rawCandidate && Array.isArray(messages)) {
+    for (let i = messages.length - 1; i >= 0; i--) {
+      const m = messages[i];
+      if (m && m.role === "user" && Array.isArray(m.content)) {
+        const imgPart = m.content.find(
+          (p) => p && p.type === "image_url" && p.image_url && p.image_url.url
+        );
+        if (imgPart) {
+          rawCandidate = imgPart.image_url.url;
+          break;
+        }
+      }
+    }
+  }
+
+  if (!rawCandidate) return null;
+  const rawStr =
+    typeof rawCandidate === "object"
+      ? rawCandidate.url || rawCandidate.data || rawCandidate.base64 || ""
+      : String(rawCandidate);
+  const dataUri = toImageDataUri(rawStr, body.mimeType || "image/png");
+  if (!dataUri) return null;
+
+  let mimeType = "image/png";
+  let rawBase64 = dataUri;
+  if (dataUri.startsWith("data:")) {
+    const commaIdx = dataUri.indexOf(",");
+    if (commaIdx !== -1) {
+      const header = dataUri.slice(5, commaIdx);
+      mimeType = header.split(";")[0] || "image/png";
+      rawBase64 = dataUri.slice(commaIdx + 1).replace(/\s+/g, "");
+    }
+  }
+  return { dataUri, rawBase64, mimeType };
+}
+
+/**
+ * Detects whether the user is asking Max v1.0 to EDIT an uploaded image ("edit")
+ * or GENERATE a new image ("generate"). Returns "edit" | "generate" | null.
+ */
+function detectImageTaskIntent(userText = "", hasImage = false, body = {}) {
+  if (body.imageAction === "edit" || body.mode === "edit") return "edit";
+  if (body.imageAction === "generate" || body.mode === "generate") return "generate";
+  if (body.imageAction === false || body.disableImageGen === true) return null;
+
+  const q = String(userText || "").toLowerCase().trim();
+  if (!q) return null;
+
+  if (hasImage) {
+    // Pure Q&A questions about an uploaded image ("ye kya hai?", "read this text", "solve this")
+    const pureQuestionOnly =
+      /^(what is this|who is this|read this|translate this|solve this|explain this|ye kya hai|yeh kya hai|is photo me kya hai|is image me kya likha hai|isko padho|isko solve karo)[?!.\s]*$/i.test(
+        q
+      );
+    if (pureQuestionOnly) return null;
+
+    const editPatterns = [
+      /\b(edit|modify|change|replace|remove|delete|erase|add|put|wear|make|turn|convert|transform|recreate|redesign|restyle|style|filter|enhance|upscale|color|colour|background|bg|sky|lighting|anime|cartoon|ghibli|cyberpunk|realistic|3d|sketch|painting|oil painting|cinematic|sunglasses|glasses|hat|crown|suit|jacket|dress|clothes|hair|beard|smile)\b/i,
+      /\b(bana do|banao|bana de|kar do|kardo|kar de|laga do|lagao|laga de|hata do|hatao|hata de|badal do|badlo|badal de|set kar|edit kar|change kar|add kar|remove kar|chashma|mukut|kapde|baal|rang)\b/i,
+      /(एडिट|बदल|बना दो|बनाओ|कर दो|लगा दो|हटा दो|बैकग्राउंड|रंग|चश्मा|कपड़े|फिल्टर)/,
+    ];
+    if (editPatterns.some((re) => re.test(q))) {
+      return "edit";
+    }
+    return null;
+  }
+
+  // Without an uploaded image: check if user is asking to generate/create/draw an image
+  const generatePatterns = [
+    /\b(generate|create|draw|paint|make|design|render)\s+(an?\s+|me\s+an?\s+|ek\s+)?(image|photo|picture|pic|art|illustration|wallpaper|logo|poster|avatar|portrait|tasveer)\b/i,
+    /\b(image|photo|picture|pic|tasveer|wallpaper|logo|poster)\s+(generate|create|make|draw|banao|bana do|bana de|banaiye|dikhao)\b/i,
+    /\b(ek\s+.*?\s+ki\s+(image|photo|picture|tasveer)\s+(banao|bana do|bana de|generate karo))\b/i,
+    /(इमेज बनाओ|इमेज बना दो|फोटो बनाओ|फोटो बना दो|तस्वीर बनाओ|तस्वीर बना दो|पिक्चर बनाओ)/,
+  ];
+  if (generatePatterns.some((re) => re.test(q))) {
+    return "generate";
+  }
+  return null;
+}
+
+/**
+ * Max v1.0 (`mimo-v2.6-flash-free`) Vision-to-Image-Edit & Text-to-Image Pipeline:
+ * 1. For `edit`: Max looks at the uploaded image + user's edit request, crafts:
+ *    - `statusMessage`: immediate message from `mimo-v2.6-flash-free` so the user & app know the image is being edited right now
+ *    - `maxPrompt`: detailed English visual prompt describing the uploaded image WITH the user's requested edit applied
+ *    - `finalReply`: presentation message for the finished image
+ * 2. Sends `maxPrompt` (and `image` base64 for `edit`) to `https://image-api.pr3095079.workers.dev/` (`Bearer noida123`).
+ * 3. Returns `{ action, statusMessage, maxPrompt, finalReply, image: { mimeType, base64, dataUri } }`.
+ */
+async function runMaxImageAgent({
+  userText = "",
+  imageInput = null,
+  action = "generate",
+  model = DEFAULT_MODEL,
+  onStatus = null,
+}) {
+  const isEdit = action === "edit" && Boolean(imageInput && imageInput.dataUri);
+
+  let statusMessage = isEdit
+    ? "Ruko bhai, aapki photo ko dekh kar aapke hisaab se edit kar raha hoon... ✨"
+    : "Ek second bhai, aapke liye shandaar image taiyar kar raha hoon... 🎨";
+  let maxPrompt = String(userText || "").trim();
+  let finalReply = isEdit
+    ? "Yeh lijiye bhai, aapki edited image bilkul taiyar hai! ✨"
+    : "Yeh lijiye bhai, aapki image ban kar taiyar hai! 🎨";
+
+  // Step 1: Use Max v1.0 (`mimo-v2.6-flash-free`) to inspect the image (if edit) and craft the optimal prompt + status message
+  try {
+    const promptInstruction = isEdit
+      ? `/no_think You are ${AI_NAME} inside the ${APP_NAME} app. The user uploaded an image and asked to edit it: "${userText}".\n` +
+        `Look carefully at the uploaded image (subject, appearance, pose, clothing, objects, lighting, background, style) and understand what the user wants to edit.\n` +
+        `Respond ONLY with a valid JSON object (no markdown fences) with these exact 3 keys:\n` +
+        `{\n` +
+        `  "statusMessage": "Short 1-sentence Hinglish/Hindi/English message telling the user that you are looking at their photo and editing it right now (e.g. 'Ruko bhai, aapki photo dekh li hai, abhi ${userText.slice(0, 35)} set kar raha hoon... ✨')",\n` +
+        `  "maxPrompt": "A rich, highly detailed English image generation/editing prompt (50-90 words) that describes the exact subject, face/features, pose, and composition of the uploaded image WITH the user's requested edit applied in photorealistic/masterpiece quality",\n` +
+        `  "finalReply": "Short friendly 1-sentence Hinglish/Hindi/English message presenting the edited image to the user (e.g. 'Yeh lijiye bhai, aapki edited photo taiyar hai! ✨')"\n` +
+        `}`
+      : `/no_think You are ${AI_NAME} inside the ${APP_NAME} app. The user asked to generate an image: "${userText}".\n` +
+        `Respond ONLY with a valid JSON object (no markdown fences) with these exact 3 keys:\n` +
+        `{\n` +
+        `  "statusMessage": "Short 1-sentence Hinglish/Hindi/English message telling the user their image is being created right now (e.g. 'Ek second bhai, aapke liye image bana raha hoon... 🎨')",\n` +
+        `  "maxPrompt": "A rich, highly detailed English image generation prompt (40-80 words, photorealistic, high resolution, vivid lighting) for: ${userText}",\n` +
+        `  "finalReply": "Short friendly 1-sentence Hinglish/Hindi/English message presenting the finished image to the user (e.g. 'Yeh lijiye bhai, aapki image ban kar taiyar hai! 🎨')"\n` +
+        `}`;
+
+    const visionMessages = [
+      {
+        role: "system",
+        content: "/no_think Output valid JSON only. Never call any tools.",
+      },
+      {
+        role: "user",
+        content: isEdit
+          ? buildMultimodalContent(promptInstruction, [imageInput.dataUri], imageInput.mimeType)
+          : `${promptInstruction}\n/no_think`,
+      },
+    ];
+
+    const up = await callOpenCodeUpstream({
+      model: model || DEFAULT_MODEL,
+      messages: visionMessages,
+      disableReasoning: true,
+    });
+
+    if (up.ok) {
+      const assembled = await collectSSEStream(up.response, up.model);
+      const rawText = String(assembled.content || "").trim();
+      const jsonMatch = rawText.match(/\{[\s\S]*\}/);
+      if (jsonMatch) {
+        const parsed = JSON.parse(jsonMatch[0]);
+        if (parsed.statusMessage && typeof parsed.statusMessage === "string") {
+          statusMessage = parsed.statusMessage.trim();
+        }
+        if (parsed.maxPrompt && typeof parsed.maxPrompt === "string") {
+          maxPrompt = parsed.maxPrompt.trim();
+        }
+        if (parsed.finalReply && typeof parsed.finalReply === "string") {
+          finalReply = parsed.finalReply.trim();
+        }
+      } else if (rawText) {
+        maxPrompt = rawText.slice(0, 500);
+      }
+    }
+  } catch {
+    // Keep sensible fallback statusMessage & maxPrompt if vision call errors
+  }
+
+  // Notify caller/stream immediately so the app knows an image is being edited/generated and prepares its image UI slot!
+  if (typeof onStatus === "function") {
+    try {
+      await onStatus({
+        type: "image_status",
+        isImageTask: true,
+        imageAction: isEdit ? "edit" : "generate",
+        imageStatus: "processing",
+        readyForImage: true,
+        statusMessage,
+        maxPrompt,
+      });
+    } catch {}
+  }
+
+  // Step 2: Send to `https://image-api.pr3095079.workers.dev/` (`edit` or `generate`) with Bearer IMAGE_API_KEY
+  let imgBuffer = null;
+  let contentType = "image/png";
+
+  if (isEdit && imageInput && imageInput.rawBase64) {
+    try {
+      const editRes = await fetch(`${IMAGE_API_URL}/edit`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${IMAGE_API_KEY}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          mode: "edit",
+          prompt: maxPrompt,
+          image: imageInput.rawBase64,
+        }),
+      });
+      const ct = (editRes.headers.get("content-type") || "").toLowerCase();
+      if (editRes.ok && ct.startsWith("image/")) {
+        contentType = ct.split(";")[0] || "image/png";
+        imgBuffer = Buffer.from(await editRes.arrayBuffer());
+      }
+    } catch {}
+  }
+
+  // Automatic fallback to `/generate` with Max's full visual description + edit prompt (`maxPrompt`)
+  // if `mode === "generate"` OR if Cloudflare's img2img model returned 500 error 5018 on `/edit`
+  if (!imgBuffer) {
+    const genRes = await fetch(`${IMAGE_API_URL}/generate`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${IMAGE_API_KEY}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        mode: "generate",
+        prompt: maxPrompt,
+      }),
+    });
+    const ct = (genRes.headers.get("content-type") || "").toLowerCase();
+    if (!genRes.ok || !ct.startsWith("image/")) {
+      const errText = await genRes.text().catch(() => "");
+      throw new Error(`Image Worker API error (${genRes.status}): ${errText.slice(0, 200)}`);
+    }
+    contentType = ct.split(";")[0] || "image/png";
+    imgBuffer = Buffer.from(await genRes.arrayBuffer());
+  }
+
+  const outBase64 = imgBuffer.toString("base64");
+  const outDataUri = `data:${contentType};base64,${outBase64}`;
+
+  return {
+    action: isEdit ? "edit" : "generate",
+    statusMessage,
+    maxPrompt,
+    finalReply,
+    image: {
+      mimeType: contentType,
+      base64: outBase64,
+      dataUri: outDataUri,
+    },
+  };
 }
 
 /**
@@ -2637,6 +2900,9 @@ const server = http.createServer(async (req, res) => {
         prompt: "GET /api/prompt",
         textAndImageChat: "POST /api/chat",
         visionChat: "POST /api/vision",
+        imageGenerateOrEdit: "POST /api/image",
+        imageGenerate: "POST /api/image/generate",
+        imageEdit: "POST /api/image/edit",
         voiceAgent: "POST /api/voice",
         voiceFillerAudio: "GET /api/voice/filler",
         voicesCatalog: "GET /api/voices",
@@ -3155,7 +3421,100 @@ const server = http.createServer(async (req, res) => {
     }
   }
 
-  // 7. Vega App Normal Agent (Text-to-Text, Image + Text-to-Text & Live Web Search): POST /api/chat (or /api/vision)
+  // 6c. Dedicated Image Generate & Vision Image Edit Endpoints:
+  //     POST /api/image, POST /api/image/generate, POST /api/image/edit
+  if (
+    req.method === "POST" &&
+    (pathname === "/api/image" ||
+      pathname === "/api/image/generate" ||
+      pathname === "/api/image/edit" ||
+      pathname === "/image" ||
+      pathname === "/generate" ||
+      pathname === "/edit")
+  ) {
+    let body;
+    try {
+      body = await readJsonBody(req);
+    } catch (err) {
+      return sendJson(res, 400, { success: false, error: err.message });
+    }
+    const messages = normalizeMessages(body, DEFAULT_SYSTEM_PROMPT);
+    const imageInput = extractLatestImageInput(body, messages);
+    const userText =
+      extractLatestUserText(messages) ||
+      String(body.prompt || body.message || body.text || "").trim();
+
+    const forcedAction =
+      pathname.endsWith("/edit") || body.mode === "edit" || body.imageAction === "edit"
+        ? "edit"
+        : pathname.endsWith("/generate") || body.mode === "generate" || body.imageAction === "generate"
+        ? "generate"
+        : imageInput
+        ? "edit"
+        : "generate";
+
+    if (!userText && !imageInput) {
+      return sendJson(res, 400, {
+        success: false,
+        error: 'Please provide "prompt" / "message" (and "image" for edit mode).',
+      });
+    }
+
+    try {
+      const wantsStream = body.stream === true;
+      if (wantsStream) {
+        setCorsHeaders(res);
+        res.writeHead(200, {
+          "Content-Type": "text/event-stream; charset=utf-8",
+          "Cache-Control": "no-cache",
+          Connection: "keep-alive",
+        });
+      }
+
+      const imgResult = await runMaxImageAgent({
+        userText: userText || "Enhance and beautify this image",
+        imageInput,
+        action: forcedAction,
+        model: body.model || DEFAULT_MODEL,
+        onStatus: (statusPayload) => {
+          if (wantsStream) {
+            sendSSEEvent(res, "image_status", statusPayload);
+          }
+        },
+      });
+
+      const responsePayload = {
+        success: true,
+        ai: AI_NAME,
+        app: APP_NAME,
+        model: DEFAULT_MODEL,
+        isImageTask: true,
+        imageAction: imgResult.action,
+        imageStatus: "completed",
+        readyForImage: true,
+        statusMessage: imgResult.statusMessage,
+        maxPrompt: imgResult.maxPrompt,
+        reply: imgResult.finalReply,
+        image: imgResult.image,
+        imageUrl: imgResult.image.dataUri,
+      };
+
+      if (wantsStream) {
+        sendSSEEvent(res, "image_ready", responsePayload);
+        res.write("data: [DONE]\n\n");
+        return res.end();
+      }
+
+      return sendJson(res, 200, responsePayload);
+    } catch (err) {
+      return sendJson(res, 500, {
+        success: false,
+        error: err.message || "Image generation/editing failed",
+      });
+    }
+  }
+
+  // 7. Vega App Normal Agent (Text-to-Text, Image + Text-to-Text, Image Generate/Edit & Live Web Search): POST /api/chat (or /api/vision)
   if (
     req.method === "POST" &&
     (pathname === "/api/chat" ||
@@ -3179,6 +3538,109 @@ const server = http.createServer(async (req, res) => {
     }
 
     try {
+      // Check if the user is asking Max v1.0 to EDIT an uploaded image or GENERATE a new image
+      const imageInput = extractLatestImageInput(body, messages);
+      const latestUserText = extractLatestUserText(messages);
+      const imageTaskAction = detectImageTaskIntent(latestUserText, Boolean(imageInput), body);
+
+      if (imageTaskAction) {
+        const wantsStream = body.stream === true;
+        if (wantsStream) {
+          setCorsHeaders(res);
+          res.writeHead(200, {
+            "Content-Type": "text/event-stream; charset=utf-8",
+            "Cache-Control": "no-cache",
+            Connection: "keep-alive",
+          });
+        }
+
+        const imgResult = await runMaxImageAgent({
+          userText: latestUserText || "Edit and enhance this image",
+          imageInput,
+          action: imageTaskAction,
+          model: body.model || DEFAULT_MODEL,
+          onStatus: (statusPayload) => {
+            if (wantsStream) {
+              // 1. Send dedicated SSE event so app immediately prepares its image slot
+              sendSSEEvent(res, "image_status", statusPayload);
+              // 2. Also send a streaming chat delta from mimo-v2.6-flash-free so user sees status text immediately
+              res.write(
+                `data: ${JSON.stringify({
+                  id: `chatcmpl-img-${Date.now()}`,
+                  object: "chat.completion.chunk",
+                  created: Math.floor(Date.now() / 1000),
+                  model: DEFAULT_MODEL,
+                  isImageTask: true,
+                  imageAction: statusPayload.imageAction,
+                  imageStatus: "processing",
+                  readyForImage: true,
+                  statusMessage: statusPayload.statusMessage,
+                  maxPrompt: statusPayload.maxPrompt,
+                  choices: [
+                    {
+                      index: 0,
+                      delta: {
+                        role: "assistant",
+                        content: `${statusPayload.statusMessage}\n\n`,
+                      },
+                      finish_reason: null,
+                    },
+                  ],
+                })}\n\n`
+              );
+            }
+          },
+        });
+
+        const finalPayload = {
+          success: true,
+          ai: AI_NAME,
+          app: APP_NAME,
+          model: DEFAULT_MODEL,
+          isImageTask: true,
+          imageAction: imgResult.action,
+          imageStatus: "completed",
+          readyForImage: true,
+          statusMessage: imgResult.statusMessage,
+          maxPrompt: imgResult.maxPrompt,
+          reply: imgResult.finalReply,
+          image: imgResult.image,
+          imageUrl: imgResult.image.dataUri,
+          usedWebSearch: false,
+          searchQueries: [],
+          reasoning: null,
+          usage: null,
+        };
+
+        if (wantsStream) {
+          sendSSEEvent(res, "image_ready", finalPayload);
+          res.write(
+            `data: ${JSON.stringify({
+              id: `chatcmpl-img-${Date.now()}`,
+              object: "chat.completion.chunk",
+              created: Math.floor(Date.now() / 1000),
+              model: DEFAULT_MODEL,
+              ...finalPayload,
+              choices: [
+                {
+                  index: 0,
+                  delta: {
+                    content: imgResult.finalReply,
+                    image: imgResult.image,
+                    imageUrl: imgResult.image.dataUri,
+                  },
+                  finish_reason: "stop",
+                },
+              ],
+            })}\n\n`
+          );
+          res.write("data: [DONE]\n\n");
+          return res.end();
+        }
+
+        return sendJson(res, 200, finalPayload);
+      }
+
       const disableReasoning = body.reasoning === true ? false : true;
       const allowWebSearch = body.webSearch !== false && body.allowWebSearch !== false;
       const forceWebSearch = body.webSearch === true || body.search === true;
