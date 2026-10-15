@@ -916,12 +916,30 @@ async function collectSSEStream(response, fallbackModel) {
 
   let streamDone = false;
   while (!streamDone) {
-    const { value, done } = await reader.read();
+    let readResult;
+    try {
+      readResult = await Promise.race([
+        reader.read(),
+        new Promise((_, rej) =>
+          setTimeout(() => rej(new Error("SSE read idle timeout")), 12000)
+        ),
+      ]);
+    } catch {
+      try {
+        reader.cancel().catch(() => {});
+      } catch {}
+      break;
+    }
+    const { value, done } = readResult;
     if (done) break;
     buffer += decoder.decode(value, { stream: true });
 
     const lines = buffer.split("\n");
     buffer = lines.pop() || "";
+    if (buffer.trim() === "data: [DONE]" || buffer.includes("[DONE]")) {
+      lines.push(buffer);
+      buffer = "";
+    }
 
     for (const rawLine of lines) {
       const line = rawLine.trim();
@@ -931,7 +949,7 @@ async function collectSSEStream(response, fallbackModel) {
       if (dataStr === "[DONE]") {
         streamDone = true;
         try {
-          reader.cancel();
+          reader.cancel().catch(() => {});
         } catch {}
         break;
       }
@@ -945,7 +963,6 @@ async function collectSSEStream(response, fallbackModel) {
 
         const choice = chunk.choices?.[0];
         if (choice) {
-          if (choice.finish_reason) finishReason = choice.finish_reason;
           const delta = choice.delta || {};
           if (typeof delta.content === "string") {
             content += delta.content;
@@ -970,6 +987,14 @@ async function collectSSEStream(response, fallbackModel) {
                 entry.function.arguments += tc.function.arguments;
               }
             }
+          }
+          if (choice.finish_reason) {
+            finishReason = choice.finish_reason;
+            streamDone = true;
+            try {
+              reader.cancel().catch(() => {});
+            } catch {}
+            break;
           }
         }
       } catch {
@@ -2142,21 +2167,6 @@ const server = http.createServer(async (req, res) => {
         VOICE_FAST_SYSTEM_PROMPT
       );
 
-      // Pre-warm Gemini Live Native Audio WebSocket connection + setupComplete in parallel with LLM!
-      let resolveTtsText = null;
-      const ttsTextPromise = new Promise((r) => {
-        resolveTtsText = r;
-      });
-      const prewarmedTtsPromise =
-        body.tts !== false && GEMINI_API_KEYS.length > 0
-          ? synthesizeWithGeminiLiveAudio({
-              spokenTextPromise: ttsTextPromise,
-              selectedVoice,
-              apiKey: getGeminiApiKey(),
-              liveModel: `models/${GEMINI_TTS_MODEL.replace(/^models\//, "")}`,
-            }).catch(() => null)
-          : null;
-
       const agentResult = await runOpenCodeAgentWithTools(
         {
           model: body.model || DEFAULT_MODEL,
@@ -2192,7 +2202,6 @@ const server = http.createServer(async (req, res) => {
       );
 
       if (!agentResult.ok) {
-        if (resolveTtsText) resolveTtsText("");
         const errPayload = {
           success: false,
           error: "Middle LLM (OpenCode mimo-v2.6-flash-free) error",
@@ -2223,20 +2232,13 @@ const server = http.createServer(async (req, res) => {
           replyText;
       }
 
-      if (resolveTtsText) {
-        resolveTtsText(body.tts !== false ? replyText : "");
-      }
-
       // Step 3: Text-to-Speech (`gemini-2.5-flash-native-audio-preview-12-2025`)
       let audioOutput = null;
       if (body.tts !== false && replyText) {
-        let ttsResult = prewarmedTtsPromise ? await prewarmedTtsPromise : null;
-        if (!ttsResult || !ttsResult.wavBase64) {
-          ttsResult = await synthesizeWithGeminiTTS({
-            text: replyText,
-            voice: selectedVoice,
-          });
-        }
+        const ttsResult = await synthesizeWithGeminiTTS({
+          text: replyText,
+          voice: selectedVoice,
+        });
         audioOutput = {
           mimeType: ttsResult.mimeType,
           sampleRate: ttsResult.sampleRate,
