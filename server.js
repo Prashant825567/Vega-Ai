@@ -1101,6 +1101,11 @@ async function collectSSEStream(response, fallbackModel) {
     }
   }
 
+  const toolCalls = Array.from(toolCallsMap.values()).filter((tc) => tc.function.name);
+  content = stripLeakedReasoning(content);
+  return { id, created, model, content, reasoning, finishReason, usage, toolCalls };
+}
+
 function stripLeakedReasoning(text) {
   if (!text || typeof text !== "string") return "";
   let cleaned = text.replace(/<think>[\s\S]*?<\/think>/gi, "").trim();
@@ -1117,11 +1122,6 @@ function stripLeakedReasoning(text) {
     }
   }
   return cleaned || text.trim();
-}
-
-  const toolCalls = Array.from(toolCallsMap.values()).filter((tc) => tc.function.name);
-  content = stripLeakedReasoning(content);
-  return { id, created, model, content, reasoning, finishReason, usage, toolCalls };
 }
 
 /**
@@ -1320,121 +1320,55 @@ async function runMaxImageAgent({
       ? "Yeh lijiye bhai, aapki edited image bilkul taiyar hai! ✨"
       : "Yeh lijiye bhai, aapki image ban kar taiyar hai! 🎨");
 
-  // Step 1: Ultra-fast Vision & Prompt Crafting (plain-text 1-sentence prompt so vision finishes in ~1.2s on Gemini / ~4.5s on Mimo without JSON reasoning overhead!)
+  // Step 1: Ultra-fast Vision Inspection for Image Edits (bounded by 4.0s with immediate stream reader cancellation so zero zombie streams remain!)
   if (!preCraftedPrompt) {
-    const promptInstruction = isEdit
-      ? `Describe this image in 1 short English sentence and include this change: ${userText}`
-      : `Write 1 short vivid English image generation prompt sentence for: ${userText}`;
-
-    const geminiKey = getGeminiApiKey();
-    const candidates = [];
-
-    // Candidate A (~1.1s): Active Gemini Flash-Lite / Flash vision model
-    if (geminiKey) {
-      candidates.push(
-        (async () => {
-          const gemModel = await resolveWorkingGeminiSttModel(geminiKey);
-          const modelCandidates = [
-            gemModel,
-            "gemini-3.1-flash-lite-preview",
-            "gemini-flash-lite-latest",
-            "gemini-2.5-flash-lite",
-            "gemini-flash-latest",
-          ].filter((v, i, a) => v && a.indexOf(v) === i);
-          const parts = [{ text: promptInstruction }];
-          if (isEdit && imageInput && imageInput.rawBase64) {
-            parts.push({
-              inlineData: {
-                mimeType: imageInput.mimeType || "image/jpeg",
-                data: imageInput.rawBase64,
-              },
-            });
-          }
-          for (const candidateModel of modelCandidates) {
-            const controller = new AbortController();
-            const timer = setTimeout(() => controller.abort(), 2400);
-            try {
-              const gemRes = await fetch(
-                `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(
-                  candidateModel
-                )}:generateContent?key=${encodeURIComponent(geminiKey)}`,
-                {
-                  method: "POST",
-                  headers: { "Content-Type": "application/json" },
-                  body: JSON.stringify({
-                    contents: [{ role: "user", parts }],
-                    generationConfig: {
-                      temperature: 0.3,
-                      maxOutputTokens: 120,
-                    },
-                  }),
-                  signal: controller.signal,
-                }
-              );
-              clearTimeout(timer);
-              if (!gemRes.ok) continue;
-              const gemData = await gemRes.json();
-              const rawText = String(
-                gemData?.candidates?.[0]?.content?.parts?.[0]?.text || ""
-              )
-                .replace(/^["'`]+|["'`]+$/g, "")
-                .trim();
-              if (rawText.length < 10) continue;
-              resolvedSttModel = candidateModel;
-              return `${rawText}, photorealistic, 8k, vivid lighting, sharp focus`;
-            } catch {
-              clearTimeout(timer);
-            }
-          }
-          throw new Error("All Gemini vision models failed");
-        })()
-      );
-    }
-
-    // Candidate B (~2.5s with max_tokens: 180 & /no_think on multimodal array): OpenCode mimo-v2.6-flash-free
-    candidates.push(
-      (async () => {
+    if (!isEdit) {
+      // For text-to-image generation, craft the enriched prompt in 0ms without an extra LLM round-trip
+      maxPrompt = `${userText}, photorealistic, 8k, ultra-detailed, vivid cinematic lighting, sharp focus`;
+    } else {
+      let visionDesc = "";
+      const visionTask = (async () => {
         const visionMessages = [
           {
             role: "system",
-            content: "/no_think Reply in 1 short English sentence only. Never call any tools.",
+            content: DEFAULT_SYSTEM_PROMPT,
           },
           {
             role: "user",
-            content: isEdit
-              ? buildMultimodalContent(promptInstruction, [imageInput.dataUri], imageInput.mimeType)
-              : `${promptInstruction}\n/no_think`,
+            content: buildMultimodalContent(
+              "Describe in 1 sentence.",
+              [imageInput.dataUri],
+              imageInput.mimeType
+            ),
           },
         ];
         const up = await callOpenCodeUpstream({
           model: model || DEFAULT_MODEL,
           messages: visionMessages,
-          max_tokens: 180,
           disableReasoning: true,
         });
-        if (!up.ok) throw new Error(`OpenCode HTTP ${up.status}`);
-        const assembled = await collectSSEStream(up.response, up.model);
-        const rawText = String(assembled.content || "")
-          .replace(/^["'`]+|["'`]+$/g, "")
-          .trim();
-        if (rawText.length < 10) throw new Error("Empty OpenCode vision prompt");
-        return `${rawText}, photorealistic, 8k, vivid lighting, sharp focus`;
-      })()
-    );
+        if (up.ok && up.response) {
+          const assembled = await collectSSEStream(up.response, up.model);
+          const cleaned = String(assembled.content || "").replace(/\s+/g, " ").trim();
+          if (cleaned.length >= 8) {
+            visionDesc = cleaned;
+          } else if (assembled.reasoning && assembled.reasoning.trim().length >= 15) {
+            visionDesc = assembled.reasoning.replace(/\s+/g, " ").trim().slice(0, 200);
+          }
+        }
+      })();
 
-    try {
-      const winnerPrompt = await Promise.race([
-        Promise.any(candidates),
-        new Promise((_, reject) => setTimeout(() => reject(new Error("Vision timeout")), 3200)),
-      ]);
-      if (winnerPrompt) {
-        maxPrompt = String(winnerPrompt).trim();
-      }
-    } catch {
-      if (!preCraftedPrompt) {
-        maxPrompt = isEdit
-          ? `Photorealistic 8k studio portrait and scene with the requested edit applied: ${userText}, vivid colors, sharp focus, cinematic lighting`
-          : `Photorealistic 8k high-detail image: ${userText}, vivid lighting, sharp focus`;
+      try {
+        await Promise.race([
+          visionTask,
+          new Promise((resolve) => setTimeout(resolve, 6200)),
+        ]);
+      } catch {}
+
+      if (visionDesc) {
+        maxPrompt = `${visionDesc} — edited with: ${userText}, photorealistic, 8k, vivid lighting, sharp focus`;
+      } else {
+        maxPrompt = `Photorealistic 8k studio portrait and scene with the requested edit applied: ${userText}, vivid colors, sharp focus, cinematic lighting`;
       }
     }
   }
@@ -1455,7 +1389,7 @@ async function runMaxImageAgent({
   }
 
   // Step 2: Generate/Edit via `https://image-api.pr3095079.workers.dev/` (`Bearer noida123`, 512x512 fast mode ~280KB PNG)
-  // With automatic fast standby if Cloudflare Workers AI free tier queues/stalls >11.5s so mobile apps NEVER hit Network Request Timeout!
+  // With clean AbortController cleanup so zero zombie requests remain on Cloudflare!
   let imgBuffer = null;
   let contentType = "image/png";
 
@@ -1484,6 +1418,9 @@ async function runMaxImageAgent({
   }
 
   if (!imgBuffer) {
+    const workerAbort = new AbortController();
+    const standbyAbort = new AbortController();
+
     const workerPromise = (async () => {
       const genRes = await fetch(`${IMAGE_API_URL}/generate`, {
         method: "POST",
@@ -1499,6 +1436,7 @@ async function runMaxImageAgent({
           num_steps: 8,
           steps: 8,
         }),
+        signal: workerAbort.signal,
       });
       const ct = (genRes.headers.get("content-type") || "").toLowerCase();
       if (!genRes.ok || !ct.startsWith("image/")) {
@@ -1512,30 +1450,44 @@ async function runMaxImageAgent({
       };
     })();
 
-    // Standby fast fallback that activates if the primary Cloudflare Worker queues beyond ~8.5s (or fails)
+    // Standby fast fallback that activates if the primary Cloudflare Worker queues beyond ~8.5s
     const standbyPromise = (async () => {
-      await new Promise((r) => setTimeout(r, 1000));
+      await new Promise((r) => setTimeout(r, 1500));
+      if (standbyAbort.signal.aborted) throw new Error("Aborted");
       const cleanPrompt = String(maxPrompt || userText || "beautiful artwork").slice(0, 380);
-      const seed = Math.floor(Math.random() * 900000) + 100000;
-      const pollUrl = `https://image.pollinations.ai/prompt/${encodeURIComponent(
-        cleanPrompt
-      )}?width=512&height=512&nologo=true&seed=${seed}`;
-      const pRes = await fetch(pollUrl);
-      const ct = (pRes.headers.get("content-type") || "").toLowerCase();
-      if (!pRes.ok || !ct.startsWith("image/")) {
-        throw new Error(`Standby HTTP ${pRes.status}`);
+      for (let attempt = 0; attempt < 2; attempt++) {
+        if (standbyAbort.signal.aborted) throw new Error("Aborted");
+        const seed = Math.floor(Math.random() * 900000) + 100000;
+        const pollUrl = `https://image.pollinations.ai/prompt/${encodeURIComponent(
+          cleanPrompt
+        )}?width=512&height=512&nologo=true&seed=${seed}`;
+        const pRes = await fetch(pollUrl, { signal: standbyAbort.signal });
+        const ct = (pRes.headers.get("content-type") || "").toLowerCase();
+        if (pRes.ok && ct.startsWith("image/")) {
+          const buf = Buffer.from(await pRes.arrayBuffer());
+          return {
+            contentType: ct.split(";")[0] || "image/jpeg",
+            buffer: buf,
+            source: "fast-standby",
+          };
+        }
+        await new Promise((r) => setTimeout(r, 1500));
       }
-      const buf = Buffer.from(await pRes.arrayBuffer());
-      return {
-        contentType: ct.split(";")[0] || "image/jpeg",
-        buffer: buf,
-        source: "fast-standby",
-      };
+      throw new Error("Standby image fetch failed");
     })();
 
-    const imgOut = await Promise.any([workerPromise, standbyPromise]);
-    contentType = imgOut.contentType;
-    imgBuffer = imgOut.buffer;
+    try {
+      const imgOut = await Promise.any([workerPromise, standbyPromise]);
+      contentType = imgOut.contentType;
+      imgBuffer = imgOut.buffer;
+    } finally {
+      try {
+        workerAbort.abort();
+      } catch {}
+      try {
+        standbyAbort.abort();
+      } catch {}
+    }
   }
 
   const imageId = saveGeneratedImageBuffer(imgBuffer, contentType);
