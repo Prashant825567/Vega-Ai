@@ -902,7 +902,8 @@ async function collectSSEStream(response, fallbackModel) {
   let usage = null;
   const toolCallsMap = new Map();
 
-  while (true) {
+  let streamDone = false;
+  while (!streamDone) {
     const { value, done } = await reader.read();
     if (done) break;
     buffer += decoder.decode(value, { stream: true });
@@ -914,7 +915,14 @@ async function collectSSEStream(response, fallbackModel) {
       const line = rawLine.trim();
       if (!line.startsWith("data:")) continue;
       const dataStr = line.slice(5).trim();
-      if (!dataStr || dataStr === "[DONE]") continue;
+      if (!dataStr) continue;
+      if (dataStr === "[DONE]") {
+        streamDone = true;
+        try {
+          reader.cancel();
+        } catch {}
+        break;
+      }
 
       try {
         const chunk = JSON.parse(dataStr);
@@ -1274,7 +1282,11 @@ async function transcribeWithGeminiSTT({ audioBase64, mimeType = "audio/wav", la
           },
         ],
         generationConfig: {
-          temperature: 0.1,
+          temperature: 0.0,
+          maxOutputTokens: 128,
+          ...(modelName.includes("2.5") || modelName.includes("3")
+            ? { thinkingConfig: { thinkingBudget: 0 } }
+            : {}),
         },
       }),
     });
@@ -1477,7 +1489,7 @@ function synthesizeWithGeminiLiveAudio({
               if (chunkIdleTimer) clearTimeout(chunkIdleTimer);
               chunkIdleTimer = setTimeout(() => {
                 if (pcmChunks.length > 0) finishSuccess();
-              }, 450);
+              }, 260);
             }
           }
         }
