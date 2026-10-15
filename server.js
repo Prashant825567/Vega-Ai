@@ -246,7 +246,7 @@ function detectNeedsThinking(text) {
   if (!q) return false;
   // Casual greetings / identity questions never need web search or deep thinking
   if (
-    /^(hi|hello|hey|namaste|namaskar|kaise ho|kaisa hai|kaisi ho|kya haal|how are you|who are you|tum kaun ho|aap kaun ho|tera naam|tumhara naam|what is your name|good morning|good evening|good night|aur batao|sab badhiya|thank you|thanks|shukriya|ok|okay|accha|theek hai)[?!.\s]*$/i.test(
+    /^(hi|hello|hey|namaste|namaskar|kaise ho|kaisa hai|kaisi ho|kya haal|how are you|who are you|tum kaun ho|aap kaun ho|tera naam|tumhara naam|what is your name|good morning|good evening|good night|aur batao|sab badhiya|thank you|thanks|shukriya|ok|okay|accha|theek hai|नमस्ते|नमस्कार|कैसे हो|क्या हाल है|तुम कौन हो|आप कौन हो|आपका नाम क्या है|शुक्रिया|धन्यवाद|ठीक है)[?!.।\s]*$/i.test(
       q
     )
   ) {
@@ -255,8 +255,9 @@ function detectNeedsThinking(text) {
   const thinkingPatterns = [
     /\b(research|analyze|analyse|compare|calculate|solve|explain in detail|deep dive|step by step|history of|difference between|write code|algorithm|debug)\b/i,
     /\b(search|web search|google|internet|online|latest|current|today|tonight|yesterday|recent|now|news|breaking|price|rate|weather|temperature|forecast|score|live|update|2024|2025|2026|2027|ipl|match|world cup|t20|cricket|football|stock|share|bitcoin|btc|eth|crypto|gold|silver|sensex|nifty|dollar|rupee|inr|usd)\b/i,
-    /\b(who is|what is the current|who won|winner|prime minister|president|chief minister|ceo|founder|net worth|release date|launch date|upcoming|new movie|box office|specs|specification)\b/i,
-    /\b(soch ke|soch kar|check karke|check karo|pata karke|pata karo|research karke|search karke|search karo|nikal ke|dhundh ke|detail me|detail mein|vistar se|samjhao|hisab laga|solve kar|aaj|abhi|kal|taza|khabar|mausam|bhav|keemat|kitna rate|kya rate|kaun hai|kon hai|kaun jeeta|kon jeeta|sona|chandi)\b/i,
+    /\b(who is|what is the current|who won|winner|prime minister|president|chief minister|ceo|founder|net worth|release date|launch date|upcoming|new movie|box office|collection|subscribers|followers|richest|top 5|top 10|specs|specification)\b/i,
+    /\b(soch ke|soch kar|check karke|check karo|pata karke|pata karo|research karke|search karke|search karo|nikal ke|dhundh ke|detail me|detail mein|vistar se|samjhao|hisab laga|solve kar|aaj|abhi|kal|taza|khabar|mausam|bhav|keemat|kitna rate|kya rate|kaun hai|kon hai|kaun jeeta|kon jeeta|sona|chandi|kamai|naya|nayi|konsa|kaunsa)\b/i,
+    /(आज|अभी|कल|ताजा|ताज़ा|खबर|ख़बर|न्यूज|न्यूज़|प्राइस|भाव|कीमत|रेट|मौसम|तापमान|बारिश|स्कोर|मैच|आईपीएल|क्रिकेट|कौन है|क्या है|कब|कितना|कितनी|कितने|सर्च|रिसर्च|गूगल|पता कर|चेक कर|सोना|सोने|चांदी|बिटकॉइन|शेयर|मार्केट|फिल्म|मूवी|कलेक्शन|कमाई|प्रधानमंत्री|राष्ट्रपति|मुख्यमंत्री|विजेता|जीता|लॉन्च|रिलीज|रिलीज़|सब्सक्राइबर|फॉलोअर्स|नेट वर्थ|सबसे ज्यादा|नया मॉडल)/,
   ];
   if (q.length > 140) return true;
   return thinkingPatterns.some((re) => re.test(q));
@@ -552,9 +553,36 @@ function parseMcpWebSearchResponse(rawText) {
   return "";
 }
 
+function formatCompactSearchResults(rawText, maxResults = 6, maxExcerptChars = 480) {
+  if (!rawText || typeof rawText !== "string") return "";
+  const trimmed = rawText.trim();
+  try {
+    const parsed = JSON.parse(trimmed);
+    if (Array.isArray(parsed?.results) && parsed.results.length > 0) {
+      const lines = [];
+      for (const item of parsed.results.slice(0, maxResults)) {
+        const title = String(item.title || "Untitled").trim();
+        const url = String(item.url || "").trim();
+        const date = item.publish_date ? ` (${item.publish_date})` : "";
+        const excerptText = Array.isArray(item.excerpts)
+          ? item.excerpts
+              .map((e) => String(e || "").replace(/\s+/g, " ").trim())
+              .filter(Boolean)
+              .join(" | ")
+              .slice(0, maxExcerptChars)
+          : "";
+        lines.push(`- ${title}${date} [${url}]\n  ${excerptText}`);
+      }
+      return lines.join("\n\n");
+    }
+  } catch {}
+  return trimmed.slice(0, maxResults * maxExcerptChars);
+}
+
 async function executeOpenCodeWebSearch(args = {}, sessionId = getSessionId()) {
   const query = String(args.query || args.objective || "").trim();
   if (!query) return "No search query provided.";
+  const maxResults = Number(args.numResults) || 6;
 
   // 1. Primary OpenCode Web Search Provider: Parallel MCP (`https://search.parallel.ai/mcp`)
   try {
@@ -590,7 +618,7 @@ async function executeOpenCodeWebSearch(args = {}, sessionId = getSessionId()) {
       const raw = await parRes.text();
       const parsedText = parseMcpWebSearchResponse(raw);
       if (parsedText) {
-        return parsedText.slice(0, args.contextMaxCharacters || 14000);
+        return formatCompactSearchResults(parsedText, maxResults, 480);
       }
     }
   } catch {
@@ -618,10 +646,10 @@ async function executeOpenCodeWebSearch(args = {}, sessionId = getSessionId()) {
           name: "web_search_exa",
           arguments: {
             query,
-            type: args.type || "auto",
-            numResults: args.numResults || 8,
+            type: args.type || "fast",
+            numResults: maxResults,
             livecrawl: args.livecrawl || "fallback",
-            contextMaxCharacters: args.contextMaxCharacters || 10000,
+            contextMaxCharacters: args.contextMaxCharacters || 4000,
           },
         },
       }),
@@ -631,7 +659,7 @@ async function executeOpenCodeWebSearch(args = {}, sessionId = getSessionId()) {
       const raw = await exaRes.text();
       const parsedText = parseMcpWebSearchResponse(raw);
       if (parsedText) {
-        return parsedText.slice(0, args.contextMaxCharacters || 14000);
+        return formatCompactSearchResults(parsedText, maxResults, 480);
       }
     }
   } catch {}
@@ -802,14 +830,34 @@ function normalizeMessages(body, defaultSystem = DEFAULT_SYSTEM_PROMPT) {
     }
   }
 
+  const webSearchRuleSuffix =
+    ` WEB SEARCH RULE: You have real-time internet access via OpenCode 'websearch' and 'webfetch' tools. For current events, news, live prices/rates, weather, scores, 2025/2026 facts, or online lookups, use live OpenCode web search facts (or call 'websearch' if not already provided). CRITICAL RULE: NEVER call bash, edit, glob, grep, or read.`;
+
   const hasSystem = messages.some(
     (m) => m && (m.role === "system" || m.role === "developer")
   );
   const customSystem = body.system || body.systemPrompt;
   if (customSystem) {
-    messages.unshift({ role: "system", content: String(customSystem) });
+    const sysStr = String(customSystem);
+    messages.unshift({
+      role: "system",
+      content: sysStr.includes("WEB SEARCH RULE") ? sysStr : `${sysStr}${webSearchRuleSuffix}`,
+    });
   } else if (!hasSystem) {
     messages.unshift({ role: "system", content: defaultSystem });
+  } else {
+    messages = messages.map((m, i) => {
+      if (
+        i === 0 &&
+        m &&
+        (m.role === "system" || m.role === "developer") &&
+        typeof m.content === "string" &&
+        !m.content.includes("WEB SEARCH RULE")
+      ) {
+        return { ...m, content: `${m.content}${webSearchRuleSuffix}` };
+      }
+      return m;
+    });
   }
 
   return messages;
@@ -828,17 +876,23 @@ async function callOpenCodeUpstream(payload) {
   );
 
   const disableReasoning = payload.disableReasoning === true;
+  const lastIdx = Array.isArray(payload.messages) ? payload.messages.length - 1 : -1;
   const preparedMessages = Array.isArray(payload.messages)
     ? payload.messages.map((m, idx) => {
+        if (!disableReasoning || !m || typeof m.content !== "string") return m;
         if (
-          disableReasoning &&
           idx === 0 &&
-          m &&
           (m.role === "system" || m.role === "developer") &&
-          typeof m.content === "string" &&
           !m.content.startsWith("/no_think")
         ) {
           return { ...m, content: `/no_think ${m.content}` };
+        }
+        if (
+          idx === lastIdx &&
+          (m.role === "user" || m.role === "tool") &&
+          !m.content.includes("/no_think")
+        ) {
+          return { ...m, content: `${m.content}\n/no_think` };
         }
         return m;
       })
@@ -1081,8 +1135,9 @@ async function runOpenCodeAgentWithTools(payload, onWebSearchStart = null) {
                 ...workingMessages[i],
                 content:
                   `${orig}\n\n` +
-                  `[Live OpenCode Web Search Results (Date: ${new Date().toISOString().slice(0, 10)}) — use these real-time facts to answer accurately and naturally]:\n` +
-                  `${String(preSearchResults).slice(0, 8000)}`,
+                  `[Live OpenCode Web Search Results (Date: ${new Date().toISOString().slice(0, 10)})]:\n` +
+                  `${String(preSearchResults).slice(0, 3200)}\n\n` +
+                  `IMPORTANT: The live OpenCode web search has ALREADY been executed above. Answer the user's question directly, accurately, and naturally using these live facts. Do NOT call the 'websearch' tool again. /no_think`,
               };
             }
             break;
@@ -1189,7 +1244,12 @@ async function runOpenCodeAgentWithTools(payload, onWebSearchStart = null) {
 
         if (tc.function.name === "websearch") {
           const resultText = await executeOpenCodeWebSearch(args, upstream.sessionId);
-          return { tool_call_id: tc.id, content: resultText };
+          return {
+            tool_call_id: tc.id,
+            content:
+              `${resultText}\n\n` +
+              `IMPORTANT: Live OpenCode web search results are provided above. Answer the user directly and completely using these facts without calling 'websearch' again. /no_think`,
+          };
         }
         if (tc.function.name === "webfetch") {
           const resultText = await executeOpenCodeWebFetch(args);
