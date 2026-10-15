@@ -1,14 +1,10 @@
-"""Gemini 2.5 Audio TTS plugin for LiveKit Agents.
+"""Pipecat TTSService for Gemini 2.5 Native Audio (Replacing LiveKit TTS plugin).
 
-Why both a custom `Gemini25NativeAudioTTS` and `livekit.plugins.google.beta.GeminiTTS`?
-1. `livekit.plugins.google.TTS` uses Google Cloud Text-to-Speech (`google-cloud-texttospeech`),
-   which requires GCP Service Account credentials (`GOOGLE_APPLICATION_CREDENTIALS`).
-2. `livekit.plugins.google.beta.GeminiTTS` uses `generate_content_stream` (`gemini-2.5-flash-preview-tts`),
-   which has a strict 10 requests/day Free Tier quota on Google AI Studio and does not support
-   `models/gemini-2.5-flash-native-audio-preview-12-2025`.
-3. `Gemini25NativeAudioTTS` connects directly to `models/gemini-2.5-flash-native-audio-preview-12-2025`
-   over Google's `BidiGenerateContent` WebSocket with `thinkingBudget=0` and default voice `Aoede`,
-   streaming 24kHz PCM audio chunks into LiveKit's `AudioEmitter` as each chunk arrives!
+Preserves the existing `models/gemini-2.5-flash-native-audio-preview-12-2025` (`BidiGenerateContent`
+WebSocket) Text-to-Speech integration with `thinkingBudget=0` and default smooth female voice `Aoede`:
+- Uses Pipecat's `TextAggregationMode.SENTENCE` so TTS begins immediately on the first LLM sentence.
+- Streams 24kHz 16-bit mono PCM chunks as `TTSAudioRawFrame`s as soon as each chunk arrives.
+- Supports immediate barge-in cancellation (`StartInterruptionFrame` / `CancelFrame`).
 """
 
 from __future__ import annotations
@@ -16,21 +12,31 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
-from typing import List, Optional
+from typing import AsyncGenerator, List, Optional
 
 import websockets
-from livekit.agents import APIConnectOptions, tts, utils
-from livekit.agents.types import DEFAULT_API_CONNECT_OPTIONS
-from livekit.plugins.google import beta as google_beta
 from loguru import logger
+from pipecat.frames.frames import (
+    CancelFrame,
+    EndFrame,
+    ErrorFrame,
+    Frame,
+    InterruptionFrame,
+    TTSAudioRawFrame,
+    TTSStartedFrame,
+    TTSStoppedFrame,
+)
+from pipecat.processors.frame_processor import FrameDirection
+from pipecat.services.settings import TTSSettings
+from pipecat.services.tts_service import TextAggregationMode, TTSService
 
 from app.config import Settings, settings
 from app.latency import TurnLatencyTracker
 from app.prompts import clean_text_for_speech, normalize_voice_name
 
 
-class Gemini25NativeAudioTTS(tts.TTS):
-    """Custom LiveKit TTS streaming 24kHz PCM chunks from `gemini-2.5-flash-native-audio-preview-12-2025`."""
+class Gemini25NativeAudioTTSService(TTSService):
+    """Pipecat TTSService streaming 24kHz PCM chunks from `gemini-2.5-flash-native-audio-preview-12-2025`."""
 
     def __init__(
         self,
@@ -38,15 +44,29 @@ class Gemini25NativeAudioTTS(tts.TTS):
         app_settings: Settings = settings,
         latency_tracker: Optional[TurnLatencyTracker] = None,
         voice_name: Optional[str] = None,
+        sample_rate: Optional[int] = None,
+        **kwargs,
     ) -> None:
+        resolved_voice = normalize_voice_name(
+            voice_name or app_settings.gemini_tts_voice, "Aoede"
+        )
         super().__init__(
-            capabilities=tts.TTSCapabilities(streaming=False),
-            sample_rate=app_settings.tts_sample_rate,
-            num_channels=1,
+            text_aggregation_mode=TextAggregationMode.SENTENCE,
+            push_text_frames=True,
+            push_start_frame=True,
+            push_stop_frames=True,
+            sample_rate=sample_rate or app_settings.tts_sample_rate,
+            settings=TTSSettings(
+                model=app_settings.gemini_tts_model,
+                voice=resolved_voice,
+                language=None,
+            ),
+            **kwargs,
         )
         self._cfg = app_settings
         self._tracker = latency_tracker
-        self._voice = normalize_voice_name(voice_name or self._cfg.gemini_tts_voice, "Aoede")
+        self._voice = resolved_voice
+        self._active_ws: Optional[websockets.ClientConnection] = None
         self._models: List[str] = []
         for m in (
             self._cfg.gemini_tts_model,
@@ -55,255 +75,197 @@ class Gemini25NativeAudioTTS(tts.TTS):
             "models/gemini-3.1-flash-live-preview",
         ):
             clean = m.replace("models/", "").strip()
-            if clean:
-                full = f"models/{clean}"
-                if full not in self._models:
-                    self._models.append(full)
+            if clean and f"models/{clean}" not in self._models:
+                self._models.append(f"models/{clean}")
 
-    @property
-    def model(self) -> str:
-        return self._models[0]
+    def set_voice(self, voice_name: str) -> None:
+        self._voice = normalize_voice_name(voice_name, self._voice)
 
-    @property
-    def provider(self) -> str:
-        return "gemini-live-native-audio"
+    async def _close_active_ws(self) -> None:
+        ws = self._active_ws
+        self._active_ws = None
+        if ws is not None:
+            try:
+                await ws.close()
+            except Exception:
+                pass
 
-    def update_options(self, *, voice_name: Optional[str] = None) -> None:
-        if voice_name:
-            self._voice = normalize_voice_name(voice_name, self._voice)
+    async def stop(self, frame: EndFrame) -> None:
+        await self._close_active_ws()
+        await super().stop(frame)
 
-    def synthesize(
-        self,
-        text: str,
-        *,
-        conn_options: APIConnectOptions = DEFAULT_API_CONNECT_OPTIONS,
-    ) -> tts.ChunkedStream:
-        return Gemini25NativeAudioChunkedStream(
-            tts=self,
-            input_text=text,
-            conn_options=conn_options,
-            app_settings=self._cfg,
-            models=self._models,
-            voice_name=self._voice,
-            latency_tracker=self._tracker,
-        )
+    async def cancel(self, frame: CancelFrame) -> None:
+        await self._close_active_ws()
+        await super().cancel(frame)
 
+    async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
+        if isinstance(frame, InterruptionFrame):
+            await self._close_active_ws()
+        await super().process_frame(frame, direction)
 
-class Gemini25NativeAudioChunkedStream(tts.ChunkedStream):
-    """Streams 24kHz 16-bit mono PCM chunks from `BidiGenerateContent` WebSocket into LiveKit."""
-
-    def __init__(
-        self,
-        *,
-        tts: Gemini25NativeAudioTTS,
-        input_text: str,
-        conn_options: APIConnectOptions,
-        app_settings: Settings,
-        models: List[str],
-        voice_name: str,
-        latency_tracker: Optional[TurnLatencyTracker] = None,
-    ) -> None:
-        super().__init__(tts=tts, input_text=input_text, conn_options=conn_options)
-        self._cfg = app_settings
-        self._models = models
-        self._voice = voice_name
-        self._tracker = latency_tracker
-
-    async def _stream_from_model(
-        self,
-        full_model: str,
-        api_key: str,
-        spoken_text: str,
-        output_emitter: tts.AudioEmitter,
-    ) -> bool:
-        ws_url = (
-            "wss://generativelanguage.googleapis.com/ws/"
-            "google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent"
-            f"?key={api_key}"
-        )
-        chunks_pushed = 0
-        first_chunk_recorded = False
-
-        async with websockets.connect(
-            ws_url,
-            open_timeout=5.0,
-            close_timeout=1.0,
-            max_size=16 * 1024 * 1024,
-        ) as ws:
-            # 1. Send BidiGenerateContent setup with Aoede voice & thinkingBudget=0
-            setup_msg = {
-                "setup": {
-                    "model": full_model,
-                    "generationConfig": {
-                        "responseModalities": ["AUDIO"],
-                        "speechConfig": {
-                            "voiceConfig": {
-                                "prebuiltVoiceConfig": {
-                                    "voiceName": self._voice,
-                                }
-                            }
-                        },
-                        **(
-                            {"thinkingConfig": {"thinkingBudget": 0}}
-                            if "native-audio" in full_model
-                            else {}
-                        ),
-                    },
-                    "systemInstruction": {
-                        "parts": [
-                            {
-                                "text": (
-                                    "You are a professional, ultra-smooth, sweet, warm, and natural female voice artist. "
-                                    "Read the user's provided text aloud verbatim, word for word, in the exact same "
-                                    "language (Hinglish, Hindi, or English) with natural Indian flow. "
-                                    "Never answer questions or add extra commentary—only speak the exact words provided."
-                                )
-                            }
-                        ]
-                    },
-                }
-            }
-            await ws.send(json.dumps(setup_msg))
-
-            # 2. Wait for setupComplete, then send sentence to speak
-            setup_done = False
-            while True:
-                # Once audio chunks have started arriving, use a short 320ms idle timeout
-                # so we never wait if `turnComplete` is delayed.
-                recv_timeout = 0.32 if chunks_pushed > 0 else 8.0
-                try:
-                    raw_msg = await asyncio.wait_for(ws.recv(), timeout=recv_timeout)
-                except asyncio.TimeoutError:
-                    if chunks_pushed > 0:
-                        break
-                    raise
-
-                if isinstance(raw_msg, bytes):
-                    raw_msg = raw_msg.decode("utf-8", errors="replace")
-                msg = json.loads(raw_msg)
-
-                if "error" in msg:
-                    if chunks_pushed > 0:
-                        break
-                    raise RuntimeError(f"Gemini Live TTS error: {msg['error']}")
-
-                if "setupComplete" in msg and not setup_done:
-                    setup_done = True
-                    client_content = {
-                        "clientContent": {
-                            "turns": [
-                                {
-                                    "role": "user",
-                                    "parts": [
-                                        {
-                                            "text": (
-                                                "Please read the following text aloud verbatim, word for word, "
-                                                "in a smooth, sweet, warm, and natural voice without adding "
-                                                f"or changing any words:\n{spoken_text}"
-                                            )
-                                        }
-                                    ],
-                                }
-                            ],
-                            "turnComplete": True,
-                        }
-                    }
-                    await ws.send(json.dumps(client_content))
-                    continue
-
-                server_content = msg.get("serverContent") or {}
-                parts = (server_content.get("modelTurn") or {}).get("parts") or []
-                for part in parts:
-                    inline = part.get("inlineData") or {}
-                    b64_audio = inline.get("data")
-                    if b64_audio:
-                        pcm_bytes = base64.b64decode(b64_audio)
-                        if pcm_bytes:
-                            if not first_chunk_recorded:
-                                first_chunk_recorded = True
-                                if self._tracker:
-                                    self._tracker.mark_tts_first_audio()
-                            output_emitter.push(pcm_bytes)
-                            chunks_pushed += 1
-
-                if (
-                    server_content.get("generationComplete")
-                    or server_content.get("turnComplete")
-                ) and chunks_pushed > 0:
-                    break
-
-        return chunks_pushed > 0
-
-    async def _run(self, output_emitter: tts.AudioEmitter) -> None:
-        spoken_text = clean_text_for_speech(self._input_text)
+    async def run_tts(self, text: str, context_id: str) -> AsyncGenerator[Frame, None]:
+        """Synthesize a sentence via Gemini 2.5 Native Audio WebSocket and yield `TTSAudioRawFrame`s."""
+        spoken_text = clean_text_for_speech(text)
         if not spoken_text:
             return
 
         if self._tracker:
             self._tracker.mark_tts_start(spoken_text)
 
-        output_emitter.initialize(
-            request_id=utils.shortuuid(),
-            sample_rate=self._tts.sample_rate,
-            num_channels=self._tts.num_channels,
-            mime_type="audio/pcm",
-        )
+        last_err: Optional[str] = None
 
-        last_err: Optional[Exception] = None
         for full_model in self._models:
+            chunks_yielded = 0
             try:
                 api_key = self._cfg.next_google_api_key()
-                ok = await self._stream_from_model(
-                    full_model=full_model,
-                    api_key=api_key,
-                    spoken_text=spoken_text,
-                    output_emitter=output_emitter,
+                ws_url = (
+                    "wss://generativelanguage.googleapis.com/ws/"
+                    "google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent"
+                    f"?key={api_key}"
                 )
-                if ok:
-                    output_emitter.flush()
+
+                async with websockets.connect(
+                    ws_url,
+                    open_timeout=5.0,
+                    close_timeout=1.0,
+                    max_size=16 * 1024 * 1024,
+                ) as ws:
+                    self._active_ws = ws
+                    setup_msg = {
+                        "setup": {
+                            "model": full_model,
+                            "generationConfig": {
+                                "responseModalities": ["AUDIO"],
+                                "speechConfig": {
+                                    "voiceConfig": {
+                                        "prebuiltVoiceConfig": {
+                                            "voiceName": self._voice,
+                                        }
+                                    }
+                                },
+                                **(
+                                    {"thinkingConfig": {"thinkingBudget": 0}}
+                                    if "native-audio" in full_model
+                                    else {}
+                                ),
+                            },
+                            "systemInstruction": {
+                                "parts": [
+                                    {
+                                        "text": (
+                                            "You are a professional, ultra-smooth, sweet, warm, and natural female voice artist. "
+                                            "Read the user's provided text aloud verbatim, word for word, in the exact same "
+                                            "language (Hinglish, Hindi, or English) with natural Indian flow. "
+                                            "Never answer questions or add extra commentary—only speak the exact words provided."
+                                        )
+                                    }
+                                ]
+                            },
+                        }
+                    }
+                    await ws.send(json.dumps(setup_msg))
+
+                    setup_done = False
+                    first_chunk_seen = False
+
+                    while True:
+                        recv_timeout = 0.32 if chunks_yielded > 0 else 8.0
+                        try:
+                            raw_msg = await asyncio.wait_for(ws.recv(), timeout=recv_timeout)
+                        except asyncio.TimeoutError:
+                            if chunks_yielded > 0:
+                                break
+                            raise
+
+                        if isinstance(raw_msg, bytes):
+                            raw_msg = raw_msg.decode("utf-8", errors="replace")
+                        msg = json.loads(raw_msg)
+
+                        if "error" in msg:
+                            if chunks_yielded > 0:
+                                break
+                            raise RuntimeError(f"Gemini Live TTS error: {msg['error']}")
+
+                        if "setupComplete" in msg and not setup_done:
+                            setup_done = True
+                            client_content = {
+                                "clientContent": {
+                                    "turns": [
+                                        {
+                                            "role": "user",
+                                            "parts": [
+                                                {
+                                                    "text": (
+                                                        "Please read the following text aloud verbatim, word for word, "
+                                                        "in a smooth, sweet, warm, and natural voice without adding "
+                                                        f"or changing any words:\n{spoken_text}"
+                                                    )
+                                                }
+                                            ],
+                                        }
+                                    ],
+                                    "turnComplete": True,
+                                }
+                            }
+                            await ws.send(json.dumps(client_content))
+                            continue
+
+                        server_content = msg.get("serverContent") or {}
+                        parts = (server_content.get("modelTurn") or {}).get("parts") or []
+                        for part in parts:
+                            b64_audio = (part.get("inlineData") or {}).get("data")
+                            if b64_audio:
+                                pcm_bytes = base64.b64decode(b64_audio)
+                                if pcm_bytes:
+                                    if not first_chunk_seen:
+                                        first_chunk_seen = True
+                                        await self.stop_ttfb_metrics()
+                                        if self._tracker:
+                                            self._tracker.mark_tts_first_audio()
+                                        yield TTSStartedFrame(context_id=context_id)
+
+                                    chunks_yielded += 1
+                                    yield TTSAudioRawFrame(
+                                        audio=pcm_bytes,
+                                        sample_rate=self.sample_rate,
+                                        num_channels=1,
+                                        context_id=context_id,
+                                    )
+
+                        if (
+                            server_content.get("generationComplete")
+                            or server_content.get("turnComplete")
+                        ) and chunks_yielded > 0:
+                            break
+
+                self._active_ws = None
+                if chunks_yielded > 0:
+                    yield TTSStoppedFrame(context_id=context_id)
                     return
+
             except asyncio.CancelledError:
-                # Barge-in interruption: exit immediately
+                await self._close_active_ws()
                 raise
             except Exception as exc:
-                last_err = exc
-                logger.warning(f"Gemini25NativeAudioTTS ({full_model}) retry warning: {exc}")
+                await self._close_active_ws()
+                last_err = f"{full_model}: {exc}"
+                logger.warning(f"Gemini25NativeAudioTTSService retry warning: {last_err}")
                 continue
 
         if last_err:
             logger.error(f"All Gemini 2.5 Native Audio TTS models failed: {last_err}")
-            raise last_err
+            yield ErrorFrame(error=f"TTS failed: {last_err}")
 
 
 def create_gemini_tts(
     *,
     app_settings: Settings = settings,
     latency_tracker: Optional[TurnLatencyTracker] = None,
-) -> tts.TTS:
-    """Create the Gemini 2.5 Audio TTS instance.
-
-    - Uses `Gemini25NativeAudioTTS` (`BidiGenerateContent` WebSocket streaming) for
-      `gemini-2.5-flash-native-audio-*` / `live` models (no 10/day free tier cap).
-    - Uses `livekit.plugins.google.beta.GeminiTTS` if configured with `gemini-2.5-flash-preview-tts`.
-    """
-    model_lower = app_settings.gemini_tts_model.lower()
-    voice = normalize_voice_name(app_settings.gemini_tts_voice, "Aoede")
-
-    if "native-audio" in model_lower or "live" in model_lower:
-        logger.info(
-            f"Using Gemini25NativeAudioTTS ({app_settings.gemini_tts_model}, voice={voice})"
-        )
-        return Gemini25NativeAudioTTS(
-            app_settings=app_settings,
-            latency_tracker=latency_tracker,
-            voice_name=voice,
-        )
-
-    logger.info(
-        f"Using livekit.plugins.google.beta.GeminiTTS ({app_settings.gemini_tts_model}, voice={voice})"
-    )
-    return google_beta.GeminiTTS(
-        model=app_settings.gemini_tts_model.replace("models/", ""),
-        voice_name=voice,
-        api_key=app_settings.next_google_api_key(),
+    voice_name: Optional[str] = None,
+) -> Gemini25NativeAudioTTSService:
+    """Create the Pipecat `Gemini25NativeAudioTTSService` instance."""
+    return Gemini25NativeAudioTTSService(
+        app_settings=app_settings,
+        latency_tracker=latency_tracker,
+        voice_name=voice_name or app_settings.gemini_tts_voice,
     )

@@ -1,15 +1,19 @@
-"""MiMo 2.6 Flash LLM plugin for LiveKit Agents (OpenAI plugin + Custom OpenCode Streaming LLM).
+"""Pipecat LLMService for MiMo v2.6 Flash (Replacing LiveKit LLM plugin).
 
-Supports two modes automatically based on `MIMO_BASE_URL` in `.env`:
-1. OpenCode Zen/Inference Gateway (`https://opencode.ai/inference/v1`):
-   Uses `OpenCodeMiMoLLM(llm.LLM)` which injects OpenCode CLI's dynamic 48-bit inverted-timestamp
-   session/request headers, authentic tool schemas, and built-in `websearch` MCP execution.
+Preserves the existing MiMo v2.6 Flash (`mimo-v2.6-flash-free`) API integration:
+1. OpenCode Gateway (`https://opencode.ai/inference/v1`):
+   Uses `OpenCodeMiMoLLMService(LLMService)` which generates dynamic 48-bit inverted-timestamp
+   session/request headers, attaches OpenCode's authentic tool schemas, streams SSE tokens
+   as `LLMTextFrame`s so TTS starts on the first sentence, executes OpenCode's built-in
+   `websearch` MCP tool with `"Ek second, abhi batata hoon. "` filler, trims chat history to
+   the last N turns, and cancels in-flight streams immediately on barge-in (`StartInterruptionFrame`).
 2. Standard OpenAI-Compatible Endpoint:
-   Uses `livekit.plugins.openai.LLM(model=..., api_key=..., base_url=...)`.
+   Uses Pipecat's `OpenAILLMService(model=..., api_key=..., base_url=...)`.
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import secrets
 import time
@@ -17,18 +21,25 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import httpx
-from livekit.agents import APIConnectOptions, llm, utils
-from livekit.agents.types import DEFAULT_API_CONNECT_OPTIONS, NOT_GIVEN, NotGivenOr
-from livekit.plugins import openai as lk_openai
 from loguru import logger
+from pipecat.frames.frames import (
+    CancelFrame,
+    EndFrame,
+    Frame,
+    InterruptionFrame,
+    LLMContextFrame,
+    LLMFullResponseEndFrame,
+    LLMFullResponseStartFrame,
+)
+from pipecat.processors.aggregators.llm_context import LLMContext
+from pipecat.processors.frame_processor import FrameDirection
+from pipecat.services.llm_service import LLMService
+from pipecat.services.openai.llm import OpenAILLMService
+from pipecat.services.settings import LLMSettings
 
 from app.config import Settings, settings
 from app.latency import TurnLatencyTracker
-from app.prompts import (
-    VOICE_SYSTEM_PROMPT,
-    trim_openai_messages,
-    truncate_livekit_chat_ctx,
-)
+from app.prompts import trim_openai_messages, trim_pipecat_llm_context
 
 _BASE62 = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
 _TOOLS_PATH = Path(__file__).with_name("opencode_tools.json")
@@ -91,13 +102,11 @@ async def _execute_opencode_websearch(
             },
             timeout=10.0,
         )
-        raw = resp.text.strip()
-        for line in raw.splitlines():
+        for line in resp.text.strip().splitlines():
             candidate = line[6:].strip() if line.startswith("data: ") else line.strip()
             if candidate.startswith("{"):
                 data = json.loads(candidate)
-                content = data.get("result", {}).get("content", [])
-                for item in content:
+                for item in data.get("result", {}).get("content", []):
                     if isinstance(item.get("text"), str) and item["text"]:
                         return item["text"][:4000]
     except Exception as exc:
@@ -105,19 +114,37 @@ async def _execute_opencode_websearch(
     return f"Search completed for {query}."
 
 
-class OpenCodeMiMoLLM(llm.LLM):
-    """Custom LiveKit `llm.LLM` for MiMo 2.6 Flash (`mimo-v2.6-flash-free`) via OpenCode."""
+class OpenCodeMiMoLLMService(LLMService):
+    """Pipecat `LLMService` streaming tokens from MiMo v2.6 Flash (`mimo-v2.6-flash-free`)."""
 
     def __init__(
         self,
         *,
         app_settings: Settings = settings,
         latency_tracker: Optional[TurnLatencyTracker] = None,
+        **kwargs,
     ) -> None:
-        super().__init__()
+        super().__init__(
+            settings=LLMSettings(
+                model=app_settings.mimo_model,
+                system_instruction=None,
+                temperature=app_settings.mimo_temperature,
+                max_tokens=app_settings.mimo_max_tokens,
+                top_p=None,
+                top_k=None,
+                frequency_penalty=None,
+                presence_penalty=None,
+                seed=None,
+                filter_incomplete_user_turns=False,
+                user_turn_completion_config=None,
+            ),
+            **kwargs,
+        )
         self._cfg = app_settings
         self._tracker = latency_tracker
         self._session_id = _generate_opencode_id("ses")
+        self._active_task: Optional[asyncio.Task] = None
+
         try:
             import h2 as _h2  # noqa: F401
             use_http2 = True
@@ -130,94 +157,26 @@ class OpenCodeMiMoLLM(llm.LLM):
             limits=httpx.Limits(max_keepalive_connections=10, max_connections=20),
         )
 
-    @property
-    def model(self) -> str:
-        return self._cfg.mimo_model
-
-    @property
-    def provider(self) -> str:
-        return "opencode-mimo"
-
-    async def aclose(self) -> None:
+    async def stop(self, frame: EndFrame) -> None:
+        self._cancel_active_stream()
+        await super().stop(frame)
         await self._http.aclose()
 
-    def chat(
-        self,
-        *,
-        chat_ctx: llm.ChatContext,
-        tools: list[llm.Tool] | None = None,
-        conn_options: APIConnectOptions = DEFAULT_API_CONNECT_OPTIONS,
-        parallel_tool_calls: NotGivenOr[bool] = NOT_GIVEN,
-        tool_choice: NotGivenOr[llm.ToolChoice] = NOT_GIVEN,
-        extra_kwargs: NotGivenOr[dict[str, Any]] = NOT_GIVEN,
-    ) -> llm.LLMStream:
-        return OpenCodeMiMoLLMStream(
-            self,
-            chat_ctx=chat_ctx,
-            tools=tools or [],
-            conn_options=conn_options,
-            app_settings=self._cfg,
-            http_client=self._http,
-            session_id=self._session_id,
-            latency_tracker=self._tracker,
-        )
+    async def cancel(self, frame: CancelFrame) -> None:
+        self._cancel_active_stream()
+        await super().cancel(frame)
 
-
-class OpenCodeMiMoLLMStream(llm.LLMStream):
-    """Streaming SSE response handler for MiMo 2.6 Flash with first-sentence TTS & barge-in support."""
-
-    def __init__(
-        self,
-        llm_instance: OpenCodeMiMoLLM,
-        *,
-        chat_ctx: llm.ChatContext,
-        tools: list[llm.Tool],
-        conn_options: APIConnectOptions,
-        app_settings: Settings,
-        http_client: httpx.AsyncClient,
-        session_id: str,
-        latency_tracker: Optional[TurnLatencyTracker] = None,
-    ) -> None:
-        super().__init__(
-            llm_instance,
-            chat_ctx=chat_ctx,
-            tools=tools,
-            conn_options=conn_options,
-        )
-        self._cfg = app_settings
-        self._http = http_client
-        self._session_id = session_id
-        self._tracker = latency_tracker
-
-    def _extract_openai_messages(self) -> List[Dict[str, Any]]:
-        """Convert LiveKit ChatContext into trimmed OpenAI messages (last N turns)."""
-        truncate_livekit_chat_ctx(self._chat_ctx, self._cfg.max_history_turns)
-        provider_msgs, _ = self._chat_ctx.to_provider_format(format="openai")
-        normalized: List[Dict[str, Any]] = []
-        for m in provider_msgs:
-            role = m.get("role", "user")
-            if role == "developer":
-                role = "system"
-            content = m.get("content", "")
-            if isinstance(content, list):
-                text_parts = [
-                    p.get("text", "")
-                    for p in content
-                    if isinstance(p, dict) and p.get("type") == "text"
-                ]
-                content = " ".join(t for t in text_parts if t).strip()
-            if content:
-                normalized.append({"role": role, "content": str(content)})
-
-        return trim_openai_messages(normalized, max_turns=self._cfg.max_history_turns)
+    def _cancel_active_stream(self) -> None:
+        if self._active_task and not self._active_task.done():
+            self._active_task.cancel()
+        self._active_task = None
 
     async def _stream_single_turn(
         self, messages: List[Dict[str, Any]], emit_tokens: bool = True
     ) -> tuple[str, List[Dict[str, Any]]]:
-        """Stream one SSE completion turn from OpenCode MiMo 2.6 Flash."""
+        """Stream one SSE turn from MiMo v2.6 Flash and push `LLMTextFrame`s downstream."""
         url = f"{self._cfg.mimo_base_url}/chat/completions"
         headers = _build_opencode_headers(self._cfg.mimo_api_key, self._session_id)
-
         payload: Dict[str, Any] = {
             "model": self._cfg.mimo_model,
             "messages": messages,
@@ -225,6 +184,7 @@ class OpenCodeMiMoLLMStream(llm.LLMStream):
             "temperature": self._cfg.mimo_temperature,
             "max_tokens": self._cfg.mimo_max_tokens,
             "reasoning_effort": "none",
+            "reasoning": {"enabled": False, "effort": "none"},
             "thinking": {"type": "disabled"},
             "tools": _OPENCODE_TOOLS,
             "tool_choice": "auto",
@@ -233,7 +193,6 @@ class OpenCodeMiMoLLMStream(llm.LLMStream):
         full_text = ""
         tool_calls_by_idx: Dict[int, Dict[str, Any]] = {}
         first_token_seen = False
-        req_id = utils.shortuuid()
 
         async with self._http.stream("POST", url, headers=headers, json=payload) as resp:
             if resp.status_code != 200:
@@ -258,28 +217,18 @@ class OpenCodeMiMoLLMStream(llm.LLMStream):
                     continue
                 delta = choices[0].get("delta") or {}
 
-                # 1. Stream text tokens immediately so TTS starts on the first sentence
                 token = delta.get("content")
                 if token:
                     if not first_token_seen:
                         first_token_seen = True
+                        await self.stop_ttfb_metrics()
                         if self._tracker:
                             self._tracker.mark_llm_first_token(token)
                     full_text += token
                     if emit_tokens:
-                        self._event_ch.send_nowait(
-                            llm.ChatChunk(
-                                id=req_id,
-                                delta=llm.ChoiceDelta(
-                                    role="assistant",
-                                    content=token,
-                                ),
-                            )
-                        )
+                        await self._push_llm_text(token)
 
-                # 2. Collect tool_calls if MiMo invokes `websearch`
-                tc_deltas = delta.get("tool_calls") or []
-                for tc in tc_deltas:
+                for tc in delta.get("tool_calls") or []:
                     idx = tc.get("index", 0)
                     entry = tool_calls_by_idx.setdefault(
                         idx,
@@ -299,32 +248,19 @@ class OpenCodeMiMoLLMStream(llm.LLMStream):
 
         return full_text, list(tool_calls_by_idx.values())
 
-    async def _run(self) -> None:
+    async def process_context_messages(self, messages: List[Dict[str, Any]]) -> str:
+        """Execute a complete streaming turn (including optional `websearch` tool call)."""
         if self._tracker:
             self._tracker.mark_llm_start()
 
-        messages = self._extract_openai_messages()
-        _, tool_calls = await self._stream_single_turn(messages, emit_tokens=True)
+        await self.start_ttfb_metrics()
+        trimmed = trim_openai_messages(messages, max_turns=self._cfg.max_history_turns)
+        full_text, tool_calls = await self._stream_single_turn(trimmed, emit_tokens=True)
 
-        # If MiMo 2.6 Flash decided to run `websearch`, speak filler immediately and fetch live results
         if tool_calls:
-            filler_id = utils.shortuuid()
-            self._event_ch.send_nowait(
-                llm.ChatChunk(
-                    id=filler_id,
-                    delta=llm.ChoiceDelta(
-                        role="assistant",
-                        content="Ek second, abhi batata hoon. ",
-                    ),
-                )
-            )
-            messages.append(
-                {
-                    "role": "assistant",
-                    "content": "",
-                    "tool_calls": tool_calls,
-                }
-            )
+            filler = "Ek second, abhi batata hoon. "
+            await self._push_llm_text(filler)
+            trimmed.append({"role": "assistant", "content": "", "tool_calls": tool_calls})
             for tc in tool_calls:
                 fn_name = tc["function"]["name"]
                 try:
@@ -341,43 +277,69 @@ class OpenCodeMiMoLLMStream(llm.LLMStream):
                 else:
                     result = "Tool not required in voice mode."
 
-                messages.append(
-                    {
-                        "role": "tool",
-                        "tool_call_id": tc["id"],
-                        "content": result,
-                    }
+                trimmed.append(
+                    {"role": "tool", "tool_call_id": tc["id"], "content": result}
                 )
 
-            await self._stream_single_turn(messages, emit_tokens=True)
+            second_text, _ = await self._stream_single_turn(trimmed, emit_tokens=True)
+            full_text = f"{filler}{second_text}".strip()
+
+        return full_text
+
+    async def _process_context(self, context: LLMContext) -> None:
+        messages = trim_pipecat_llm_context(
+            context, max_turns=self._cfg.max_history_turns
+        )
+        await self.process_context_messages(messages)
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
+        await super().process_frame(frame, direction)
+
+        if isinstance(frame, InterruptionFrame):
+            self._cancel_active_stream()
+            await self.push_frame(frame, direction)
+            return
+
+        if isinstance(frame, LLMContextFrame):
+            self._cancel_active_stream()
+            try:
+                await self.push_frame(LLMFullResponseStartFrame())
+                await self.start_processing_metrics()
+                self._active_task = asyncio.current_task()
+                await self._process_context(frame.context)
+            except asyncio.CancelledError:
+                logger.info("OpenCodeMiMoLLMService stream cancelled due to barge-in interruption.")
+                raise
+            except Exception as exc:
+                await self.push_error(error_msg=f"MiMo LLM error: {exc}", exception=exc)
+            finally:
+                self._active_task = None
+                await self.stop_processing_metrics()
+                await self.push_frame(LLMFullResponseEndFrame())
+        else:
+            await self.push_frame(frame, direction)
 
 
 def create_mimo_llm(
     *,
     app_settings: Settings = settings,
     latency_tracker: Optional[TurnLatencyTracker] = None,
-) -> llm.LLM:
-    """Create the MiMo 2.6 Flash LLM instance.
-
-    - Uses `OpenCodeMiMoLLM` when `MIMO_BASE_URL` points to `opencode.ai` (handles dynamic CLI headers & tools).
-    - Uses `livekit.plugins.openai.LLM` when pointed at any standard OpenAI-compatible base URL.
-    """
+) -> LLMService:
+    """Create the Pipecat LLMService for MiMo v2.6 Flash."""
     if app_settings.is_opencode_gateway:
         logger.info(
-            f"Using OpenCodeMiMoLLM ({app_settings.mimo_model}) -> {app_settings.mimo_base_url}"
+            f"Using OpenCodeMiMoLLMService ({app_settings.mimo_model}) -> {app_settings.mimo_base_url}"
         )
-        return OpenCodeMiMoLLM(
+        return OpenCodeMiMoLLMService(
             app_settings=app_settings,
             latency_tracker=latency_tracker,
         )
 
     logger.info(
-        f"Using livekit.plugins.openai.LLM ({app_settings.mimo_model}) -> {app_settings.mimo_base_url}"
+        f"Using Pipecat OpenAILLMService ({app_settings.mimo_model}) -> {app_settings.mimo_base_url}"
     )
-    return lk_openai.LLM(
+    return OpenAILLMService(
         model=app_settings.mimo_model,
         api_key=app_settings.mimo_api_key,
         base_url=app_settings.mimo_base_url,
-        temperature=app_settings.mimo_temperature,
-        max_completion_tokens=app_settings.mimo_max_tokens,
     )

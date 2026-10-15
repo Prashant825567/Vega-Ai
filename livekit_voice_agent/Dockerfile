@@ -8,6 +8,12 @@ WORKDIR /app
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     curl \
+    ffmpeg \
+    libavdevice-dev \
+    libavfilter-dev \
+    libopus-dev \
+    libvpx-dev \
+    pkg-config \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
@@ -15,9 +21,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
-# Pre-download Silero VAD weights at build time so container startup is instant
-RUN python -c "from livekit.plugins import silero; silero.VAD.load()"
+# Pre-warm Silero VAD ONNX weights at image build time
+RUN python -c "from pipecat.audio.vad.silero import SileroVADAnalyzer; SileroVADAnalyzer()"
 
 EXPOSE 8000
 
-CMD ["python", "-m", "app.agent", "start"]
+CMD ["uvicorn", "app.server:app", "--host", "0.0.0.0", "--port", "8000"]

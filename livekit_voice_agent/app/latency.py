@@ -1,4 +1,4 @@
-"""Per-turn latency logger for STT, LLM first token (TTFT), TTS first audio (TTFA), and Total turnaround."""
+"""Per-turn latency tracker & Pipecat FrameProcessor for STT, LLM TTFT, TTS TTFA, and Total latency."""
 
 from __future__ import annotations
 
@@ -7,14 +7,24 @@ from collections import deque
 from dataclasses import asdict, dataclass
 from typing import Any, Deque, Dict, List, Optional
 
-from livekit.agents import metrics
 from loguru import logger
+from pipecat.frames.frames import (
+    Frame,
+    InterruptionFrame,
+    LLMFullResponseStartFrame,
+    LLMTextFrame,
+    TranscriptionFrame,
+    TTSAudioRawFrame,
+    VADUserStartedSpeakingFrame,
+    VADUserStoppedSpeakingFrame,
+)
+from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 
 
 @dataclass
 class TurnLatencyRecord:
     turn_id: int
-    room_name: str
+    session_id: str
     transcript: str
     stt_ms: float
     llm_first_token_ms: float
@@ -66,8 +76,8 @@ global_latency_store = LatencyMetricsStore()
 class TurnLatencyTracker:
     """Tracks per-turn STT, LLM first token, TTS first audio, and total turnaround latency."""
 
-    def __init__(self, room_name: str = "default") -> None:
-        self.room_name = room_name
+    def __init__(self, session_id: str = "default") -> None:
+        self.session_id = session_id
         self.turn_id: int = 0
         self.t_turn_start: Optional[float] = None
         self.t_stt_start: Optional[float] = None
@@ -109,7 +119,7 @@ class TurnLatencyTracker:
         )
         self.last_stt_ms = stt_ms
         logger.info(
-            f"[Room={self.room_name} | Turn #{self.turn_id}] "
+            f"[Session={self.session_id} | Turn #{self.turn_id}] "
             f"STT Latency = {stt_ms:.1f}ms | Transcript={transcript!r}"
         )
         return stt_ms
@@ -137,7 +147,7 @@ class TurnLatencyTracker:
         )
         self.last_llm_ttft_ms = ttft_ms
         logger.info(
-            f"[Room={self.room_name} | Turn #{self.turn_id}] "
+            f"[Session={self.session_id} | Turn #{self.turn_id}] "
             f"LLM First Token (TTFT) = {ttft_ms:.1f}ms | FirstChunk={first_token!r}"
         )
         return ttft_ms
@@ -146,7 +156,7 @@ class TurnLatencyTracker:
         if self.t_tts_start is None:
             self.t_tts_start = time.perf_counter()
             logger.debug(
-                f"[Room={self.room_name} | Turn #{self.turn_id}] "
+                f"[Session={self.session_id} | Turn #{self.turn_id}] "
                 f"TTS starting on first LLM sentence: {sentence!r}"
             )
 
@@ -178,7 +188,7 @@ class TurnLatencyTracker:
 
         record = TurnLatencyRecord(
             turn_id=self.turn_id,
-            room_name=self.room_name,
+            session_id=self.session_id,
             transcript=self.current_transcript,
             stt_ms=round(stt_ms, 1),
             llm_first_token_ms=round(llm_ms, 1),
@@ -190,7 +200,7 @@ class TurnLatencyTracker:
         global_latency_store.add(record)
 
         logger.success(
-            f"⚡ [TURN #{self.turn_id} LATENCY | room={self.room_name}] "
+            f"⚡ [TURN #{self.turn_id} LATENCY | session={self.session_id}] "
             f"STT={record.stt_ms:.1f}ms | "
             f"LLM_first_token={record.llm_first_token_ms:.1f}ms | "
             f"TTS_first_audio={record.tts_first_audio_ms:.1f}ms | "
@@ -200,22 +210,35 @@ class TurnLatencyTracker:
 
     def mark_interruption(self) -> None:
         logger.warning(
-            f"🛑 [BARGE-IN | room={self.room_name} | Turn #{self.turn_id}] "
+            f"🛑 [BARGE-IN | session={self.session_id} | Turn #{self.turn_id}] "
             f"User interrupted — active LLM + TTS streams cancelled!"
         )
 
-    def on_livekit_metrics(self, ev: Any) -> None:
-        """Handle LiveKit AgentSession `metrics_collected` events."""
-        m = getattr(ev, "metrics", ev)
-        if isinstance(m, metrics.STTMetrics):
-            if self.last_stt_ms == 0.0 and m.duration > 0:
-                self.mark_stt_done(self.current_transcript, duration_ms=m.duration * 1000.0)
-        elif isinstance(m, metrics.EOUMetrics):
-            if self.last_stt_ms == 0.0 and m.transcription_delay > 0:
-                self.last_stt_ms = m.transcription_delay * 1000.0
-        elif isinstance(m, metrics.LLMMetrics):
-            if m.ttft > 0 and self.last_llm_ttft_ms == 0.0:
-                self.mark_llm_first_token(ttft_ms_override=m.ttft * 1000.0)
-        elif isinstance(m, metrics.TTSMetrics):
-            if m.ttfb > 0:
-                self.mark_tts_first_audio(ttfa_ms_override=m.ttfb * 1000.0)
+
+class TurnLatencyObserverProcessor(FrameProcessor):
+    """Pipecat FrameProcessor observing VAD, STT, LLM, TTS, and Barge-In frames."""
+
+    def __init__(self, tracker: TurnLatencyTracker, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self._tracker = tracker
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
+        await super().process_frame(frame, direction)
+
+        if isinstance(frame, InterruptionFrame):
+            self._tracker.mark_interruption()
+        elif isinstance(frame, VADUserStoppedSpeakingFrame):
+            if self._tracker.t_stt_start is None:
+                self._tracker.mark_stt_start()
+        elif isinstance(frame, TranscriptionFrame):
+            if self._tracker.last_stt_ms == 0.0 and frame.text:
+                self._tracker.mark_stt_done(frame.text)
+        elif isinstance(frame, LLMFullResponseStartFrame):
+            if self._tracker.t_llm_start is None:
+                self._tracker.mark_llm_start()
+        elif isinstance(frame, LLMTextFrame):
+            self._tracker.mark_llm_first_token(frame.text)
+        elif isinstance(frame, TTSAudioRawFrame):
+            self._tracker.mark_tts_first_audio()
+
+        await self.push_frame(frame, direction)

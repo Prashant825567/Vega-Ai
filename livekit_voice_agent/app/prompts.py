@@ -1,11 +1,11 @@
-"""Short voice-first system prompt and chat history truncation for Max v1.0."""
+"""MAX v1 voice-first system prompt, voice normalization, and N-turn chat history trimmer."""
 
 from __future__ import annotations
 
 import re
 from typing import Any, Dict, List
 
-from livekit.agents import llm
+from pipecat.processors.aggregators.llm_context import LLMContext
 
 VOICE_SYSTEM_PROMPT = (
     "You are Max v1.0, the ultra-fast real-time voice AI assistant for the Vega app. "
@@ -32,7 +32,7 @@ SUPPORTED_FEMALE_VOICES = [
 
 
 def normalize_voice_name(voice: str | None, default: str = "Aoede") -> str:
-    """Resolve voice name against Gemini 2.5's smooth female voice list."""
+    """Resolve user-requested voice name against Gemini 2.5's smooth female voice list."""
     if not voice:
         return default
     cleaned = voice.strip().lower()
@@ -54,13 +54,6 @@ def clean_text_for_speech(text: str) -> str:
     return cleaned.strip()
 
 
-def truncate_livekit_chat_ctx(chat_ctx: llm.ChatContext, max_turns: int = 6) -> llm.ChatContext:
-    """Keep only the system prompt + last `max_turns` user/assistant turns in LiveKit ChatContext."""
-    max_items = max(2, max_turns * 2)
-    chat_ctx.truncate(max_items=max_items)
-    return chat_ctx
-
-
 def trim_openai_messages(
     messages: List[Dict[str, Any]], max_turns: int = 6
 ) -> List[Dict[str, Any]]:
@@ -68,8 +61,16 @@ def trim_openai_messages(
     if not messages:
         return [{"role": "system", "content": VOICE_SYSTEM_PROMPT}]
 
-    system_msgs = [m for m in messages if m.get("role") in ("system", "developer")]
-    non_system = [m for m in messages if m.get("role") not in ("system", "developer")]
+    system_msgs = [
+        m
+        for m in messages
+        if isinstance(m, dict) and m.get("role") in ("system", "developer")
+    ]
+    non_system = [
+        m
+        for m in messages
+        if isinstance(m, dict) and m.get("role") not in ("system", "developer")
+    ]
 
     max_non_system = max(2, max_turns * 2)
     trimmed = non_system[-max_non_system:]
@@ -82,3 +83,26 @@ def trim_openai_messages(
         else [{"role": "system", "content": VOICE_SYSTEM_PROMPT}]
     )
     return head + trimmed
+
+
+def trim_pipecat_llm_context(context: LLMContext, max_turns: int = 6) -> List[Dict[str, Any]]:
+    """Trim a Pipecat `LLMContext` in-place to the system prompt + last `max_turns` turns."""
+    raw_messages = list(context.get_messages())
+    normalized: List[Dict[str, Any]] = []
+    for m in raw_messages:
+        if isinstance(m, dict):
+            role = "system" if m.get("role") == "developer" else str(m.get("role", "user"))
+            content = m.get("content", "")
+            if isinstance(content, list):
+                text_parts = [
+                    p.get("text", "")
+                    for p in content
+                    if isinstance(p, dict) and p.get("type") == "text"
+                ]
+                content = " ".join(t for t in text_parts if t).strip()
+            if content:
+                normalized.append({"role": role, "content": str(content)})
+
+    trimmed = trim_openai_messages(normalized, max_turns=max_turns)
+    context.set_messages(trimmed)
+    return trimmed

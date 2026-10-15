@@ -1,48 +1,52 @@
-"""Custom LiveKit STT plugin for Gemini 3.1 Flash using Silero VAD + StreamAdapter.
+"""Pipecat SegmentedSTTService for Gemini 3.1 Flash (Replacing LiveKit STT + StreamAdapter).
 
-Why a custom STT class?
-- `livekit.plugins.google.STT` uses Google Cloud Speech-to-Text (`cloud_speech_v2`), which
-  requires GCP Service Account credentials (`GOOGLE_APPLICATION_CREDENTIALS`).
-- `livekit.plugins.google.beta.GeminiSTT` only accepts Live models (`gemini-3.5-transcribe-live`)
-  and rejects standard Gemini Flash models (`gemini-3.1-flash-lite-preview`).
-- `GeminiFlashSTT` accepts VAD-segmented audio buffers via `stt.StreamAdapter(stt=..., vad=...)`
-  and transcribes them with `gemini-3.1-flash-lite-preview` (with fallback to `gemini-3-flash-preview`)
-  using your `GOOGLE_API_KEY`.
+Preserves the existing Gemini 3.1 Flash (`gemini-3.1-flash-lite-preview` + fallback `gemini-3-flash-preview`)
+Speech-to-Text API integration and `GOOGLE_API_KEY` / `GEMINI_API_KEY` configuration.
+Upstream `VADProcessor(SileroVADAnalyzer)` emits `VADUserStartedSpeakingFrame` and
+`VADUserStoppedSpeakingFrame`, which `SegmentedSTTService` buffers into a 16-bit mono WAV
+container and passes into `run_stt(audio: bytes)`.
 """
 
 from __future__ import annotations
 
 import base64
-from typing import List, Optional
+from typing import AsyncGenerator, List, Optional
 
 import httpx
-from livekit.agents import APIConnectOptions, LanguageCode, stt, utils, vad
-from livekit.agents.types import DEFAULT_API_CONNECT_OPTIONS, NOT_GIVEN, NotGivenOr
 from loguru import logger
+from pipecat.frames.frames import CancelFrame, EndFrame, ErrorFrame, Frame, TranscriptionFrame
+from pipecat.services.settings import STTSettings
+from pipecat.services.stt_service import SegmentedSTTService
+from pipecat.utils.time import time_now_iso8601
 
 from app.config import Settings, settings
 from app.latency import TurnLatencyTracker
 
 
-class GeminiFlashSTT(stt.STT):
-    """Non-streaming Gemini 3.1 Flash STT designed to be wrapped with `stt.StreamAdapter` + Silero VAD."""
+class GeminiFlashSTTService(SegmentedSTTService):
+    """VAD-segmented Speech-to-Text service using Gemini 3.1 Flash."""
 
     def __init__(
         self,
         *,
         app_settings: Settings = settings,
         latency_tracker: Optional[TurnLatencyTracker] = None,
-        language: str = "hi-IN",
+        sample_rate: Optional[int] = None,
+        trailing_silence_secs: float = 0.15,
+        **kwargs,
     ) -> None:
         super().__init__(
-            capabilities=stt.STTCapabilities(
-                streaming=False,
-                interim_results=False,
-            )
+            sample_rate=sample_rate,
+            trailing_silence_secs=trailing_silence_secs,
+            settings=STTSettings(
+                model=app_settings.gemini_stt_model,
+                language=app_settings.stt_language,
+            ),
+            **kwargs,
         )
         self._cfg = app_settings
         self._tracker = latency_tracker
-        self._language = language or self._cfg.stt_language
+
         try:
             import h2 as _h2  # noqa: F401
             use_http2 = True
@@ -66,34 +70,26 @@ class GeminiFlashSTT(stt.STT):
             if clean and clean not in self._models:
                 self._models.append(clean)
 
-    @property
-    def model(self) -> str:
-        return self._models[0]
-
-    @property
-    def provider(self) -> str:
-        return "google-gemini-flash"
-
-    async def aclose(self) -> None:
+    async def stop(self, frame: EndFrame) -> None:
+        await super().stop(frame)
         await self._http.aclose()
 
-    async def _recognize_impl(
-        self,
-        buffer: utils.AudioBuffer,
-        *,
-        language: NotGivenOr[str] = NOT_GIVEN,
-        conn_options: APIConnectOptions = DEFAULT_API_CONNECT_OPTIONS,
-    ) -> stt.SpeechEvent:
-        """Convert Silero VAD-segmented AudioBuffer to WAV and transcribe with Gemini 3.1 Flash."""
+    async def cancel(self, frame: CancelFrame) -> None:
+        await super().cancel(frame)
+
+    async def run_stt(self, audio: bytes) -> AsyncGenerator[Frame, None]:
+        """Transcribe a VAD-segmented WAV buffer using Gemini 3.1 Flash."""
+        if not audio or len(audio) < 600:
+            return
+
         if self._tracker:
             self._tracker.mark_stt_start()
 
-        merged_frame = utils.merge_frames(buffer)
-        wav_bytes = merged_frame.to_wav_bytes()
+        await self.start_ttfb_metrics()
+        await self.start_processing_metrics()
 
-        lang = language if isinstance(language, str) and language else self._language
-        b64_wav = base64.b64encode(wav_bytes).decode("ascii")
-
+        b64_wav = base64.b64encode(audio).decode("ascii")
+        lang = self._cfg.stt_language
         prompt = (
             "Transcribe this spoken audio accurately into plain text. "
             f"Primary languages: {lang}, Hinglish (Hindi in Latin script), Hindi, or English. "
@@ -132,16 +128,13 @@ class GeminiFlashSTT(stt.STT):
                     f"https://generativelanguage.googleapis.com/v1beta/models/"
                     f"{model_name}:generateContent?key={api_key}"
                 )
-                resp = await self._http.post(
-                    url,
-                    json=payload,
-                    timeout=conn_options.timeout if conn_options else 10.0,
-                )
+                resp = await self._http.post(url, json=payload)
                 if resp.status_code != 200:
                     last_err = f"{model_name} HTTP {resp.status_code}: {resp.text[:160]}"
                     continue
 
                 data = resp.json()
+                await self.stop_ttfb_metrics()
                 candidates = data.get("candidates") or []
                 if candidates:
                     parts = candidates[0].get("content", {}).get("parts") or []
@@ -151,35 +144,32 @@ class GeminiFlashSTT(stt.STT):
                 last_err = f"{model_name} error: {exc}"
                 continue
 
-        if not transcript and last_err:
-            logger.warning(f"GeminiFlashSTT warning: {last_err}")
+        await self.stop_processing_metrics()
 
-        if self._tracker and transcript:
+        if not transcript:
+            if last_err:
+                logger.warning(f"GeminiFlashSTTService warning: {last_err}")
+                yield ErrorFrame(error=f"STT failed: {last_err}")
+            return
+
+        if self._tracker:
             self._tracker.mark_stt_done(transcript)
 
-        return stt.SpeechEvent(
-            type=stt.SpeechEventType.FINAL_TRANSCRIPT,
-            request_id=utils.shortuuid(),
-            alternatives=[
-                stt.SpeechData(
-                    language=LanguageCode(lang),
-                    text=transcript,
-                    confidence=1.0 if transcript else 0.0,
-                )
-            ],
+        yield TranscriptionFrame(
+            transcript,
+            self._user_id,
+            time_now_iso8601(),
         )
 
 
 def create_gemini_stt(
     *,
-    silero_vad: vad.VAD,
     app_settings: Settings = settings,
     latency_tracker: Optional[TurnLatencyTracker] = None,
-) -> stt.StreamAdapter:
-    """Create a streaming-compatible Gemini 3.1 Flash STT wrapped in LiveKit's `stt.StreamAdapter`."""
-    base_stt = GeminiFlashSTT(
+) -> GeminiFlashSTTService:
+    """Create the Pipecat `GeminiFlashSTTService` instance."""
+    return GeminiFlashSTTService(
         app_settings=app_settings,
         latency_tracker=latency_tracker,
-        language=app_settings.stt_language,
+        trailing_silence_secs=0.15,
     )
-    return stt.StreamAdapter(stt=base_stt, vad=silero_vad)

@@ -1,142 +1,56 @@
-# Vega App — Max v1.0 Real-Time Voice Agent (Python + LiveKit Agents)
+# Vega App — MAX v1 Voice Agent (Pipecat + SmallWebRTC)
 
-Real-time streaming voice assistant backend built with **LiveKit Agents (`livekit-agents`)** and **FastAPI**:
+Self-hosted real-time voice agent backend replacing LiveKit with **Pipecat (`pipecat-ai`) + SmallWebRTC (`aiortc`)**:
 
 ```text
-LiveKit Room Audio (WebRTC)
-  └──► Silero VAD + Turn Detection (`stt.StreamAdapter`)
-         └──► STT: Gemini 3.1 Flash (`gemini-3.1-flash-lite-preview`)
-                └──► LLM: MiMo 2.6 Flash (`mimo-v2.6-flash-free` via OpenCode / OpenAI-compatible SSE)
-                       └──► TTS: Gemini 2.5 Native Audio (`gemini-2.5-flash-native-audio-preview-12-2025`, `Aoede`)
-                              └──► Back to LiveKit Room (with Barge-In Interruption)
+SmallWebRTC Peer Audio Input (16kHz PCM)
+  └──► VADProcessor (Silero VAD)
+         └──► GeminiFlashSTTService (`gemini-3.1-flash-lite-preview`, WAV-segmented)
+                └──► LLMContextAggregatorPair.user() (Turn Detection & Barge-In Interruption)
+                       └──► OpenCodeMiMoLLMService (`mimo-v2.6-flash-free`, Streaming SSE + WebSearch)
+                              └──► Gemini25NativeAudioTTSService (`gemini-2.5-flash-native-audio-preview-12-2025`, `Aoede`)
+                                     └──► TurnLatencyObserverProcessor (STT / LLM TTFT / TTS TTFA / Total)
+                                            └──► SmallWebRTC Peer Audio Output (24kHz PCM)
 ```
 
 ---
 
-## 📁 Project Structure
+## 💻 Windows CMD Setup & Run Commands
 
-```text
-livekit_voice_agent/
-├── .env.example              # Environment variable template (no hardcoded secrets)
-├── requirements.txt          # Python dependencies
-├── Dockerfile                # Production Dockerfile for LiveKit Cloud / Render
-├── README.md                 # Setup, local dev, LiveKit Cloud deploy, and Expo integration guide
-└── app/
-    ├── __init__.py
-    ├── config.py             # Loads & validates .env variables
-    ├── prompts.py            # Short voice-first system prompt + N-turn history trimmer
-    ├── latency.py            # Per-turn STT, LLM TTFT, TTS TTFA, and Total latency logger
-    ├── plugins/
-    │   ├── __init__.py
-    │   ├── gemini_stt.py     # Custom `GeminiFlashSTT` wrapped in `stt.StreamAdapter` + Silero VAD
-    │   ├── mimo_llm.py       # `OpenCodeMiMoLLM` (with dynamic CLI headers & websearch) + `openai.LLM`
-    │   ├── opencode_tools.json
-    │   └── gemini_tts.py     # `Gemini25NativeAudioTTS` (Bidi WebSocket 24kHz PCM chunk streaming) + `GeminiTTS`
-    ├── agent.py              # LiveKit Agents Worker entrypoint (`python -m app.agent dev`)
-    └── server.py             # FastAPI Token (`/api/token`), Metrics (`/api/metrics`), and `/health` server
-```
-
----
-
-## 🚀 How to Run Locally
-
-### 1. Create a Virtual Environment & Install Dependencies
-```bash
+```cmd
 cd livekit_voice_agent
-python3 -m venv .venv
-source .venv/bin/activate
+python -m venv .venv
+.venv\Scripts\activate.bat
+python -m pip install --upgrade pip
 pip install -r requirements.txt
+copy .env.example .env
+```
+Edit `.env` (set `GOOGLE_API_KEY` and `SESSION_SECRET`), then start the server:
+```cmd
+python -m uvicorn app.server:app --host 0.0.0.0 --port 8000
 ```
 
-### 2. Configure `.env`
-```bash
-cp .env.example .env
+Verify health in another CMD window:
+```cmd
+curl http://localhost:8000/health
 ```
-Edit `.env` and fill in:
-- `LIVEKIT_URL`, `LIVEKIT_API_KEY`, `LIVEKIT_API_SECRET` (from your LiveKit Cloud project or local `livekit-server --dev`)
-- `GOOGLE_API_KEY` (your Google AI Studio API key)
-- `MIMO_BASE_URL=https://opencode.ai/inference/v1` and `MIMO_API_KEY=public`
-
-### 3. Start the FastAPI Token & Health Server (Terminal 1)
-```bash
-uvicorn app.server:app --host 0.0.0.0 --port 8000 --reload
-```
-- **Health Check:** `curl http://localhost:8000/health`
-- **Issue Expo Room Token:**
-  ```bash
-  curl -X POST http://localhost:8000/api/token \
-    -H "Content-Type: application/json" \
-    -d '{"participant_name":"Prashant","voice":"Aoede"}'
-  ```
-
-### 4. Start the LiveKit Voice Agent Worker (Terminal 2)
-- **Console / Terminal Audio Mode (test directly with your laptop mic & speaker):**
-  ```bash
-  python -m app.agent console
-  ```
-- **Local Development Mode (connects to LiveKit Cloud / local LiveKit Server with hot-reload):**
-  ```bash
-  python -m app.agent dev
-  ```
-- **Production Worker Mode:**
-  ```bash
-  python -m app.agent start
-  ```
 
 ---
 
-## ☁️ Deploying to LiveKit Cloud
+## 🌐 Public Internet Deployment & STUN/TURN Networking
 
-1. Install the LiveKit CLI (`lk`):
-   ```bash
-   curl -sSL https://get.livekit.io/cli | bash
-   lk cloud auth
-   ```
-2. Inside `livekit_voice_agent/`, initialize and deploy the agent worker:
-   ```bash
-   lk agent create \
-     --name vega-max-v1 \
-     --secrets-file .env
-   ```
-3. For subsequent updates:
-   ```bash
-   lk agent deploy
-   ```
-4. Deploy the FastAPI Token Server (`uvicorn app.server:app --host 0.0.0.0 --port $PORT`) on Render / Railway / Fly.io so your Expo React Native app can call `POST /api/token`.
-
----
-
-## 📱 Expo React Native Client Integration (`@livekit/react-native`)
-
-```tsx
-import React, { useState } from "react";
-import { Button, View } from "react-native";
-import { LiveKitRoom, AudioSession, useVoiceAssistant } from "@livekit/react-native";
-
-const TOKEN_API_URL = "https://your-token-server.onrender.com/api/token";
-
-export default function VegaVoiceScreen() {
-  const [conn, setConn] = useState<{ url: string; token: string } | null>(null);
-
-  async function startVoiceSession() {
-    await AudioSession.startAudioSession();
-    const res = await fetch(TOKEN_API_URL, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ participant_name: "Prashant", voice: "Aoede" }),
-    });
-    const data = await res.json();
-    setConn({ url: data.url, token: data.token });
-  }
-
-  if (!conn) {
-    return <Button title="Talk to Max v1.0" onPress={startVoiceSession} />;
-  }
-
-  return (
-    <LiveKitRoom serverUrl={conn.url} token={conn.token} connect={true} audio={true} video={false}>
-      <View />
-    </LiveKitRoom>
-  );
-}
-```
+1. **Signaling Over HTTPS:**
+   - `GET /health`
+   - `POST /api/session` (creates a signed session token and returns `iceServers`)
+   - `POST /api/offer` (exchanges WebRTC SDP Offer/Answer via `SmallWebRTCRequestHandler`)
+   - `PATCH /api/offer` (trickle ICE candidates)
+   - `DELETE /api/session/{pc_id}` (disconnect & resource cleanup)
+2. **UDP Media Ports & TURN Server Requirement:**
+   - `SmallWebRTC` (`aiortc`) establishes a direct peer-to-peer WebRTC media connection between the mobile client and the Python server.
+   - On a VPS/VM (AWS EC2, DigitalOcean, Hetzner, GCP VM) with a public IP and open UDP ports, STUN (`stun:stun.l.google.com:19302`) works for most networks.
+   - For mobile clients behind **Symmetric NAT / carrier-grade NAT (4G/5G)** or when hosting the backend behind a container proxy (like Render/Railway where arbitrary UDP ports are not exposed), configure a **TURN server** (e.g., self-hosted `coturn`, Cloudflare Calls TURN, or Metered TURN) in `.env`:
+     ```ini
+     TURN_SERVER_URL=turn:your-turn-server.com:3478?transport=tcp
+     TURN_USERNAME=your_turn_user
+     TURN_CREDENTIAL=your_turn_password
+     ```
