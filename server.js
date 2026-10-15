@@ -1226,8 +1226,8 @@ function pcm16ToWavBuffer(pcmBuffer, sampleRate = 24000, numChannels = 1, bitsPe
   return Buffer.concat([header, pcmBuffer]);
 }
 
-function cleanTextForSpeech(text) {
-  return String(text || "")
+function cleanTextForSpeech(text, maxChars = 320) {
+  let cleaned = String(text || "")
     .replace(/```[\s\S]*?```/g, " ")
     .replace(/`([^`]+)`/g, "$1")
     .replace(/\*\*([^*]+)\*\*/g, "$1")
@@ -1237,6 +1237,17 @@ function cleanTextForSpeech(text) {
     .replace(/\s*[–—]\s*/g, " to ")
     .replace(/\s+/g, " ")
     .trim();
+  if (maxChars > 0 && cleaned.length > maxChars) {
+    const slice = cleaned.slice(0, maxChars);
+    const lastBoundary = Math.max(
+      slice.lastIndexOf(". "),
+      slice.lastIndexOf("? "),
+      slice.lastIndexOf("! "),
+      slice.lastIndexOf("। ")
+    );
+    cleaned = lastBoundary > 60 ? slice.slice(0, lastBoundary + 1).trim() : slice.trim();
+  }
+  return cleaned;
 }
 
 // ─── Step 1 (STT): Gemini Speech-to-Text (with automatic model fallback) ─────
@@ -2158,9 +2169,10 @@ const server = http.createServer(async (req, res) => {
 
       // Step 2: Middle LLM (`mimo-v2.6-flash-free` via OpenCode as Max v1.0 + Built-in OpenCode Web Search)
       const fillerCacheKey = `${selectedVoice}::${body.fillerText || DEFAULT_FILLER_TEXT}`;
+      const trimmedHistory = Array.isArray(body.history) ? body.history.slice(-6) : undefined;
       const llmMessages = normalizeMessages(
         {
-          history: body.history,
+          history: trimmedHistory,
           system: body.system || body.systemPrompt,
           message: userTranscript,
         },
@@ -2172,7 +2184,7 @@ const server = http.createServer(async (req, res) => {
           model: body.model || DEFAULT_MODEL,
           messages: llmMessages,
           temperature: body.temperature ?? 0.6,
-          max_tokens: body.max_tokens,
+          max_tokens: body.max_tokens || 120,
           disableReasoning,
           allowWebSearch: needsThinking,
         },
@@ -2359,7 +2371,7 @@ const server = http.createServer(async (req, res) => {
     }
 
     try {
-      const disableReasoning = body.fast === true || body.reasoning === false;
+      const disableReasoning = body.reasoning === true ? false : true;
 
       if (body.stream === true) {
         const result = await callOpenCodeUpstream({
@@ -2384,10 +2396,18 @@ const server = http.createServer(async (req, res) => {
           Connection: "keep-alive",
         });
         const reader = result.response.body.getReader();
+        const dec = new TextDecoder();
         while (true) {
           const { value, done } = await reader.read();
           if (done) break;
           res.write(value);
+          const chunkStr = dec.decode(value, { stream: true });
+          if (chunkStr.includes("[DONE]")) {
+            try {
+              reader.cancel().catch(() => {});
+            } catch {}
+            break;
+          }
         }
         return res.end();
       }
@@ -2444,8 +2464,7 @@ const server = http.createServer(async (req, res) => {
 
     const messages = normalizeMessages(body, DEFAULT_SYSTEM_PROMPT);
     const wantsStream = body.stream === true;
-    const disableReasoning =
-      body.reasoning_effort === "none" || body.fast === true || body.reasoning === false;
+    const disableReasoning = body.reasoning === true ? false : true;
 
     try {
       const result = await callOpenCodeUpstream({
@@ -2474,10 +2493,18 @@ const server = http.createServer(async (req, res) => {
           Connection: "keep-alive",
         });
         const reader = result.response.body.getReader();
+        const dec = new TextDecoder();
         while (true) {
           const { value, done } = await reader.read();
           if (done) break;
           res.write(value);
+          const chunkStr = dec.decode(value, { stream: true });
+          if (chunkStr.includes("[DONE]")) {
+            try {
+              reader.cancel().catch(() => {});
+            } catch {}
+            break;
+          }
         }
         return res.end();
       }
