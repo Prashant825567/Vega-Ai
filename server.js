@@ -72,9 +72,9 @@ const UPSTREAM_URLS = [
 ];
 
 const DEFAULT_MODEL = process.env.DEFAULT_MODEL || "mimo-v2.6-flash-free";
-const GEMINI_VOICE_MODEL = "gemini-2.5-flash-native-audio-preview-12-2025";
-const GEMINI_STT_MODEL = "gemini-2.5-flash-native-audio-preview-12-2025";
-const GEMINI_TTS_MODEL = "gemini-2.5-flash-native-audio-preview-12-2025";
+const GEMINI_VOICE_MODEL = "gemini-3.1-flash-live-preview";
+const GEMINI_STT_MODEL = "gemini-3.1-flash-live-preview";
+const GEMINI_TTS_MODEL = "gemini-3.1-flash-live-preview";
 
 // ─── Smooth & Beautiful Female Voices Catalog (Gemini Live Native Audio) ─────
 const SMOOTH_FEMALE_VOICES = [
@@ -1693,21 +1693,26 @@ function synthesizeWithGeminiLiveAudio({
                 } catch {}
                 return reject(new Error("Empty spokenText after promise resolved."));
               }
-              sendWsJson(socket, {
-                clientContent: {
-                  turns: [
-                    {
-                      role: "user",
-                      parts: [
-                        {
-                          text: `Please read the following text aloud verbatim, word for word, in a smooth, sweet, warm, and natural voice without adding or changing any words:\n${finalSpoken}`,
-                        },
-                      ],
-                    },
-                  ],
-                  turnComplete: true,
-                },
-              });
+              const readPrompt = `Please read the following text aloud verbatim, word for word, in a smooth, sweet, warm, and natural voice without adding or changing any words:\n${finalSpoken}`;
+              if (fullModel.includes("3.1")) {
+                sendWsJson(socket, {
+                  realtimeInput: {
+                    text: readPrompt,
+                  },
+                });
+              } else {
+                sendWsJson(socket, {
+                  clientContent: {
+                    turns: [
+                      {
+                        role: "user",
+                        parts: [{ text: readPrompt }],
+                      },
+                    ],
+                    turnComplete: true,
+                  },
+                });
+              }
             })
             .catch((err) => {
               if (!finished) {
@@ -1845,6 +1850,8 @@ function synthesizeWithGeminiLiveAudio({
             },
             ...(fullModel.includes("native-audio")
               ? { thinkingConfig: { thinkingBudget: 0 } }
+              : fullModel.includes("3.1")
+              ? { thinkingConfig: { thinkingLevel: "MINIMAL" } }
               : {}),
           },
           systemInstruction: {
@@ -1881,9 +1888,9 @@ async function synthesizeWithGeminiTTS({ text, voice }) {
 
   const liveModelsToTry = [
     GEMINI_TTS_MODEL,
+    "models/gemini-3.1-flash-live-preview",
     "models/gemini-2.5-flash-native-audio-preview-12-2025",
     "models/gemini-2.5-flash-native-audio-latest",
-    "models/gemini-3.1-flash-live-preview",
   ];
 
   const triedModels = new Set();
@@ -1993,7 +2000,7 @@ function runGeminiNativeVoiceTurn({
   systemPrompt = "",
   selectedVoice = "Aoede",
   apiKey,
-  liveModel = "models/gemini-2.5-flash-native-audio-preview-12-2025",
+  liveModel = "models/gemini-3.1-flash-live-preview",
   enableWebSearchTool = true,
 }) {
   return new Promise((resolve, reject) => {
@@ -2136,6 +2143,7 @@ function runGeminiNativeVoiceTurn({
 
         if (msg.setupComplete !== undefined && !setupDone) {
           setupDone = true;
+          const isGemini31 = fullModel.includes("3.1");
           const historyTurns = [];
           if (Array.isArray(history)) {
             for (const h of history.slice(-6)) {
@@ -2149,7 +2157,7 @@ function runGeminiNativeVoiceTurn({
           }
 
           if (pcmInput && pcmInput.pcmBuffer && pcmInput.pcmBuffer.length > 0) {
-            if (historyTurns.length > 0) {
+            if (!isGemini31 && historyTurns.length > 0) {
               sendWsJson(socket, {
                 clientContent: {
                   turns: historyTurns,
@@ -2172,6 +2180,13 @@ function runGeminiNativeVoiceTurn({
             sendWsJson(socket, {
               realtimeInput: {
                 audioStreamEnd: true,
+              },
+            });
+          } else if (isGemini31) {
+            // Gemini 3.1 Flash Live requires realtimeInput.text for user text messages
+            sendWsJson(socket, {
+              realtimeInput: {
+                text: userText,
               },
             });
           } else {
@@ -2359,13 +2374,24 @@ function runGeminiNativeVoiceTurn({
         }
       });
 
-      const defaultVoicePersona =
+      let defaultVoicePersona =
         systemPrompt ||
         `You are ${AI_NAME}, the fast, smart, warm real-time voice AI assistant inside the ${APP_NAME} app. ` +
           `When asked who you are or what your name is, say you are ${AI_NAME}, the voice AI of ${APP_NAME}. ` +
           `Speak naturally in the same language as the user (Hinglish, Hindi, or English) with a smooth, sweet, warm Indian conversational flow. ` +
           `WEB RESEARCH RULE: Whenever the user asks about live news, current prices/rates (Bitcoin, crypto, stocks, gold), weather, sports/IPL scores, 2025/2026 events, or asks you to search/check online, call the 'websearch' tool first and answer using the live OpenCode search results. ` +
           `IMPORTANT: Keep every reply to ONE short, natural spoken sentence (maximum 15 to 18 words) unless the user explicitly asks for a detailed explanation.`;
+
+      if (fullModel.includes("3.1") && Array.isArray(history) && history.length > 0) {
+        const histLines = history
+          .slice(-6)
+          .filter((h) => h && h.content && typeof h.content === "string")
+          .map((h) => `${h.role === "assistant" || h.role === "model" ? AI_NAME : "User"}: ${h.content}`)
+          .join("\n");
+        if (histLines) {
+          defaultVoicePersona += `\n\nRecent conversation context:\n${histLines}`;
+        }
+      }
 
       recordSentPrompt({
         agent: "voice",
@@ -2389,6 +2415,8 @@ function runGeminiNativeVoiceTurn({
             },
             ...(fullModel.includes("native-audio")
               ? { thinkingConfig: { thinkingBudget: 0 } }
+              : fullModel.includes("3.1")
+              ? { thinkingConfig: { thinkingLevel: "MINIMAL" } }
               : {}),
           },
           ...(enableWebSearchTool
@@ -2445,9 +2473,9 @@ async function runGeminiNativeVoiceAgent({
   const selectedVoice = normalizeVoiceName(voice || GEMINI_TTS_VOICE || "Aoede");
   const liveModelsToTry = [
     GEMINI_VOICE_MODEL,
+    "models/gemini-3.1-flash-live-preview",
     "models/gemini-2.5-flash-native-audio-preview-12-2025",
     "models/gemini-2.5-flash-native-audio-latest",
-    "models/gemini-3.1-flash-live-preview",
   ];
   const triedModels = new Set();
   const maxKeyAttempts = Math.max(1, GEMINI_API_KEYS.length);
