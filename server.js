@@ -225,7 +225,7 @@ const BACKEND_API_KEY = (process.env.BACKEND_API_KEY || "").trim();
 const DEFAULT_FILLER_TEXT =
   process.env.VOICE_FILLER_TEXT || "Ek second, abhi batata hoon.";
 
-const DEFAULT_SYSTEM_PROMPT =
+let DEFAULT_SYSTEM_PROMPT =
   process.env.SYSTEM_PROMPT ||
   `You are ${AI_NAME}, a fast, smart, and helpful AI assistant built into the ${APP_NAME} app. ` +
     `When asked who you are or what your name/version is, always introduce yourself as ${AI_NAME} (the AI assistant of ${APP_NAME}). ` +
@@ -233,12 +233,24 @@ const DEFAULT_SYSTEM_PROMPT =
     `WEB SEARCH RULE: You have real-time internet access via the 'websearch' and 'webfetch' tools. Whenever the user asks about current events, latest news, live prices/rates (crypto, stocks, gold), weather, sports scores, recent releases, or asks you to search/check something online, call the 'websearch' tool first and answer using the live results. ` +
     `CRITICAL RULE: NEVER invoke or call local shell/file tools (bash, edit, glob, grep, or read)—they are unused gateway placeholders.`;
 
-const VOICE_FAST_SYSTEM_PROMPT =
+let VOICE_FAST_SYSTEM_PROMPT =
   process.env.VOICE_SYSTEM_PROMPT ||
   `/no_think You are ${AI_NAME}, the real-time voice AI agent inside the ${APP_NAME} app. ` +
     `When asked who you are, always say you are ${AI_NAME}, the voice AI of ${APP_NAME}. ` +
     `Reply directly in 1 to 2 short, natural spoken sentences in the user's language (Hinglish, Hindi, or English) with no markdown, asterisks, lists, or emojis. ` +
     `Do NOT call any tools for greetings, casual chat, or general knowledge—only call 'websearch' when the user asks for live/current news, prices, weather, scores, or web search. Never call bash, edit, glob, grep, or read.`;
+
+// Ring buffer storing the exact prompts sent on the most recent turns
+const recentSentPrompts = [];
+function recordSentPrompt(entry) {
+  recentSentPrompts.unshift({
+    at: new Date().toISOString(),
+    ...entry,
+  });
+  if (recentSentPrompts.length > 20) {
+    recentSentPrompts.length = 20;
+  }
+}
 
 // ─── Detect Whether a Query Needs Live OpenCode Web Search / Deep Research ───
 function detectNeedsThinking(text) {
@@ -905,6 +917,13 @@ async function callOpenCodeUpstream(payload) {
     tools: [...existingTools, ...missingStubs],
     tool_choice: payload.tool_choice && payload.tool_choice !== "none" ? payload.tool_choice : "auto",
   };
+
+  recordSentPrompt({
+    agent: "text",
+    model: upstreamBody.model,
+    systemPrompt: preparedMessages.find((m) => m && m.role === "system")?.content || "",
+    messages: preparedMessages,
+  });
 
   if (typeof payload.temperature === "number") {
     upstreamBody.temperature = payload.temperature;
@@ -2348,6 +2367,14 @@ function runGeminiNativeVoiceTurn({
           `WEB RESEARCH RULE: Whenever the user asks about live news, current prices/rates (Bitcoin, crypto, stocks, gold), weather, sports/IPL scores, 2025/2026 events, or asks you to search/check online, call the 'websearch' tool first and answer using the live OpenCode search results. ` +
           `IMPORTANT: Keep every reply to ONE short, natural spoken sentence (maximum 15 to 18 words) unless the user explicitly asks for a detailed explanation.`;
 
+      recordSentPrompt({
+        agent: "voice",
+        model: fullModel,
+        voice: selectedVoice,
+        systemPrompt: defaultVoicePersona,
+        userText: userText || "(live PCM microphone audio stream)",
+      });
+
       sendWsJson(socket, {
         setup: {
           model: fullModel,
@@ -2597,16 +2624,40 @@ const server = http.createServer(async (req, res) => {
     });
   }
 
-  // 1a. Active System Prompts & App Integration Prompt Endpoint:
-  //     GET /api/prompt (aliases: /prompt, /api/prompts, /api/system-prompt)
+  // 1a. Active System Prompts, Last Sent Prompt & App Integration Prompt Endpoint:
+  //     GET / POST /api/prompt (aliases: /prompt, /api/prompts, /api/system-prompt, /api/last-prompt)
   if (
-    req.method === "GET" &&
-    (pathname === "/api/prompt" ||
-      pathname === "/prompt" ||
-      pathname === "/api/prompts" ||
-      pathname === "/prompts" ||
-      pathname === "/api/system-prompt")
+    pathname === "/api/prompt" ||
+    pathname === "/prompt" ||
+    pathname === "/api/prompts" ||
+    pathname === "/prompts" ||
+    pathname === "/api/system-prompt" ||
+    pathname === "/api/last-prompt"
   ) {
+    if (req.method === "POST" || req.method === "PUT" || req.method === "PATCH") {
+      let body;
+      try {
+        body = await readJsonBody(req);
+      } catch (err) {
+        return sendJson(res, 400, { success: false, error: err.message });
+      }
+      if (typeof body.systemPrompt === "string" && body.systemPrompt.trim()) {
+        DEFAULT_SYSTEM_PROMPT = body.systemPrompt.trim();
+      }
+      if (typeof body.prompt === "string" && body.prompt.trim()) {
+        DEFAULT_SYSTEM_PROMPT = body.prompt.trim();
+      }
+      if (typeof body.voiceSystemPrompt === "string" && body.voiceSystemPrompt.trim()) {
+        VOICE_FAST_SYSTEM_PROMPT = body.voiceSystemPrompt.trim();
+      }
+      return sendJson(res, 200, {
+        success: true,
+        message: "Active system prompt updated.",
+        prompt: `/no_think ${DEFAULT_SYSTEM_PROMPT}`,
+        voiceFastSystemPrompt: VOICE_FAST_SYSTEM_PROMPT,
+      });
+    }
+
     const voiceNativeSystemPrompt =
       `You are ${AI_NAME}, the fast, smart, warm real-time voice AI assistant inside the ${APP_NAME} app. ` +
       `When asked who you are or what your name is, say you are ${AI_NAME}, the voice AI of ${APP_NAME}. ` +
@@ -2616,6 +2667,12 @@ const server = http.createServer(async (req, res) => {
 
     const webSearchRuleSuffix =
       `WEB SEARCH RULE: You have real-time internet access via OpenCode 'websearch' and 'webfetch' tools. For current events, news, live prices/rates, weather, scores, 2025/2026 facts, or online lookups, use live OpenCode web search facts (or call 'websearch' if not already provided). CRITICAL RULE: NEVER call bash, edit, glob, grep, or read.`;
+
+    const appBuilderMasterPrompt =
+      `Connect my existing Vega App (Max v1.0 AI) UI to our live backend at https://vega-ai-6m2k.onrender.com without modifying any existing UI design, styles, or Support Chat.\n` +
+      `1. Text Agent (mimo-v2.6-flash-free + Live OpenCode Web Search): POST https://vega-ai-6m2k.onrender.com/api/chat with JSON { "message": "<text>", "history": [...], "image": "<optional_base64>" } -> render data.reply.\n` +
+      `2. Voice Agent (gemini-2.5-flash-native-audio-preview-12-2025, Aoede voice + Live OpenCode Web Search): POST https://vega-ai-6m2k.onrender.com/api/voice with JSON { "audio": "<base64_wav_or_webm>", "mimeType": "audio/wav", "voice": "Aoede", "history": [...] } -> show data.transcript, data.reply, and auto-play data.audio.dataUri.\n` +
+      `3. Per-User Chat History (ai_chats & ai_messages): GET /api/history/chats?user=<email>, GET /api/history/chats/<chatId>?user=<email>, POST /api/history/turns, PATCH /api/history/chats/<chatId>, DELETE /api/history/chats/<chatId>.`;
 
     const format = (url.searchParams.get("format") || "").toLowerCase();
     if (format === "text" || url.searchParams.get("raw") === "1") {
@@ -2629,7 +2686,9 @@ const server = http.createServer(async (req, res) => {
           `=== VOICE FAST SYSTEM PROMPT ===\n` +
           `${VOICE_FAST_SYSTEM_PROMPT}\n\n` +
           `=== ALWAYS-APPENDED WEB SEARCH RULE ===\n` +
-          `${webSearchRuleSuffix}\n`
+          `${webSearchRuleSuffix}\n\n` +
+          `=== LAST SENT PROMPT ON SERVER ===\n` +
+          `${JSON.stringify(recentSentPrompts[0] || null, null, 2)}\n`
       );
     }
 
@@ -2638,6 +2697,8 @@ const server = http.createServer(async (req, res) => {
       ai: AI_NAME,
       app: APP_NAME,
       prompt: `/no_think ${DEFAULT_SYSTEM_PROMPT}`,
+      lastSentPrompt: recentSentPrompts[0] || null,
+      recentSentPrompts,
       activePromptsSentOnEveryTurn: {
         textAgentSystemPrompt: `/no_think ${DEFAULT_SYSTEM_PROMPT}`,
         textAgentRawSystemPrompt: DEFAULT_SYSTEM_PROMPT,
@@ -2649,6 +2710,7 @@ const server = http.createServer(async (req, res) => {
         preSearchContextTemplate:
           "[Live OpenCode Web Search Results (Date: YYYY-MM-DD)]:\n<results>\n\nIMPORTANT: The live OpenCode web search has ALREADY been executed above. Answer the user's question directly, accurately, and naturally using these live facts. Do NOT call the 'websearch' tool again. /no_think",
       },
+      appBuilderMasterPrompt,
       models: {
         textAgentModel: DEFAULT_MODEL,
         voiceAgentModel: GEMINI_VOICE_MODEL,
