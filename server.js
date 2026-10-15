@@ -240,13 +240,13 @@ const VOICE_FAST_SYSTEM_PROMPT =
     `Reply directly in 1 to 2 short, natural spoken sentences in the user's language (Hinglish, Hindi, or English) with no markdown, asterisks, lists, or emojis. ` +
     `Do NOT call any tools for greetings, casual chat, or general knowledge—only call 'websearch' when the user asks for live/current news, prices, weather, scores, or web search. Never call bash, edit, glob, grep, or read.`;
 
-// ─── Detect Whether a Voice Query Needs Deep Thinking / Web Search ───────────
+// ─── Detect Whether a Query Needs Live OpenCode Web Search / Deep Research ───
 function detectNeedsThinking(text) {
   const q = String(text || "").toLowerCase().trim();
   if (!q) return false;
   // Casual greetings / identity questions never need web search or deep thinking
   if (
-    /^(hi|hello|hey|namaste|namaskar|kaise ho|kaisa hai|kaisi ho|kya haal|how are you|who are you|tum kaun ho|aap kaun ho|tera naam|tumhara naam|what is your name|good morning|good evening|good night|aur batao|sab badhiya)[?!.\s]*$/i.test(
+    /^(hi|hello|hey|namaste|namaskar|kaise ho|kaisa hai|kaisi ho|kya haal|how are you|who are you|tum kaun ho|aap kaun ho|tera naam|tumhara naam|what is your name|good morning|good evening|good night|aur batao|sab badhiya|thank you|thanks|shukriya|ok|okay|accha|theek hai)[?!.\s]*$/i.test(
       q
     )
   ) {
@@ -254,8 +254,9 @@ function detectNeedsThinking(text) {
   }
   const thinkingPatterns = [
     /\b(research|analyze|analyse|compare|calculate|solve|explain in detail|deep dive|step by step|history of|difference between|write code|algorithm|debug)\b/i,
-    /\b(search|web search|google|latest|current|today|news|price|rate|weather|score|live|update|2025|2026|ipl|match|stock|bitcoin|crypto|gold|silver|sensex|nifty)\b/i,
-    /\b(soch ke|soch kar|check karke|pata karke|research karke|search karke|nikal ke|dhundh ke|detail me|detail mein|vistar se|samjhao|hisab laga|solve kar|aaj ka|abhi ka|kya bhav|kitna rate)\b/i,
+    /\b(search|web search|google|internet|online|latest|current|today|tonight|yesterday|recent|now|news|breaking|price|rate|weather|temperature|forecast|score|live|update|2024|2025|2026|2027|ipl|match|world cup|t20|cricket|football|stock|share|bitcoin|btc|eth|crypto|gold|silver|sensex|nifty|dollar|rupee|inr|usd)\b/i,
+    /\b(who is|what is the current|who won|winner|prime minister|president|chief minister|ceo|founder|net worth|release date|launch date|upcoming|new movie|box office|specs|specification)\b/i,
+    /\b(soch ke|soch kar|check karke|check karo|pata karke|pata karo|research karke|search karke|search karo|nikal ke|dhundh ke|detail me|detail mein|vistar se|samjhao|hisab laga|solve kar|aaj|abhi|kal|taza|khabar|mausam|bhav|keemat|kitna rate|kya rate|kaun hai|kon hai|kaun jeeta|kon jeeta|sona|chandi)\b/i,
   ];
   if (q.length > 140) return true;
   return thinkingPatterns.some((re) => re.test(q));
@@ -1021,14 +1022,75 @@ function stripLeakedReasoning(text) {
 }
 
 /**
+ * Extracts plain text from the latest user message in a messages array.
+ */
+function extractLatestUserText(messages) {
+  if (!Array.isArray(messages)) return "";
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i];
+    if (m && m.role === "user") {
+      if (typeof m.content === "string") return m.content.trim();
+      if (Array.isArray(m.content)) {
+        const textPart = m.content.find((p) => p && p.type === "text" && typeof p.text === "string");
+        if (textPart) return textPart.text.trim();
+      }
+    }
+  }
+  return "";
+}
+
+/**
  * Runs OpenCode `mimo-v2.6-flash-free` with automatic execution of OpenCode's
- * built-in `websearch` and `webfetch` tools (up to 3 turns).
+ * built-in `websearch` and `webfetch` tools (up to 3 turns) + proactive OpenCode
+ * web search pre-fetching whenever a query needs live web research.
  */
 async function runOpenCodeAgentWithTools(payload, onWebSearchStart = null) {
   const workingMessages = Array.isArray(payload.messages) ? [...payload.messages] : [];
   let usedWebSearch = false;
   const searchQueries = [];
   let lastAssembled = null;
+
+  // Proactive OpenCode Web Search: when the user's question asks for live/current info
+  // or web research, pre-fetch OpenCode websearch (`search.parallel.ai/mcp` / `mcp.exa.ai/mcp`)
+  // so `mimo-v2.6-flash-free` has verified real-time web facts even when `/no_think` is active.
+  const latestUserText = extractLatestUserText(workingMessages);
+  const shouldPreSearch =
+    payload.allowWebSearch !== false &&
+    latestUserText &&
+    (payload.webSearch === true || detectNeedsThinking(latestUserText));
+
+  if (shouldPreSearch) {
+    try {
+      usedWebSearch = true;
+      searchQueries.push(latestUserText);
+      if (typeof onWebSearchStart === "function") {
+        try {
+          await onWebSearchStart([latestUserText]);
+        } catch {}
+      }
+      const preSearchResults = await executeOpenCodeWebSearch({
+        query: latestUserText,
+        numResults: 6,
+      });
+      if (preSearchResults && !preSearchResults.startsWith("No search results")) {
+        for (let i = workingMessages.length - 1; i >= 0; i--) {
+          if (workingMessages[i] && workingMessages[i].role === "user") {
+            const orig = workingMessages[i].content;
+            if (typeof orig === "string") {
+              workingMessages[i] = {
+                ...workingMessages[i],
+                content:
+                  `${orig}\n\n` +
+                  `[Live OpenCode Web Search Results (Date: ${new Date().toISOString().slice(0, 10)}) — use these real-time facts to answer accurately and naturally]:\n` +
+                  `${String(preSearchResults).slice(0, 8000)}`,
+              };
+            }
+            break;
+          }
+        }
+      }
+    } catch {}
+  }
 
   for (let turn = 0; turn < 3; turn++) {
     const upstream = await callOpenCodeUpstream({
@@ -1928,6 +1990,9 @@ function runGeminiNativeVoiceTurn({
       let fragOpcode = 0;
       let fragChunks = [];
       let chunkIdleTimer = null;
+      let toolCallInFlight = false;
+      let nativeUsedWebSearch = false;
+      const nativeSearchQueries = [];
 
       function finishSuccess() {
         if (finished) return;
@@ -1957,6 +2022,8 @@ function runGeminiNativeVoiceTurn({
           mimeType: "audio/wav",
           transcript,
           reply,
+          usedWebSearch: nativeUsedWebSearch,
+          searchQueries: nativeSearchQueries,
           wavBuffer,
           wavBase64,
           dataUri: wavBase64 ? `data:audio/wav;base64,${wavBase64}` : "",
@@ -2039,6 +2106,55 @@ function runGeminiNativeVoiceTurn({
           return;
         }
 
+        // Handle live OpenCode websearch tool calls from Gemini Native Audio model
+        if (msg.toolCall && Array.isArray(msg.toolCall.functionCalls)) {
+          toolCallInFlight = true;
+          if (chunkIdleTimer) {
+            clearTimeout(chunkIdleTimer);
+            chunkIdleTimer = null;
+          }
+          const calls = msg.toolCall.functionCalls;
+          Promise.all(
+            calls.map(async (fc) => {
+              const q =
+                String(fc?.args?.query || fc?.args?.q || inputTranscriptParts.join(" ") || userText || "").trim() ||
+                "latest news today";
+              nativeUsedWebSearch = true;
+              nativeSearchQueries.push(q);
+              let searchResult = "";
+              try {
+                searchResult = await executeOpenCodeWebSearch({
+                  query: q,
+                  numResults: 5,
+                });
+              } catch (e) {
+                searchResult = `Search error: ${e.message}`;
+              }
+              return {
+                id: fc.id,
+                name: fc.name || "websearch",
+                response: {
+                  result: String(searchResult || "No results found.").slice(0, 3500),
+                },
+              };
+            })
+          )
+            .then((functionResponses) => {
+              toolCallInFlight = false;
+              if (!finished) {
+                sendWsJson(socket, {
+                  toolResponse: {
+                    functionResponses,
+                  },
+                });
+              }
+            })
+            .catch(() => {
+              toolCallInFlight = false;
+            });
+          return;
+        }
+
         const sc = msg?.serverContent;
         if (sc) {
           if (typeof sc.inputTranscription?.text === "string") {
@@ -2053,16 +2169,18 @@ function runGeminiNativeVoiceTurn({
               if (p?.inlineData?.data) {
                 pcmChunks.push(Buffer.from(p.inlineData.data, "base64"));
                 if (chunkIdleTimer) clearTimeout(chunkIdleTimer);
-                chunkIdleTimer = setTimeout(() => {
-                  if (pcmChunks.length > 0) finishSuccess();
-                }, 650);
+                if (!toolCallInFlight) {
+                  chunkIdleTimer = setTimeout(() => {
+                    if (!toolCallInFlight && pcmChunks.length > 0) finishSuccess();
+                  }, 650);
+                }
               }
               if (typeof p?.text === "string" && !p?.thought) {
                 modelTextParts.push(p.text);
               }
             }
           }
-          if ((sc.turnComplete || sc.generationComplete) && pcmChunks.length > 0) {
+          if (!toolCallInFlight && (sc.turnComplete || sc.generationComplete) && pcmChunks.length > 0) {
             finishSuccess();
           }
         }
@@ -2162,6 +2280,7 @@ function runGeminiNativeVoiceTurn({
         `You are ${AI_NAME}, the fast, smart, warm real-time voice AI assistant inside the ${APP_NAME} app. ` +
           `When asked who you are or what your name is, say you are ${AI_NAME}, the voice AI of ${APP_NAME}. ` +
           `Speak naturally in the same language as the user (Hinglish, Hindi, or English) with a smooth, sweet, warm Indian conversational flow. ` +
+          `WEB RESEARCH RULE: Whenever the user asks about live news, current prices/rates (Bitcoin, crypto, stocks, gold), weather, sports/IPL scores, 2025/2026 events, or asks you to search/check online, call the 'websearch' tool first and answer using the live OpenCode search results. ` +
           `IMPORTANT: Keep every reply to ONE short, natural spoken sentence (maximum 15 to 18 words) unless the user explicitly asks for a detailed explanation.`;
 
       sendWsJson(socket, {
@@ -2180,6 +2299,27 @@ function runGeminiNativeVoiceTurn({
               ? { thinkingConfig: { thinkingBudget: 0 } }
               : {}),
           },
+          tools: [
+            {
+              functionDeclarations: [
+                {
+                  name: "websearch",
+                  description:
+                    "Search the live web using OpenCode web search for current news, live prices (Bitcoin, crypto, stocks, gold), weather, sports/IPL scores, 2025/2026 events, or any real-time information.",
+                  parameters: {
+                    type: "OBJECT",
+                    properties: {
+                      query: {
+                        type: "STRING",
+                        description: "The search query to look up on the live web",
+                      },
+                    },
+                    required: ["query"],
+                  },
+                },
+              ],
+            },
+          ],
           inputAudioTranscription: {},
           outputAudioTranscription: {},
           systemInstruction: {
@@ -2673,6 +2813,14 @@ const server = http.createServer(async (req, res) => {
         voice: selectedVoice,
       });
 
+      if (nativeResult.usedWebSearch) {
+        usedWebSearch = true;
+        for (const q of nativeResult.searchQueries || []) {
+          if (q && !searchQueries.includes(q)) searchQueries.push(q);
+        }
+        needsThinking = true;
+      }
+
       const finalTranscript = (nativeResult.transcript || userTranscript || "").trim();
       let replyText = (nativeResult.reply || "").trim();
 
@@ -2807,45 +2955,8 @@ const server = http.createServer(async (req, res) => {
 
     try {
       const disableReasoning = body.reasoning === true ? false : true;
-
-      if (body.stream === true) {
-        const result = await callOpenCodeUpstream({
-          model: body.model || DEFAULT_MODEL,
-          messages,
-          temperature: body.temperature,
-          max_tokens: body.max_tokens,
-          disableReasoning,
-        });
-
-        if (!result.ok) {
-          return sendJson(res, result.status || 502, {
-            success: false,
-            error: "Upstream OpenCode API error",
-            details: result.errorText,
-          });
-        }
-
-        res.writeHead(200, {
-          "Content-Type": "text/event-stream; charset=utf-8",
-          "Cache-Control": "no-cache",
-          Connection: "keep-alive",
-        });
-        const reader = result.response.body.getReader();
-        const dec = new TextDecoder();
-        while (true) {
-          const { value, done } = await reader.read();
-          if (done) break;
-          res.write(value);
-          const chunkStr = dec.decode(value, { stream: true });
-          if (chunkStr.includes("[DONE]")) {
-            try {
-              reader.cancel().catch(() => {});
-            } catch {}
-            break;
-          }
-        }
-        return res.end();
-      }
+      const allowWebSearch = body.webSearch !== false && body.allowWebSearch !== false;
+      const forceWebSearch = body.webSearch === true || body.search === true;
 
       const agentResult = await runOpenCodeAgentWithTools({
         model: body.model || DEFAULT_MODEL,
@@ -2853,6 +2964,8 @@ const server = http.createServer(async (req, res) => {
         temperature: body.temperature,
         max_tokens: body.max_tokens,
         disableReasoning,
+        allowWebSearch,
+        webSearch: forceWebSearch,
       });
 
       if (!agentResult.ok) {
@@ -2864,6 +2977,46 @@ const server = http.createServer(async (req, res) => {
       }
 
       const assembled = agentResult.assembled;
+
+      if (body.stream === true) {
+        setCorsHeaders(res);
+        res.writeHead(200, {
+          "Content-Type": "text/event-stream; charset=utf-8",
+          "Cache-Control": "no-cache",
+          Connection: "keep-alive",
+        });
+        if (agentResult.usedWebSearch) {
+          res.write(
+            `event: websearch\ndata: ${JSON.stringify({
+              type: "websearch",
+              usedWebSearch: true,
+              searchQueries: agentResult.searchQueries,
+            })}\n\n`
+          );
+        }
+        const chunkPayload = {
+          id: assembled.id,
+          object: "chat.completion.chunk",
+          created: assembled.created,
+          model: assembled.model,
+          usedWebSearch: agentResult.usedWebSearch,
+          searchQueries: agentResult.searchQueries,
+          choices: [
+            {
+              index: 0,
+              delta: {
+                role: "assistant",
+                content: assembled.content,
+              },
+              finish_reason: "stop",
+            },
+          ],
+        };
+        res.write(`data: ${JSON.stringify(chunkPayload)}\n\n`);
+        res.write("data: [DONE]\n\n");
+        return res.end();
+      }
+
       return sendJson(res, 200, {
         success: true,
         ai: AI_NAME,
@@ -2884,6 +3037,7 @@ const server = http.createServer(async (req, res) => {
   }
 
   // 8. OpenAI-Compatible Endpoint: POST /v1/chat/completions
+  //    Also executes OpenCode `websearch` & `webfetch` automatically via `runOpenCodeAgentWithTools`!
   if (
     req.method === "POST" &&
     (pathname === "/v1/chat/completions" || pathname === "/chat/completions")
@@ -2900,9 +3054,11 @@ const server = http.createServer(async (req, res) => {
     const messages = normalizeMessages(body, DEFAULT_SYSTEM_PROMPT);
     const wantsStream = body.stream === true;
     const disableReasoning = body.reasoning === true ? false : true;
+    const allowWebSearch = body.webSearch !== false && body.allowWebSearch !== false;
+    const forceWebSearch = body.webSearch === true || body.search === true;
 
     try {
-      const result = await callOpenCodeUpstream({
+      const agentResult = await runOpenCodeAgentWithTools({
         model: body.model || DEFAULT_MODEL,
         messages,
         tools: body.tools,
@@ -2910,46 +3066,58 @@ const server = http.createServer(async (req, res) => {
         temperature: body.temperature,
         max_tokens: body.max_tokens,
         disableReasoning,
+        allowWebSearch,
+        webSearch: forceWebSearch,
       });
 
-      if (!result.ok) {
-        return sendJson(res, result.status || 502, {
+      if (!agentResult.ok) {
+        return sendJson(res, agentResult.status || 502, {
           error: {
-            message: result.errorText,
+            message: agentResult.errorText,
             type: "upstream_error",
           },
         });
       }
 
+      const assembled = agentResult.assembled;
+
       if (wantsStream) {
+        setCorsHeaders(res);
         res.writeHead(200, {
           "Content-Type": "text/event-stream; charset=utf-8",
           "Cache-Control": "no-cache",
           Connection: "keep-alive",
         });
-        const reader = result.response.body.getReader();
-        const dec = new TextDecoder();
-        while (true) {
-          const { value, done } = await reader.read();
-          if (done) break;
-          res.write(value);
-          const chunkStr = dec.decode(value, { stream: true });
-          if (chunkStr.includes("[DONE]")) {
-            try {
-              reader.cancel().catch(() => {});
-            } catch {}
-            break;
-          }
-        }
+        const chunkPayload = {
+          id: assembled.id,
+          object: "chat.completion.chunk",
+          created: assembled.created,
+          model: assembled.model,
+          usedWebSearch: agentResult.usedWebSearch,
+          searchQueries: agentResult.searchQueries,
+          choices: [
+            {
+              index: 0,
+              delta: {
+                role: "assistant",
+                content: assembled.content,
+              },
+              finish_reason: "stop",
+            },
+          ],
+        };
+        res.write(`data: ${JSON.stringify(chunkPayload)}\n\n`);
+        res.write("data: [DONE]\n\n");
         return res.end();
       }
 
-      const assembled = await collectSSEStream(result.response, result.model);
       return sendJson(res, 200, {
         id: assembled.id,
         object: "chat.completion",
         created: assembled.created,
         model: assembled.model,
+        usedWebSearch: agentResult.usedWebSearch,
+        searchQueries: agentResult.searchQueries,
         choices: [
           {
             index: 0,
