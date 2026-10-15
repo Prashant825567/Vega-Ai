@@ -966,7 +966,26 @@ async function collectSSEStream(response, fallbackModel) {
     }
   }
 
+function stripLeakedReasoning(text) {
+  if (!text || typeof text !== "string") return "";
+  let cleaned = text.replace(/<think>[\s\S]*?<\/think>/gi, "").trim();
+  if (/^(?:The user|User is|User wants|User asked)\b/i.test(cleaned)) {
+    const gluedMatch = cleaned.match(/^[\s\S]*?\.[)"']?(?=[A-Z\u0900-\u097F])/);
+    if (gluedMatch) {
+      cleaned = cleaned.slice(gluedMatch[0].length).trim();
+    } else if (cleaned.includes("\n\n")) {
+      cleaned = cleaned.split(/\n\s*\n/).slice(1).join("\n\n").trim();
+    } else {
+      cleaned = cleaned
+        .replace(/^The user[\s\S]*?(?:I should|I'll|I will|Let's|Let me)[^.!?\n]*[.!?]\s*/i, "")
+        .trim();
+    }
+  }
+  return cleaned || text.trim();
+}
+
   const toolCalls = Array.from(toolCallsMap.values()).filter((tc) => tc.function.name);
+  content = stripLeakedReasoning(content);
   return { id, created, model, content, reasoning, finishReason, usage, toolCalls };
 }
 
