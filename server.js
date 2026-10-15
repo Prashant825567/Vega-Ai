@@ -2977,10 +2977,305 @@ const server = http.createServer(async (req, res) => {
     }
   }
 
-  // 9. Server-Side ZentraGrid History Proxy (`ai_chats`, `ai_messages`, `/v1/files`)
-  //    In any web deployment, ZENTRAGRID_API_KEY stays strictly on the server and
-  //    the browser talks only to this route. Support chat collections (`messages`,
-  //    `presence`, `typing`) are never touched here.
+  // 9. High-Level Chat History Backend Routes (`/api/history/*`)
+  //    Wraps ZentraGrid (`https://vega-storage.onrender.com`) `ai_chats`, `ai_messages`, and `/v1/files`
+  //    using deterministic IDs (`ai_chat_<emailSlug>_<createdAtMs>`, `ai_msg_<chatId>_<seq>`).
+  if (pathname.startsWith("/api/history")) {
+    const ztKey = (
+      process.env.ZENTRAGRID_API_KEY ||
+      process.env.STORAGE_API_KEY ||
+      (req.headers["authorization"] || "").replace(/^Bearer\s+/i, "") ||
+      req.headers["x-api-key"] ||
+      ""
+    ).trim();
+    if (!ztKey) {
+      return sendJson(res, 401, {
+        success: false,
+        error: {
+          message: "ZENTRAGRID_API_KEY is required (configure on Render server env or pass Authorization: Bearer <key>)",
+          code: "INVALID_ID_TOKEN",
+        },
+      });
+    }
+    const ztBase = (process.env.ZENTRAGRID_BASE_URL || "https://vega-storage.onrender.com").replace(/\/+$/, "");
+
+    const ztFetch = async (relPath, opts = {}) => {
+      const resp = await fetch(`${ztBase}${relPath}`, {
+        method: opts.method || "GET",
+        headers: {
+          Authorization: `Bearer ${ztKey}`,
+          ...(opts.body ? { "Content-Type": "application/json" } : {}),
+          ...(opts.headers || {}),
+        },
+        body: opts.body ? JSON.stringify(opts.body) : undefined,
+      });
+      const text = await resp.text();
+      let json = null;
+      try {
+        json = text ? JSON.parse(text) : null;
+      } catch {}
+      return { status: resp.status, ok: resp.ok, json, headers: resp.headers };
+    };
+
+    const emailToSlug = (e) =>
+      String(e || "")
+        .trim()
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, "_")
+        .replace(/^_+|_+$/g, "")
+        .slice(0, 64) || "user";
+
+    // 9a. GET /api/history/chats?user=<email>&limit=50&cursor=<cursor> -> listChats()
+    if (req.method === "GET" && pathname === "/api/history/chats") {
+      const userEmail = String(url.searchParams.get("user") || url.searchParams.get("email") || "")
+        .trim()
+        .toLowerCase();
+      if (!userEmail) {
+        return sendJson(res, 400, {
+          success: false,
+          error: { message: "Query param ?user=<email> is required" },
+        });
+      }
+      const limit = Math.min(Math.max(Number(url.searchParams.get("limit")) || 50, 1), 200);
+      const cursor = url.searchParams.get("cursor") || "";
+      const qs =
+        `?where=user:eq:${encodeURIComponent(userEmail)}` +
+        `&order_by=updated_at:desc&limit=${limit}` +
+        (cursor ? `&cursor=${encodeURIComponent(cursor)}` : "");
+      const out = await ztFetch(`/v1/data/ai_chats${qs}`);
+      if (!out.ok) return sendJson(res, out.status, out.json || { error: { message: "Failed to list chats" } });
+      const chats = (out.json?.documents || []).map((d) => ({ id: d.id, ...(d.data || {}) }));
+      return sendJson(res, 200, {
+        success: true,
+        chats,
+        documents: out.json?.documents || [],
+        next_cursor: out.json?.next_cursor || null,
+      });
+    }
+
+    // 9b. GET /api/history/chats/:chatId?user=<email> -> openChat(id)
+    const chatMatch = pathname.match(/^\/api\/history\/chats\/([^/]+)$/);
+    if (req.method === "GET" && chatMatch) {
+      const chatId = decodeURIComponent(chatMatch[1]);
+      const userEmail = String(url.searchParams.get("user") || url.searchParams.get("email") || "")
+        .trim()
+        .toLowerCase();
+      const chatRes = await ztFetch(
+        `/v1/data/ai_chats?where=id:eq:${encodeURIComponent(chatId)}&limit=1`
+      );
+      const chatEnvelope = (chatRes.json?.documents || [])[0] || null;
+      const chatDoc = chatEnvelope ? { id: chatEnvelope.id, ...(chatEnvelope.data || {}) } : null;
+      if (chatDoc && userEmail && chatDoc.user && String(chatDoc.user).toLowerCase() !== userEmail) {
+        return sendJson(res, 403, {
+          success: false,
+          error: { message: "Chat belongs to a different user" },
+        });
+      }
+
+      const allMessages = [];
+      let cursor = null;
+      for (let page = 0; page < 50; page++) {
+        const qs =
+          `?where=chat_id:eq:${encodeURIComponent(chatId)}` +
+          `&order_by=at&limit=200` +
+          (cursor ? `&cursor=${encodeURIComponent(cursor)}` : "");
+        const msgRes = await ztFetch(`/v1/data/ai_messages${qs}`);
+        if (!msgRes.ok) break;
+        for (const doc of msgRes.json?.documents || []) {
+          allMessages.push({ id: doc.id, ...(doc.data || {}) });
+        }
+        cursor = msgRes.json?.next_cursor || null;
+        if (!cursor) break;
+      }
+
+      return sendJson(res, 200, {
+        success: true,
+        chat: chatDoc,
+        messages: allMessages,
+      });
+    }
+
+    // 9c. POST /api/history/turns (or POST /api/history/chats/:chatId/turns) -> appendTurn(chatId, turn)
+    const turnMatch = pathname.match(/^\/api\/history\/(?:turns|chats\/([^/]+)\/turns)$/);
+    if (req.method === "POST" && turnMatch) {
+      let body;
+      try {
+        body = await readJsonBody(req);
+      } catch (err) {
+        return sendJson(res, 400, { success: false, error: { message: err.message } });
+      }
+      const userEmail = String(body.user || body.email || "")
+        .trim()
+        .toLowerCase();
+      if (!userEmail) {
+        return sendJson(res, 400, {
+          success: false,
+          error: { message: '"user" (lowercase email) is required in JSON body' },
+        });
+      }
+
+      const nowMs = Date.now();
+      const nowIso = new Date(nowMs).toISOString();
+      const chatId =
+        (turnMatch[1] ? decodeURIComponent(turnMatch[1]) : "") ||
+        body.chatId ||
+        body.chat_id ||
+        `ai_chat_${emailToSlug(userEmail)}_${body.createdAtMs || nowMs}`;
+      const device = body.device === "ios" || body.device === "web" ? body.device : "android";
+
+      // Check if chat exists
+      const existingRes = await ztFetch(
+        `/v1/data/ai_chats?where=id:eq:${encodeURIComponent(chatId)}&limit=1`
+      );
+      let chatData = (existingRes.json?.documents || [])[0]?.data || null;
+
+      // Support single turn (`role`, `text`) or paired turn (`user: {text}`, `ai: {text}`)
+      const items = [];
+      if (body.user && typeof body.user === "object" && body.ai && typeof body.ai === "object") {
+        items.push({ role: "user", ...body.user });
+        items.push({ role: "ai", ...body.ai });
+      } else {
+        items.push({
+          role: body.role || "user",
+          text: body.text || body.message || body.reply || "",
+          kind: body.kind || "text",
+          file_id: body.file_id,
+          duration_ms: body.duration_ms,
+          seq: body.seq,
+          at: body.at,
+        });
+      }
+
+      if (!chatData) {
+        const firstUserItem = items.find((i) => i.role === "user") || items[0];
+        const firstTitle =
+          firstUserItem?.role === "user" && firstUserItem?.text
+            ? String(firstUserItem.text).trim().slice(0, 60)
+            : "New chat";
+        chatData = {
+          id: chatId,
+          user: userEmail,
+          title: firstTitle || "New chat",
+          created_at: nowIso,
+          updated_at: nowIso,
+          turns: 0,
+          last_text: String(firstUserItem?.text || "").trim().slice(0, 120),
+          device,
+        };
+        await ztFetch("/v1/data/ai_chats", {
+          method: "POST",
+          body: { id: chatId, data: chatData },
+        });
+      }
+
+      const savedMessages = [];
+      let currentTurns = Number(chatData.turns) || 0;
+      let latestText = chatData.last_text || "";
+      let latestAt = nowIso;
+      let updatedTitle = chatData.title || "New chat";
+
+      for (const item of items) {
+        const seqNum = Number(item.seq) > 0 ? Number(item.seq) : currentTurns + 1;
+        const seqStr = String(seqNum).padStart(4, "0");
+        const msgId = `ai_msg_${chatId}_${seqStr}`;
+        const msgAt = item.at || new Date().toISOString();
+        const msgData = {
+          id: msgId,
+          chat_id: chatId,
+          user: userEmail,
+          role: item.role === "ai" ? "ai" : "user",
+          text: String(item.text || ""),
+          at: msgAt,
+          kind: item.kind === "voice" ? "voice" : "text",
+          ...(item.kind === "voice" && item.file_id ? { file_id: item.file_id } : {}),
+          ...(item.kind === "voice" && typeof item.duration_ms === "number"
+            ? { duration_ms: Math.round(item.duration_ms) }
+            : {}),
+        };
+        await ztFetch("/v1/data/ai_messages", {
+          method: "POST",
+          body: { id: msgId, data: msgData },
+        });
+        savedMessages.push(msgData);
+        currentTurns = Math.max(currentTurns, seqNum);
+        latestText = String(item.text || "").trim().slice(0, 120);
+        latestAt = msgAt;
+        if (updatedTitle === "New chat" && msgData.role === "user" && msgData.text.trim()) {
+          updatedTitle = msgData.text.trim().slice(0, 60);
+        }
+      }
+
+      const patchFields = {
+        updated_at: latestAt,
+        turns: currentTurns,
+        last_text: latestText,
+        ...(updatedTitle !== chatData.title ? { title: updatedTitle } : {}),
+      };
+      await ztFetch(`/v1/data/ai_chats/${encodeURIComponent(chatId)}`, {
+        method: "PATCH",
+        body: { data: patchFields },
+      });
+
+      return sendJson(res, 200, {
+        success: true,
+        chatId,
+        chat: { ...chatData, ...patchFields },
+        messages: savedMessages,
+      });
+    }
+
+    // 9d. PATCH /api/history/chats/:chatId -> renameChat(id, title)
+    if (req.method === "PATCH" && chatMatch) {
+      const chatId = decodeURIComponent(chatMatch[1]);
+      let body;
+      try {
+        body = await readJsonBody(req);
+      } catch (err) {
+        return sendJson(res, 400, { success: false, error: { message: err.message } });
+      }
+      const title = String(body.title || "").trim().slice(0, 60) || "New chat";
+      const updated_at = new Date().toISOString();
+      const out = await ztFetch(`/v1/data/ai_chats/${encodeURIComponent(chatId)}`, {
+        method: "PATCH",
+        body: { data: { title, updated_at } },
+      });
+      if (!out.ok) return sendJson(res, out.status, out.json || { error: { message: "Rename failed" } });
+      return sendJson(res, 200, {
+        success: true,
+        chat: { id: chatId, ...(out.json?.data || { title, updated_at }) },
+      });
+    }
+
+    // 9e. DELETE /api/history/chats/:chatId -> deleteChat(id) (messages first, then chat doc)
+    if (req.method === "DELETE" && chatMatch) {
+      const chatId = decodeURIComponent(chatMatch[1]);
+      let deletedMessages = 0;
+      for (let page = 0; page < 50; page++) {
+        const msgRes = await ztFetch(
+          `/v1/data/ai_messages?where=chat_id:eq:${encodeURIComponent(chatId)}&limit=200`
+        );
+        const docs = msgRes.json?.documents || [];
+        if (docs.length === 0) break;
+        for (const d of docs) {
+          await ztFetch(`/v1/data/ai_messages/${encodeURIComponent(d.id)}`, { method: "DELETE" });
+          deletedMessages++;
+        }
+        if (!msgRes.json?.next_cursor) break;
+      }
+      await ztFetch(`/v1/data/ai_chats/${encodeURIComponent(chatId)}`, { method: "DELETE" });
+      return sendJson(res, 200, {
+        success: true,
+        id: chatId,
+        deleted: true,
+        deletedMessages,
+      });
+    }
+  }
+
+  // 10. Server-Side ZentraGrid History Proxy (`/v1/data/ai_chats`, `/v1/data/ai_messages`, `/v1/files`)
+  //     In any web deployment, ZENTRAGRID_API_KEY stays strictly on the server and
+  //     the browser talks only to this route. Support chat collections (`messages`,
+  //     `presence`, `typing`) are never touched here.
   const ztMatch = pathname.match(/^\/(?:api\/storage\/)?(v1\/(?:data\/(ai_chats|ai_messages)(?:\/[^/]+)?|files(?:\/[^/]+(?:\/download)?)?))$/);
   if (ztMatch) {
     const ztKey = (process.env.ZENTRAGRID_API_KEY || process.env.STORAGE_API_KEY || "").trim();
