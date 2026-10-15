@@ -1180,6 +1180,16 @@ function detectImageTaskIntent(userText = "", hasImage = false, body = {}) {
   const q = String(userText || "").toLowerCase().trim();
   if (!q) return null;
 
+  // Skip pure capability questions ("kya tum image generate kar sakte ho?", "can you generate images?")
+  if (
+    /\b(kya tum|kya aap|can you|are you able to|do you have)\b[\s\S]{0,50}\b(kar sakte|bana sakte|sakte ho|sakti ho)\b/i.test(
+      q
+    ) ||
+    /^(can you|do you)\s+(generate|create|edit)\s+(images?|photos?|pictures?)[?!.\s]*$/i.test(q)
+  ) {
+    return null;
+  }
+
   if (hasImage) {
     // Pure Q&A questions about an uploaded image ("ye kya hai?", "read this text", "solve this")
     const pureQuestionOnly =
@@ -1259,19 +1269,28 @@ async function runMaxImageAgent({
   action = "generate",
   model = DEFAULT_MODEL,
   onStatus = null,
+  preCraftedPrompt = "",
+  preStatusMessage = "",
+  preFinalReply = "",
 }) {
   const isEdit = action === "edit" && Boolean(imageInput && imageInput.dataUri);
 
-  let statusMessage = isEdit
-    ? "Ruko bhai, aapki photo ko dekh kar aapke hisaab se edit kar raha hoon... ✨"
-    : "Ek second bhai, aapke liye shandaar image taiyar kar raha hoon... 🎨";
-  let maxPrompt = String(userText || "").trim();
-  let finalReply = isEdit
-    ? "Yeh lijiye bhai, aapki edited image bilkul taiyar hai! ✨"
-    : "Yeh lijiye bhai, aapki image ban kar taiyar hai! 🎨";
+  let statusMessage =
+    preStatusMessage ||
+    (isEdit
+      ? "Ruko bhai, aapki photo ko dekh kar aapke hisaab se edit kar raha hoon... ✨"
+      : "Ek second bhai, aapke liye shandaar image taiyar kar raha hoon... 🎨");
+  let maxPrompt = String(preCraftedPrompt || userText || "").trim();
+  let finalReply =
+    preFinalReply ||
+    (isEdit
+      ? "Yeh lijiye bhai, aapki edited image bilkul taiyar hai! ✨"
+      : "Yeh lijiye bhai, aapki image ban kar taiyar hai! 🎨");
 
   // Step 1: Use Max v1.0 (`mimo-v2.6-flash-free`) to inspect the image (if edit) and craft the optimal prompt + status message
-  try {
+  // (Skip if mimo-v2.6-flash-free already provided preCraftedPrompt via <IMAGE_TASK> and no vision inspection is needed)
+  if (!preCraftedPrompt || isEdit) {
+    try {
     const promptInstruction = isEdit
       ? `/no_think You are ${AI_NAME} inside the ${APP_NAME} app. The user uploaded an image and asked to edit it: "${userText}".\n` +
         `Look carefully at the uploaded image (subject, appearance, pose, clothing, objects, lighting, background, style) and understand what the user wants to edit.\n` +
@@ -1329,6 +1348,7 @@ async function runMaxImageAgent({
     }
   } catch {
     // Keep sensible fallback statusMessage & maxPrompt if vision call errors
+  }
   }
 
   // Notify caller/stream immediately so the app knows an image is being edited/generated and prepares its image UI slot!
@@ -3715,10 +3735,13 @@ const server = http.createServer(async (req, res) => {
           });
         }
         const imgResult = await runMaxImageAgent({
-          userText: fallbackImgTask.maxPrompt || latestUserText,
+          userText: latestUserText,
           imageInput,
           action: fallbackImgTask.action,
           model: body.model || DEFAULT_MODEL,
+          preCraftedPrompt: fallbackImgTask.maxPrompt,
+          preStatusMessage: fallbackImgTask.statusMessage,
+          preFinalReply: fallbackImgTask.finalReply,
           onStatus: (statusPayload) => {
             if (wantsStream) {
               sendSSEEvent(res, "image_status", statusPayload);
@@ -3924,10 +3947,13 @@ const server = http.createServer(async (req, res) => {
       );
       if (fallbackImgTask) {
         const imgResult = await runMaxImageAgent({
-          userText: fallbackImgTask.maxPrompt || latestUserText,
+          userText: latestUserText,
           imageInput,
           action: fallbackImgTask.action,
           model: body.model || DEFAULT_MODEL,
+          preCraftedPrompt: fallbackImgTask.maxPrompt,
+          preStatusMessage: fallbackImgTask.statusMessage,
+          preFinalReply: fallbackImgTask.finalReply,
         });
         const finalPayload = {
           id: `chatcmpl-img-${Date.now()}`,
