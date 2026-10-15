@@ -15,8 +15,10 @@ services:
         value: Vega
       - key: DEFAULT_MODEL
         value: mimo-v2.6-flash-free
+      - key: GEMINI_VOICE_MODEL
+        value: gemini-2.5-flash-native-audio-preview-12-2025
       - key: GEMINI_STT_MODEL
-        value: gemini-3.1-flash-lite-preview
+        value: gemini-2.5-flash-native-audio-preview-12-2025
       - key: GEMINI_TTS_MODEL
         value: gemini-2.5-flash-native-audio-preview-12-2025
       - key: GEMINI_TTS_VOICE

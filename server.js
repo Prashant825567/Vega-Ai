@@ -72,15 +72,9 @@ const UPSTREAM_URLS = [
 ];
 
 const DEFAULT_MODEL = process.env.DEFAULT_MODEL || "mimo-v2.6-flash-free";
-const GEMINI_STT_MODEL = process.env.GEMINI_STT_MODEL || "gemini-3.1-flash-lite-preview";
-
-// Always use Gemini Live Native Audio (`gemini-2.5-flash-native-audio-preview-12-2025`) directly for TTS,
-// even if an older env var still says `gemini-2.5-flash-preview-tts`.
-const rawTtsEnv = (process.env.GEMINI_TTS_MODEL || "").trim();
-const GEMINI_TTS_MODEL =
-  !rawTtsEnv || rawTtsEnv === "gemini-2.5-flash-preview-tts"
-    ? "gemini-2.5-flash-native-audio-preview-12-2025"
-    : rawTtsEnv;
+const GEMINI_VOICE_MODEL = "gemini-2.5-flash-native-audio-preview-12-2025";
+const GEMINI_STT_MODEL = "gemini-2.5-flash-native-audio-preview-12-2025";
+const GEMINI_TTS_MODEL = "gemini-2.5-flash-native-audio-preview-12-2025";
 
 // ─── Smooth & Beautiful Female Voices Catalog (Gemini Live Native Audio) ─────
 const SMOOTH_FEMALE_VOICES = [
@@ -1780,6 +1774,478 @@ async function synthesizeWithGeminiTTS({ text, voice }) {
   );
 }
 
+/**
+ * Extracts raw 16-bit mono little-endian PCM and sampleRate from a WAV or raw PCM base64 string.
+ * Returns `{ pcmBuffer, sampleRate }` if valid 16-bit PCM WAV/raw, or `null` if compressed (e.g. WebM/Opus).
+ */
+function extractPcmFromWavBase64(base64Data, mimeType = "audio/wav") {
+  if (!base64Data) return null;
+  const buf = Buffer.from(base64Data, "base64");
+  const cleanMime = String(mimeType || "").toLowerCase();
+
+  if (cleanMime.includes("pcm")) {
+    const rateMatch = cleanMime.match(/rate=(\d+)/);
+    return {
+      pcmBuffer: buf,
+      sampleRate: rateMatch ? Number(rateMatch[1]) || 16000 : 16000,
+    };
+  }
+
+  if (buf.length < 44) return null;
+  if (buf.toString("ascii", 0, 4) !== "RIFF" || buf.toString("ascii", 8, 12) !== "WAVE") {
+    return null;
+  }
+
+  let offset = 12;
+  let audioFormat = 1;
+  let numChannels = 1;
+  let sampleRate = 24000;
+  let bitsPerSample = 16;
+  let dataChunk = null;
+
+  while (offset + 8 <= buf.length) {
+    const chunkId = buf.toString("ascii", offset, offset + 4);
+    const chunkSize = buf.readUInt32LE(offset + 4);
+    const chunkStart = offset + 8;
+    if (chunkId === "fmt " && chunkStart + 16 <= buf.length) {
+      audioFormat = buf.readUInt16LE(chunkStart);
+      numChannels = buf.readUInt16LE(chunkStart + 2);
+      sampleRate = buf.readUInt32LE(chunkStart + 4);
+      bitsPerSample = buf.readUInt16LE(chunkStart + 14);
+    } else if (chunkId === "data") {
+      const end = Math.min(buf.length, chunkStart + chunkSize);
+      dataChunk = buf.subarray(chunkStart, end);
+      break;
+    }
+    offset = chunkStart + chunkSize + (chunkSize % 2);
+  }
+
+  if (!dataChunk || audioFormat !== 1 || bitsPerSample !== 16) {
+    return null;
+  }
+
+  if (numChannels === 2) {
+    const frames = Math.floor(dataChunk.length / 4);
+    const mono = Buffer.alloc(frames * 2);
+    for (let i = 0; i < frames; i++) {
+      const left = dataChunk.readInt16LE(i * 4);
+      const right = dataChunk.readInt16LE(i * 4 + 2);
+      mono.writeInt16LE(Math.round((left + right) / 2), i * 2);
+    }
+    return { pcmBuffer: mono, sampleRate };
+  }
+
+  return { pcmBuffer: dataChunk, sampleRate };
+}
+
+/**
+ * Unified Single-Pass Voice Agent (`gemini-2.5-flash-native-audio-preview-12-2025`):
+ * Performs STT + Max v1.0 LLM + Aoede 24kHz WAV TTS in ONE single BidiGenerateContent WebSocket call!
+ */
+function runGeminiNativeVoiceTurn({
+  userText = "",
+  pcmInput = null,
+  history = [],
+  systemPrompt = "",
+  selectedVoice = "Aoede",
+  apiKey,
+  liveModel = "models/gemini-2.5-flash-native-audio-preview-12-2025",
+}) {
+  return new Promise((resolve, reject) => {
+    const fullModel = liveModel.startsWith("models/") ? liveModel : `models/${liveModel}`;
+    const wsKey = crypto.randomBytes(16).toString("base64");
+    const wsPath = `/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent?key=${encodeURIComponent(
+      apiKey
+    )}`;
+
+    const req = https.request({
+      hostname: "generativelanguage.googleapis.com",
+      port: 443,
+      path: wsPath,
+      method: "GET",
+      headers: {
+        Connection: "Upgrade",
+        Upgrade: "websocket",
+        "Sec-WebSocket-Version": "13",
+        "Sec-WebSocket-Key": wsKey,
+      },
+    });
+
+    let finishSuccessRef = null;
+    const timeout = setTimeout(() => {
+      if (typeof finishSuccessRef === "function") {
+        finishSuccessRef();
+        return;
+      }
+      req.destroy();
+      reject(new Error(`Gemini Native Voice (${fullModel}) WebSocket timed out.`));
+    }, 15000);
+
+    function sendWsJson(socket, obj) {
+      const payload = Buffer.from(JSON.stringify(obj), "utf8");
+      const mask = crypto.randomBytes(4);
+      let header;
+      if (payload.length < 126) {
+        header = Buffer.alloc(2);
+        header[0] = 0x81;
+        header[1] = 0x80 | payload.length;
+      } else if (payload.length < 65536) {
+        header = Buffer.alloc(4);
+        header[0] = 0x81;
+        header[1] = 0x80 | 126;
+        header.writeUInt16BE(payload.length, 2);
+      } else {
+        header = Buffer.alloc(10);
+        header[0] = 0x81;
+        header[1] = 0x80 | 127;
+        header.writeBigUInt64BE(BigInt(payload.length), 2);
+      }
+      const masked = Buffer.alloc(payload.length);
+      for (let i = 0; i < payload.length; i++) {
+        masked[i] = payload[i] ^ mask[i & 3];
+      }
+      socket.write(Buffer.concat([header, mask, masked]));
+    }
+
+    req.on("error", (err) => {
+      clearTimeout(timeout);
+      reject(err);
+    });
+
+    req.on("response", (res) => {
+      clearTimeout(timeout);
+      reject(new Error(`Gemini Native Voice WebSocket upgrade rejected: HTTP ${res.statusCode}`));
+    });
+
+    req.on("upgrade", (res, socket, head) => {
+      let buf = head && head.length ? Buffer.from(head) : Buffer.alloc(0);
+      const pcmChunks = [];
+      const inputTranscriptParts = [];
+      const outputTranscriptParts = [];
+      const modelTextParts = [];
+      let setupDone = false;
+      let finished = false;
+      let fragOpcode = 0;
+      let fragChunks = [];
+      let chunkIdleTimer = null;
+
+      function finishSuccess() {
+        if (finished) return;
+        finished = true;
+        clearTimeout(timeout);
+        if (chunkIdleTimer) clearTimeout(chunkIdleTimer);
+        try {
+          const closeFrame = Buffer.from([0x88, 0x80, 0, 0, 0, 0]);
+          socket.write(closeFrame);
+          socket.end();
+        } catch {}
+        if (pcmChunks.length === 0 && outputTranscriptParts.length === 0 && modelTextParts.length === 0) {
+          return reject(new Error(`Gemini Native Voice (${fullModel}) returned empty response.`));
+        }
+        const pcmBuffer = pcmChunks.length > 0 ? Buffer.concat(pcmChunks) : Buffer.alloc(0);
+        const wavBuffer = pcmBuffer.length > 0 ? pcm16ToWavBuffer(pcmBuffer, 24000, 1, 16) : null;
+        const wavBase64 = wavBuffer ? wavBuffer.toString("base64") : "";
+        const transcript = inputTranscriptParts.join("").trim() || userText || "";
+        const reply =
+          outputTranscriptParts.join("").trim() ||
+          modelTextParts.join("").trim() ||
+          "";
+        resolve({
+          model: fullModel.replace(/^models\//, ""),
+          voice: selectedVoice,
+          sampleRate: 24000,
+          mimeType: "audio/wav",
+          transcript,
+          reply,
+          wavBuffer,
+          wavBase64,
+          dataUri: wavBase64 ? `data:audio/wav;base64,${wavBase64}` : "",
+        });
+      }
+
+      finishSuccessRef = () => {
+        if (pcmChunks.length > 0 || outputTranscriptParts.length > 0) finishSuccess();
+        else {
+          req.destroy();
+          reject(new Error(`Gemini Native Voice (${fullModel}) WebSocket timed out.`));
+        }
+      };
+
+      function handleJsonMessage(msg) {
+        if (msg.error) {
+          if (!finished) {
+            if (pcmChunks.length > 0) return finishSuccess();
+            finished = true;
+            clearTimeout(timeout);
+            if (chunkIdleTimer) clearTimeout(chunkIdleTimer);
+            socket.destroy();
+            reject(new Error(`Gemini Native Voice (${fullModel}) error: ${JSON.stringify(msg.error)}`));
+          }
+          return;
+        }
+
+        if (msg.setupComplete !== undefined && !setupDone) {
+          setupDone = true;
+          const historyTurns = [];
+          if (Array.isArray(history)) {
+            for (const h of history.slice(-6)) {
+              if (h && h.content && typeof h.content === "string") {
+                historyTurns.push({
+                  role: h.role === "assistant" || h.role === "model" ? "model" : "user",
+                  parts: [{ text: h.content }],
+                });
+              }
+            }
+          }
+
+          if (pcmInput && pcmInput.pcmBuffer && pcmInput.pcmBuffer.length > 0) {
+            if (historyTurns.length > 0) {
+              sendWsJson(socket, {
+                clientContent: {
+                  turns: historyTurns,
+                  turnComplete: false,
+                },
+              });
+            }
+            const chunkSize = 32000;
+            for (let i = 0; i < pcmInput.pcmBuffer.length; i += chunkSize) {
+              const slice = pcmInput.pcmBuffer.subarray(i, i + chunkSize);
+              sendWsJson(socket, {
+                realtimeInput: {
+                  audio: {
+                    mimeType: `audio/pcm;rate=${pcmInput.sampleRate || 24000}`,
+                    data: slice.toString("base64"),
+                  },
+                },
+              });
+            }
+            sendWsJson(socket, {
+              realtimeInput: {
+                audioStreamEnd: true,
+              },
+            });
+          } else {
+            historyTurns.push({
+              role: "user",
+              parts: [{ text: userText }],
+            });
+            sendWsJson(socket, {
+              clientContent: {
+                turns: historyTurns,
+                turnComplete: true,
+              },
+            });
+          }
+          return;
+        }
+
+        const sc = msg?.serverContent;
+        if (sc) {
+          if (typeof sc.inputTranscription?.text === "string") {
+            inputTranscriptParts.push(sc.inputTranscription.text);
+          }
+          if (typeof sc.outputTranscription?.text === "string") {
+            outputTranscriptParts.push(sc.outputTranscription.text);
+          }
+          const parts = sc.modelTurn?.parts;
+          if (Array.isArray(parts)) {
+            for (const p of parts) {
+              if (p?.inlineData?.data) {
+                pcmChunks.push(Buffer.from(p.inlineData.data, "base64"));
+                if (chunkIdleTimer) clearTimeout(chunkIdleTimer);
+                chunkIdleTimer = setTimeout(() => {
+                  if (pcmChunks.length > 0) finishSuccess();
+                }, 260);
+              }
+              if (typeof p?.text === "string" && !p?.thought) {
+                modelTextParts.push(p.text);
+              }
+            }
+          }
+          if ((sc.turnComplete || sc.generationComplete) && pcmChunks.length > 0) {
+            finishSuccess();
+          }
+        }
+      }
+
+      socket.on("data", (chunk) => {
+        buf = Buffer.concat([buf, chunk]);
+        while (buf.length >= 2) {
+          const b0 = buf[0];
+          const b1 = buf[1];
+          const fin = (b0 & 0x80) !== 0;
+          const opcode = b0 & 0x0f;
+          const isMasked = (b1 & 0x80) !== 0;
+          let len = b1 & 0x7f;
+          let offset = 2;
+          if (len === 126) {
+            if (buf.length < 4) break;
+            len = buf.readUInt16BE(2);
+            offset = 4;
+          } else if (len === 127) {
+            if (buf.length < 10) break;
+            len = Number(buf.readBigUInt64BE(2));
+            offset = 10;
+          }
+          let maskKey = null;
+          if (isMasked) {
+            if (buf.length < offset + 4) break;
+            maskKey = buf.subarray(offset, offset + 4);
+            offset += 4;
+          }
+          if (buf.length < offset + len) break;
+          let payload = buf.subarray(offset, offset + len);
+          buf = buf.subarray(offset + len);
+          if (isMasked && maskKey) {
+            const unmasked = Buffer.alloc(payload.length);
+            for (let i = 0; i < payload.length; i++) {
+              unmasked[i] = payload[i] ^ maskKey[i & 3];
+            }
+            payload = unmasked;
+          }
+
+          if (opcode === 0x08) {
+            if (pcmChunks.length > 0) {
+              finishSuccess();
+            } else if (!finished) {
+              finished = true;
+              clearTimeout(timeout);
+              const reason = payload.length > 2 ? payload.subarray(2).toString("utf8") : "closed";
+              reject(new Error(`Gemini Native Voice (${fullModel}) WebSocket closed: ${reason}`));
+            }
+            return;
+          } else if (opcode === 0x09) {
+            const pong = Buffer.alloc(2);
+            pong[0] = 0x8a;
+            pong[1] = 0x80;
+            socket.write(Buffer.concat([pong, crypto.randomBytes(4)]));
+          } else if (opcode === 0x01 || opcode === 0x02 || opcode === 0x00) {
+            if (opcode !== 0x00) {
+              fragOpcode = opcode;
+              fragChunks = [payload];
+            } else {
+              fragChunks.push(payload);
+            }
+            if (fin && (fragOpcode === 0x01 || fragOpcode === 0x02)) {
+              const full = Buffer.concat(fragChunks);
+              fragChunks = [];
+              try {
+                const parsed = JSON.parse(full.toString("utf8"));
+                handleJsonMessage(parsed);
+              } catch {}
+            }
+          }
+        }
+      });
+
+      socket.on("error", (err) => {
+        if (!finished) {
+          finished = true;
+          clearTimeout(timeout);
+          reject(err);
+        }
+      });
+
+      socket.on("close", () => {
+        if (!finished) {
+          if (pcmChunks.length > 0) finishSuccess();
+          else {
+            finished = true;
+            clearTimeout(timeout);
+            reject(new Error(`Gemini Native Voice (${fullModel}) WebSocket closed before audio finished.`));
+          }
+        }
+      });
+
+      const defaultVoicePersona =
+        systemPrompt ||
+        `You are ${AI_NAME}, the fast, smart, warm real-time voice AI assistant inside the ${APP_NAME} app. ` +
+          `When asked who you are or what your name is, always introduce yourself as ${AI_NAME}, the voice AI of ${APP_NAME}. ` +
+          `Speak naturally in the same language as the user (Hinglish, Hindi, or English) with a smooth, sweet, warm, and natural Indian conversational flow. ` +
+          `Keep every response concise, direct, and conversational (1 to 2 short spoken sentences) so your voice answer is ultra-fast.`;
+
+      sendWsJson(socket, {
+        setup: {
+          model: fullModel,
+          generationConfig: {
+            responseModalities: ["AUDIO"],
+            speechConfig: {
+              voiceConfig: {
+                prebuiltVoiceConfig: {
+                  voiceName: selectedVoice,
+                },
+              },
+            },
+            ...(fullModel.includes("native-audio")
+              ? { thinkingConfig: { thinkingBudget: 0 } }
+              : {}),
+          },
+          inputAudioTranscription: {},
+          outputAudioTranscription: {},
+          systemInstruction: {
+            parts: [{ text: defaultVoicePersona }],
+          },
+        },
+      });
+    });
+
+    req.end();
+  });
+}
+
+async function runGeminiNativeVoiceAgent({
+  userText = "",
+  pcmInput = null,
+  history = [],
+  systemPrompt = "",
+  voice = "Aoede",
+}) {
+  if (GEMINI_API_KEYS.length === 0) {
+    throw new Error(
+      "Server misconfiguration: GEMINI_API_KEY (Google AI Studio API Key) environment variable is not set."
+    );
+  }
+  const selectedVoice = normalizeVoiceName(voice || GEMINI_TTS_VOICE || "Aoede");
+  const liveModelsToTry = [
+    GEMINI_VOICE_MODEL,
+    "models/gemini-2.5-flash-native-audio-preview-12-2025",
+    "models/gemini-2.5-flash-native-audio-latest",
+    "models/gemini-3.1-flash-live-preview",
+  ];
+  const triedModels = new Set();
+  const maxKeyAttempts = Math.max(1, GEMINI_API_KEYS.length);
+  let lastErr = null;
+
+  for (const rawModel of liveModelsToTry) {
+    const cleanModel = rawModel.replace(/^models\//, "");
+    if (!cleanModel || triedModels.has(cleanModel)) continue;
+    triedModels.add(cleanModel);
+
+    for (let k = 0; k < maxKeyAttempts; k++) {
+      try {
+        const apiKey = getGeminiApiKey();
+        const result = await runGeminiNativeVoiceTurn({
+          userText,
+          pcmInput,
+          history,
+          systemPrompt,
+          selectedVoice,
+          apiKey,
+          liveModel: `models/${cleanModel}`,
+        });
+        if (result && (result.wavBase64 || result.reply)) {
+          return result;
+        }
+      } catch (err) {
+        lastErr = err;
+      }
+    }
+  }
+  throw new Error(
+    lastErr?.message || `Gemini Native Voice Agent (${GEMINI_VOICE_MODEL}) failed.`
+  );
+}
+
 // In-memory cache for filler audio ("Ek second, abhi batata hoon.") per voice
 // so subsequent filler audio plays in 0ms!
 const fillerAudioCache = new Map();
@@ -1883,9 +2349,11 @@ const server = http.createServer(async (req, res) => {
       service: `${AI_NAME} Backend & Voice Agent API`,
       app: APP_NAME,
       models: {
-        stt: GEMINI_STT_MODEL,
-        llm: DEFAULT_MODEL,
-        tts: GEMINI_TTS_MODEL,
+        voice: GEMINI_VOICE_MODEL,
+        stt: GEMINI_VOICE_MODEL,
+        llm: GEMINI_VOICE_MODEL,
+        chatLlm: DEFAULT_MODEL,
+        tts: GEMINI_VOICE_MODEL,
         ttsDefaultVoice: GEMINI_TTS_VOICE,
       },
       availableFemaleVoices: SMOOTH_FEMALE_VOICES,
@@ -2078,10 +2546,10 @@ const server = http.createServer(async (req, res) => {
   }
 
   // 6. Full Voice Agent Endpoint: POST /api/voice (or /api/voice-agent)
-  //    Pipeline:
-  //    [1] STT: `gemini-2.5-flash`
-  //    [2] LLM: `mimo-v2.6-flash-free` (Max v1.0, Fast No-Reasoning by default, or Smart Filler if research needed)
-  //    [3] TTS: `gemini-2.5-flash-preview-tts` (Playable 24kHz WAV output for Vega App)
+  //    Unified Single-Model Pipeline:
+  //    [1] STT: `gemini-2.5-flash-native-audio-preview-12-2025`
+  //    [2] LLM: `gemini-2.5-flash-native-audio-preview-12-2025` (Max v1.0, zero thinking delay)
+  //    [3] TTS: `gemini-2.5-flash-native-audio-preview-12-2025` (Aoede 24kHz WAV output for Vega App)
   if (
     req.method === "POST" &&
     (pathname === "/api/voice" || pathname === "/api/voice-agent" || pathname === "/voice")
@@ -2097,24 +2565,28 @@ const server = http.createServer(async (req, res) => {
     const selectedVoice = normalizeVoiceName(body.voice || GEMINI_TTS_VOICE || "Aoede");
 
     try {
-      // Step 1: Speech-to-Text (`gemini-2.5-flash`)
       let userTranscript = (body.text ?? body.message ?? "").trim();
       const audioInput = body.audio || body.audioBase64;
+      let pcmInput = null;
 
       if (!userTranscript && audioInput) {
         const { mimeType, base64Data } = parseBase64AudioInput(
           audioInput,
           body.mimeType || "audio/wav"
         );
-        const sttResult = await transcribeWithGeminiSTT({
-          audioBase64: base64Data,
-          mimeType,
-          languageHint: body.language || "",
-        });
-        userTranscript = sttResult.transcript;
+        pcmInput = extractPcmFromWavBase64(base64Data, mimeType);
+        if (!pcmInput) {
+          // Compressed browser audio (e.g. audio/webm;codecs=opus): transcribe and feed to Native Audio model
+          const sttResult = await transcribeWithGeminiSTT({
+            audioBase64: base64Data,
+            mimeType,
+            languageHint: body.language || "",
+          });
+          userTranscript = sttResult.transcript;
+        }
       }
 
-      if (!userTranscript) {
+      if (!userTranscript && !pcmInput) {
         return sendJson(res, 400, {
           success: false,
           error:
@@ -2123,18 +2595,14 @@ const server = http.createServer(async (req, res) => {
         });
       }
 
-      // Check if this voice query requires deep thinking / web search
       let needsThinking =
         typeof body.thinking === "boolean"
           ? body.thinking
           : detectNeedsThinking(userTranscript);
 
-      // By default in voice mode: disable reasoning for ultra-fast response!
-      // Only enable reasoning if the user explicitly asked for deep thinking (`body.reasoning === true`).
       const disableReasoning = body.reasoning === true ? false : true;
       let fillerSentInStream = false;
 
-      // If client requested SSE stream (`stream: true`), emit transcript & instant filler audio first!
       if (wantsStream) {
         setCorsHeaders(res);
         res.writeHead(200, {
@@ -2143,11 +2611,13 @@ const server = http.createServer(async (req, res) => {
           Connection: "keep-alive",
         });
 
-        sendSSEEvent(res, "transcript", {
-          type: "transcript",
-          transcript: userTranscript,
-          needsThinking,
-        });
+        if (userTranscript) {
+          sendSSEEvent(res, "transcript", {
+            type: "transcript",
+            transcript: userTranscript,
+            needsThinking,
+          });
+        }
 
         if (needsThinking && body.tts !== false) {
           try {
@@ -2161,102 +2631,67 @@ const server = http.createServer(async (req, res) => {
               text: filler.text,
               audio: filler,
             });
-          } catch {
-            // Continue even if filler TTS fails
-          }
+          } catch {}
         }
       }
 
-      // Step 2: Middle LLM (`mimo-v2.6-flash-free` via OpenCode as Max v1.0 + Built-in OpenCode Web Search)
       const fillerCacheKey = `${selectedVoice}::${body.fillerText || DEFAULT_FILLER_TEXT}`;
-      const trimmedHistory = Array.isArray(body.history) ? body.history.slice(-6) : undefined;
-      const llmMessages = normalizeMessages(
-        {
-          history: trimmedHistory,
-          system: body.system || body.systemPrompt,
-          message: userTranscript,
-        },
-        VOICE_FAST_SYSTEM_PROMPT
-      );
+      const trimmedHistory = Array.isArray(body.history) ? body.history.slice(-6) : [];
+      let usedWebSearch = false;
+      const searchQueries = [];
+      let effectiveUserText = userTranscript;
 
-      const agentResult = await runOpenCodeAgentWithTools(
-        {
-          model: body.model || DEFAULT_MODEL,
-          messages: llmMessages,
-          temperature: body.temperature ?? 0.6,
-          max_tokens: body.max_tokens || 120,
-          disableReasoning,
-          allowWebSearch: needsThinking,
-        },
-        async (queries) => {
-          needsThinking = true;
+      if (needsThinking && userTranscript) {
+        try {
+          usedWebSearch = true;
+          searchQueries.push(userTranscript);
           if (wantsStream) {
-            if (!fillerSentInStream && body.tts !== false) {
-              try {
-                const filler = await getFillerAudio(
-                  selectedVoice,
-                  body.fillerText || DEFAULT_FILLER_TEXT
-                );
-                fillerSentInStream = true;
-                sendSSEEvent(res, "filler", {
-                  type: "filler",
-                  text: filler.text,
-                  audio: filler,
-                });
-              } catch {}
-            }
             sendSSEEvent(res, "websearch", {
               type: "websearch",
-              queries,
+              queries: searchQueries,
             });
           }
-        }
-      );
-
-      if (!agentResult.ok) {
-        const errPayload = {
-          success: false,
-          error: "Middle LLM (OpenCode mimo-v2.6-flash-free) error",
-          details: agentResult.errorText,
-          transcript: userTranscript,
-        };
-        if (wantsStream) {
-          sendSSEEvent(res, "error", errPayload);
-          return res.end();
-        }
-        return sendJson(res, agentResult.status || 502, errPayload);
+          const searchResultText = await executeOpenCodeWebSearch({
+            query: userTranscript,
+            numResults: 4,
+          });
+          if (searchResultText) {
+            effectiveUserText =
+              `User question: ${userTranscript}\n\n` +
+              `Live web search facts (use these to answer concisely in 1-2 spoken sentences, starting with "Ek second, abhi batata hoon..."): \n${String(
+                searchResultText
+              ).slice(0, 1200)}`;
+          }
+        } catch {}
       }
 
-      const assembled = agentResult.assembled;
-      let replyText = assembled.content.trim();
+      const nativeResult = await runGeminiNativeVoiceAgent({
+        userText: effectiveUserText,
+        pcmInput,
+        history: trimmedHistory,
+        systemPrompt: body.system || body.systemPrompt || "",
+        voice: selectedVoice,
+      });
 
-      // Ensure that when Max v1.0 performs a Web Search in voice mode, it speaks "Ek second, abhi batata hoon..."
-      // And when no Web Search / deep thinking was needed, strip any accidental "Ek second..." filler prefix.
+      const finalTranscript = (nativeResult.transcript || userTranscript || "").trim();
+      let replyText = (nativeResult.reply || "").trim();
+
       if (
-        (agentResult.usedWebSearch || needsThinking) &&
+        (usedWebSearch || needsThinking) &&
         replyText &&
         !/^ek\s+second/i.test(replyText)
       ) {
         replyText = `Ek second, abhi batata hoon... ${replyText}`;
-      } else if (!agentResult.usedWebSearch && !needsThinking && replyText) {
-        replyText =
-          replyText.replace(/^ek\s+second\s*,?\s*abhi\s+batat[ai]\s+hoon[.!\s…-]*/i, "").trim() ||
-          replyText;
       }
 
-      // Step 3: Text-to-Speech (`gemini-2.5-flash-native-audio-preview-12-2025`)
       let audioOutput = null;
-      if (body.tts !== false && replyText) {
-        const ttsResult = await synthesizeWithGeminiTTS({
-          text: replyText,
-          voice: selectedVoice,
-        });
+      if (body.tts !== false && nativeResult.wavBase64) {
         audioOutput = {
-          mimeType: ttsResult.mimeType,
-          sampleRate: ttsResult.sampleRate,
-          voice: ttsResult.voice,
-          base64: ttsResult.wavBase64,
-          dataUri: ttsResult.dataUri,
+          mimeType: nativeResult.mimeType,
+          sampleRate: nativeResult.sampleRate,
+          voice: nativeResult.voice,
+          base64: nativeResult.wavBase64,
+          dataUri: nativeResult.dataUri,
         };
       }
 
@@ -2267,16 +2702,16 @@ const server = http.createServer(async (req, res) => {
         ai: AI_NAME,
         app: APP_NAME,
         pipeline: {
-          sttModel: GEMINI_STT_MODEL,
-          llmModel: assembled.model,
-          ttsModel: GEMINI_TTS_MODEL,
+          sttModel: GEMINI_VOICE_MODEL,
+          llmModel: nativeResult.model || GEMINI_VOICE_MODEL,
+          ttsModel: nativeResult.model || GEMINI_VOICE_MODEL,
           voice: selectedVoice,
           fastNoReasoning: disableReasoning,
           needsThinking,
-          usedWebSearch: agentResult.usedWebSearch,
-          searchQueries: agentResult.searchQueries,
+          usedWebSearch,
+          searchQueries,
         },
-        transcript: userTranscript,
+        transcript: finalTranscript,
         ...(needsThinking
           ? {
               fillerText: body.fillerText || DEFAULT_FILLER_TEXT,
@@ -2284,9 +2719,9 @@ const server = http.createServer(async (req, res) => {
             }
           : {}),
         reply: replyText,
-        reasoning: assembled.reasoning || null,
+        reasoning: null,
         audio: audioOutput,
-        usage: assembled.usage,
+        usage: null,
       };
 
       if (wantsStream) {
