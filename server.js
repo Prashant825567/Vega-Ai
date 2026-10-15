@@ -2170,9 +2170,10 @@ function runGeminiNativeVoiceTurn({
                 pcmChunks.push(Buffer.from(p.inlineData.data, "base64"));
                 if (chunkIdleTimer) clearTimeout(chunkIdleTimer);
                 if (!toolCallInFlight) {
+                  const idleWaitMs = nativeUsedWebSearch ? 1400 : 650;
                   chunkIdleTimer = setTimeout(() => {
                     if (!toolCallInFlight && pcmChunks.length > 0) finishSuccess();
-                  }, 650);
+                  }, idleWaitMs);
                 }
               }
               if (typeof p?.text === "string" && !p?.thought) {
@@ -2821,7 +2822,7 @@ const server = http.createServer(async (req, res) => {
         needsThinking = true;
       }
 
-      const finalTranscript = (nativeResult.transcript || userTranscript || "").trim();
+      const finalTranscript = (userTranscript || nativeResult.transcript || "").trim();
       let replyText = (nativeResult.reply || "").trim();
 
       if (
