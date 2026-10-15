@@ -183,9 +183,6 @@ class OpenCodeMiMoLLMService(LLMService):
             "stream": True,
             "temperature": self._cfg.mimo_temperature,
             "max_tokens": self._cfg.mimo_max_tokens,
-            "reasoning_effort": "none",
-            "reasoning": {"enabled": False, "effort": "none"},
-            "thinking": {"type": "disabled"},
             "tools": _OPENCODE_TOOLS,
             "tool_choice": "auto",
         }

@@ -241,23 +241,27 @@ const DEFAULT_SYSTEM_PROMPT =
 
 const VOICE_FAST_SYSTEM_PROMPT =
   process.env.VOICE_SYSTEM_PROMPT ||
-  `You are ${AI_NAME}, the real-time voice AI agent inside the ${APP_NAME} app. ` +
+  `/no_think You are ${AI_NAME}, the real-time voice AI agent inside the ${APP_NAME} app. ` +
     `When asked who you are, always say you are ${AI_NAME}, the voice AI of ${APP_NAME}. ` +
-    `IMPORTANT VOICE & WEB SEARCH RULES: ` +
-    `1. Your reply will be converted directly into speech via TTS and played in the ${APP_NAME} app. ` +
-    `2. Give fast, direct, natural spoken answers (1 to 3 sentences) with actual facts and answers. Never reply with only a placeholder phrase like "Ek second"—always provide the complete answer. ` +
-    `3. NEVER use markdown, asterisks (*), bullet points, numbered lists, emojis, or code blocks—write ONLY plain spoken sentences in the user's language (Hinglish, Hindi, or English). ` +
-    `4. You have real-time internet access via the 'websearch' and 'webfetch' tools! Whenever the user asks about live/current news, prices, rates, weather, scores, recent events, or says "search karke batao" / "pata karke batao", you MUST call the 'websearch' tool FIRST, and then speak the real-time answer clearly. ` +
-    `5. CRITICAL RULE: NEVER invoke or call local shell/file tools (bash, edit, glob, grep, or read).`;
+    `Reply directly in 1 to 2 short, natural spoken sentences in the user's language (Hinglish, Hindi, or English) with no markdown, asterisks, lists, or emojis. ` +
+    `Do NOT call any tools for greetings, casual chat, or general knowledge—only call 'websearch' when the user asks for live/current news, prices, weather, scores, or web search. Never call bash, edit, glob, grep, or read.`;
 
 // ─── Detect Whether a Voice Query Needs Deep Thinking / Web Search ───────────
 function detectNeedsThinking(text) {
   const q = String(text || "").toLowerCase().trim();
   if (!q) return false;
+  // Casual greetings / identity questions never need web search or deep thinking
+  if (
+    /^(hi|hello|hey|namaste|namaskar|kaise ho|kaisa hai|kaisi ho|kya haal|how are you|who are you|tum kaun ho|aap kaun ho|tera naam|tumhara naam|what is your name|good morning|good evening|good night|aur batao|sab badhiya)[?!.\s]*$/i.test(
+      q
+    )
+  ) {
+    return false;
+  }
   const thinkingPatterns = [
     /\b(research|analyze|analyse|compare|calculate|solve|explain in detail|deep dive|step by step|history of|difference between|write code|algorithm|debug)\b/i,
-    /\b(search|web search|google|latest|current|today|news|price|rate|weather|score|live|update|2025|2026)\b/i,
-    /\b(soch ke|soch kar|check karke|pata karke|research karke|search karke|nikal ke|dhundh ke|detail me|detail mein|vistar se|samjhao|hisab laga|solve kar|aaj ka|abhi ka)\b/i,
+    /\b(search|web search|google|latest|current|today|news|price|rate|weather|score|live|update|2025|2026|ipl|match|stock|bitcoin|crypto|gold|silver|sensex|nifty)\b/i,
+    /\b(soch ke|soch kar|check karke|pata karke|research karke|search karke|nikal ke|dhundh ke|detail me|detail mein|vistar se|samjhao|hisab laga|solve kar|aaj ka|abhi ka|kya bhav|kitna rate)\b/i,
   ];
   if (q.length > 140) return true;
   return thinkingPatterns.some((re) => re.test(q));
@@ -829,20 +833,28 @@ async function callOpenCodeUpstream(payload) {
   );
 
   const disableReasoning = payload.disableReasoning === true;
+  const preparedMessages = Array.isArray(payload.messages)
+    ? payload.messages.map((m, idx) => {
+        if (
+          disableReasoning &&
+          idx === 0 &&
+          m &&
+          (m.role === "system" || m.role === "developer") &&
+          typeof m.content === "string" &&
+          !m.content.startsWith("/no_think")
+        ) {
+          return { ...m, content: `/no_think ${m.content}` };
+        }
+        return m;
+      })
+    : [];
 
   const upstreamBody = {
     model: resolveModel(payload.model),
-    messages: payload.messages,
+    messages: preparedMessages,
     stream: true,
     tools: [...existingTools, ...missingStubs],
     tool_choice: payload.tool_choice && payload.tool_choice !== "none" ? payload.tool_choice : "auto",
-    ...(disableReasoning
-      ? {
-          reasoning_effort: "none",
-          reasoning: { enabled: false, effort: "none" },
-          thinking: { type: "disabled" },
-        }
-      : {}),
   };
 
   if (typeof payload.temperature === "number") {
@@ -1028,12 +1040,23 @@ async function runOpenCodeAgentWithTools(payload, onWebSearchStart = null) {
       };
     }
 
-    const webCalls = assembled.toolCalls.filter(
-      (tc) => tc.function.name === "websearch" || tc.function.name === "webfetch"
-    );
+    const webCalls =
+      payload.allowWebSearch === false
+        ? []
+        : assembled.toolCalls.filter(
+            (tc) => tc.function.name === "websearch" || tc.function.name === "webfetch"
+          );
 
     if (webCalls.length === 0) {
-      // Model attempted to call a placeholder tool (bash/read/etc.); instruct it to reply in text directly
+      if (assembled.content && assembled.content.trim()) {
+        return {
+          ok: true,
+          assembled,
+          usedWebSearch,
+          searchQueries,
+        };
+      }
+      // Model attempted to call a placeholder/disabled tool; instruct it to reply in text directly
       workingMessages.push({
         role: "assistant",
         content: assembled.content || "",
@@ -1043,7 +1066,7 @@ async function runOpenCodeAgentWithTools(payload, onWebSearchStart = null) {
         workingMessages.push({
           role: "tool",
           tool_call_id: tc.id,
-          content: "Local shell/file tools are disabled. Answer the user directly in plain text.",
+          content: "Tool is disabled for this turn. Answer the user directly in plain spoken text.",
         });
       }
       continue;
@@ -1354,6 +1377,7 @@ async function transcribeWithGeminiSTT({ audioBase64, mimeType = "audio/wav", la
  */
 function synthesizeWithGeminiLiveAudio({
   spokenText,
+  spokenTextPromise = null,
   selectedVoice,
   apiKey,
   liveModel = "models/gemini-2.5-flash-native-audio-preview-12-2025",
@@ -1483,21 +1507,44 @@ function synthesizeWithGeminiLiveAudio({
         }
         if (msg.setupComplete !== undefined && !setupDone) {
           setupDone = true;
-          sendWsJson(socket, {
-            clientContent: {
-              turns: [
-                {
-                  role: "user",
-                  parts: [
+          Promise.resolve(spokenTextPromise ? spokenTextPromise : spokenText)
+            .then((resolvedText) => {
+              if (finished) return;
+              const finalSpoken = cleanTextForSpeech(resolvedText || "");
+              if (!finalSpoken) {
+                finished = true;
+                clearTimeout(timeout);
+                try {
+                  socket.destroy();
+                } catch {}
+                return reject(new Error("Empty spokenText after promise resolved."));
+              }
+              sendWsJson(socket, {
+                clientContent: {
+                  turns: [
                     {
-                      text: `Please read the following text aloud verbatim, word for word, in a smooth, sweet, warm, and natural voice without adding or changing any words:\n${spokenText}`,
+                      role: "user",
+                      parts: [
+                        {
+                          text: `Please read the following text aloud verbatim, word for word, in a smooth, sweet, warm, and natural voice without adding or changing any words:\n${finalSpoken}`,
+                        },
+                      ],
                     },
                   ],
+                  turnComplete: true,
                 },
-              ],
-              turnComplete: true,
-            },
-          });
+              });
+            })
+            .catch((err) => {
+              if (!finished) {
+                finished = true;
+                clearTimeout(timeout);
+                try {
+                  socket.destroy();
+                } catch {}
+                reject(err);
+              }
+            });
           return;
         }
         const parts = msg?.serverContent?.modelTurn?.parts;
@@ -2095,6 +2142,21 @@ const server = http.createServer(async (req, res) => {
         VOICE_FAST_SYSTEM_PROMPT
       );
 
+      // Pre-warm Gemini Live Native Audio WebSocket connection + setupComplete in parallel with LLM!
+      let resolveTtsText = null;
+      const ttsTextPromise = new Promise((r) => {
+        resolveTtsText = r;
+      });
+      const prewarmedTtsPromise =
+        body.tts !== false && GEMINI_API_KEYS.length > 0
+          ? synthesizeWithGeminiLiveAudio({
+              spokenTextPromise: ttsTextPromise,
+              selectedVoice,
+              apiKey: getGeminiApiKey(),
+              liveModel: `models/${GEMINI_TTS_MODEL.replace(/^models\//, "")}`,
+            }).catch(() => null)
+          : null;
+
       const agentResult = await runOpenCodeAgentWithTools(
         {
           model: body.model || DEFAULT_MODEL,
@@ -2102,6 +2164,7 @@ const server = http.createServer(async (req, res) => {
           temperature: body.temperature ?? 0.6,
           max_tokens: body.max_tokens,
           disableReasoning,
+          allowWebSearch: needsThinking,
         },
         async (queries) => {
           needsThinking = true;
@@ -2129,6 +2192,7 @@ const server = http.createServer(async (req, res) => {
       );
 
       if (!agentResult.ok) {
+        if (resolveTtsText) resolveTtsText("");
         const errPayload = {
           success: false,
           error: "Middle LLM (OpenCode mimo-v2.6-flash-free) error",
@@ -2146,21 +2210,33 @@ const server = http.createServer(async (req, res) => {
       let replyText = assembled.content.trim();
 
       // Ensure that when Max v1.0 performs a Web Search in voice mode, it speaks "Ek second, abhi batata hoon..."
+      // And when no Web Search / deep thinking was needed, strip any accidental "Ek second..." filler prefix.
       if (
         (agentResult.usedWebSearch || needsThinking) &&
         replyText &&
         !/^ek\s+second/i.test(replyText)
       ) {
         replyText = `Ek second, abhi batata hoon... ${replyText}`;
+      } else if (!agentResult.usedWebSearch && !needsThinking && replyText) {
+        replyText =
+          replyText.replace(/^ek\s+second\s*,?\s*abhi\s+batat[ai]\s+hoon[.!\s…-]*/i, "").trim() ||
+          replyText;
+      }
+
+      if (resolveTtsText) {
+        resolveTtsText(body.tts !== false ? replyText : "");
       }
 
       // Step 3: Text-to-Speech (`gemini-2.5-flash-native-audio-preview-12-2025`)
       let audioOutput = null;
       if (body.tts !== false && replyText) {
-        const ttsResult = await synthesizeWithGeminiTTS({
-          text: replyText,
-          voice: selectedVoice,
-        });
+        let ttsResult = prewarmedTtsPromise ? await prewarmedTtsPromise : null;
+        if (!ttsResult || !ttsResult.wavBase64) {
+          ttsResult = await synthesizeWithGeminiTTS({
+            text: replyText,
+            voice: selectedVoice,
+          });
+        }
         audioOutput = {
           mimeType: ttsResult.mimeType,
           sampleRate: ttsResult.sampleRate,

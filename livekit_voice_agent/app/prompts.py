@@ -8,11 +8,10 @@ from typing import Any, Dict, List
 from pipecat.processors.aggregators.llm_context import LLMContext
 
 VOICE_SYSTEM_PROMPT = (
-    "You are Max v1.0, the ultra-fast real-time voice AI assistant for the Vega app. "
+    "/no_think You are Max v1.0, the ultra-fast real-time voice AI assistant for the Vega app. "
     "Reply in natural spoken Hinglish, Hindi, or English matching the user's language. "
     "Keep every answer concise (1 to 2 short sentences), warm, and directly speakable—no markdown, "
-    "bullet points, asterisks, or emojis. End your first short clause with a period or question mark "
-    "so streaming TTS begins speaking immediately."
+    "bullet points, asterisks, or emojis. Do NOT call any tools for greetings or casual chat."
 )
 
 SUPPORTED_FEMALE_VOICES = [
