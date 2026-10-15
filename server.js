@@ -1972,6 +1972,7 @@ function runGeminiNativeVoiceTurn({
   selectedVoice = "Aoede",
   apiKey,
   liveModel = "models/gemini-2.5-flash-native-audio-preview-12-2025",
+  enableWebSearchTool = true,
 }) {
   return new Promise((resolve, reject) => {
     const fullModel = liveModel.startsWith("models/") ? liveModel : `models/${liveModel}`;
@@ -2360,27 +2361,31 @@ function runGeminiNativeVoiceTurn({
               ? { thinkingConfig: { thinkingBudget: 0 } }
               : {}),
           },
-          tools: [
-            {
-              functionDeclarations: [
-                {
-                  name: "websearch",
-                  description:
-                    "Search the live web using OpenCode web search for current news, live prices (Bitcoin, crypto, stocks, gold), weather, sports/IPL scores, 2025/2026 events, or any real-time information.",
-                  parameters: {
-                    type: "OBJECT",
-                    properties: {
-                      query: {
-                        type: "STRING",
-                        description: "The search query to look up on the live web",
+          ...(enableWebSearchTool
+            ? {
+                tools: [
+                  {
+                    functionDeclarations: [
+                      {
+                        name: "websearch",
+                        description:
+                          "Search the live web using OpenCode web search for current news, live prices (Bitcoin, crypto, stocks, gold), weather, sports/IPL scores, 2025/2026 events, or any real-time information.",
+                        parameters: {
+                          type: "OBJECT",
+                          properties: {
+                            query: {
+                              type: "STRING",
+                              description: "The search query to look up on the live web",
+                            },
+                          },
+                          required: ["query"],
+                        },
                       },
-                    },
-                    required: ["query"],
+                    ],
                   },
-                },
-              ],
-            },
-          ],
+                ],
+              }
+            : {}),
           inputAudioTranscription: {},
           outputAudioTranscription: {},
           systemInstruction: {
@@ -2400,6 +2405,7 @@ async function runGeminiNativeVoiceAgent({
   history = [],
   systemPrompt = "",
   voice = "Aoede",
+  enableWebSearchTool = true,
 }) {
   if (GEMINI_API_KEYS.length === 0) {
     throw new Error(
@@ -2433,6 +2439,7 @@ async function runGeminiNativeVoiceAgent({
           selectedVoice,
           apiKey,
           liveModel: `models/${cleanModel}`,
+          enableWebSearchTool,
         });
         if (result && (result.wavBase64 || result.reply)) {
           return result;
@@ -2872,6 +2879,7 @@ const server = http.createServer(async (req, res) => {
         history: trimmedHistory,
         systemPrompt: body.system || body.systemPrompt || "",
         voice: selectedVoice,
+        enableWebSearchTool: !usedWebSearch,
       });
 
       if (nativeResult.usedWebSearch) {
