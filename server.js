@@ -2579,17 +2579,80 @@ const server = http.createServer(async (req, res) => {
         GEMINI_API_KEY: GEMINI_API_KEYS.length > 0,
       },
       endpoints: {
+        prompt: "GET /api/prompt",
         textAndImageChat: "POST /api/chat",
         visionChat: "POST /api/vision",
         voiceAgent: "POST /api/voice",
         voiceFillerAudio: "GET /api/voice/filler",
         voicesCatalog: "GET /api/voices",
         webSearch: "POST /api/websearch",
+        historyChats: "GET /api/history/chats?user=<email>",
+        historyTurns: "POST /api/history/turns",
         speechToText: "POST /api/stt",
         textToSpeech: "POST /api/tts",
         openAICompatible: "POST /v1/chat/completions",
         models: "GET /v1/models",
         health: "GET /api/health",
+      },
+    });
+  }
+
+  // 1a. Active System Prompts & App Integration Prompt Endpoint:
+  //     GET /api/prompt (aliases: /prompt, /api/prompts, /api/system-prompt)
+  if (
+    req.method === "GET" &&
+    (pathname === "/api/prompt" ||
+      pathname === "/prompt" ||
+      pathname === "/api/prompts" ||
+      pathname === "/prompts" ||
+      pathname === "/api/system-prompt")
+  ) {
+    const voiceNativeSystemPrompt =
+      `You are ${AI_NAME}, the fast, smart, warm real-time voice AI assistant inside the ${APP_NAME} app. ` +
+      `When asked who you are or what your name is, say you are ${AI_NAME}, the voice AI of ${APP_NAME}. ` +
+      `Speak naturally in the same language as the user (Hinglish, Hindi, or English) with a smooth, sweet, warm Indian conversational flow. ` +
+      `WEB RESEARCH RULE: Whenever the user asks about live news, current prices/rates (Bitcoin, crypto, stocks, gold), weather, sports/IPL scores, 2025/2026 events, or asks you to search/check online, call the 'websearch' tool first and answer using the live OpenCode search results. ` +
+      `IMPORTANT: Keep every reply to ONE short, natural spoken sentence (maximum 15 to 18 words) unless the user explicitly asks for a detailed explanation.`;
+
+    const webSearchRuleSuffix =
+      `WEB SEARCH RULE: You have real-time internet access via OpenCode 'websearch' and 'webfetch' tools. For current events, news, live prices/rates, weather, scores, 2025/2026 facts, or online lookups, use live OpenCode web search facts (or call 'websearch' if not already provided). CRITICAL RULE: NEVER call bash, edit, glob, grep, or read.`;
+
+    const format = (url.searchParams.get("format") || "").toLowerCase();
+    if (format === "text" || url.searchParams.get("raw") === "1") {
+      setCorsHeaders(res);
+      res.writeHead(200, { "Content-Type": "text/plain; charset=utf-8" });
+      return res.end(
+        `=== TEXT AGENT SYSTEM PROMPT (POST /api/chat & POST /v1/chat/completions) ===\n` +
+          `/no_think ${DEFAULT_SYSTEM_PROMPT}\n\n` +
+          `=== VOICE AGENT SYSTEM PROMPT (POST /api/voice) ===\n` +
+          `${voiceNativeSystemPrompt}\n\n` +
+          `=== VOICE FAST SYSTEM PROMPT ===\n` +
+          `${VOICE_FAST_SYSTEM_PROMPT}\n\n` +
+          `=== ALWAYS-APPENDED WEB SEARCH RULE ===\n` +
+          `${webSearchRuleSuffix}\n`
+      );
+    }
+
+    return sendJson(res, 200, {
+      success: true,
+      ai: AI_NAME,
+      app: APP_NAME,
+      prompt: `/no_think ${DEFAULT_SYSTEM_PROMPT}`,
+      activePromptsSentOnEveryTurn: {
+        textAgentSystemPrompt: `/no_think ${DEFAULT_SYSTEM_PROMPT}`,
+        textAgentRawSystemPrompt: DEFAULT_SYSTEM_PROMPT,
+        voiceAgentNativeSystemPrompt: voiceNativeSystemPrompt,
+        voiceFastSystemPrompt: VOICE_FAST_SYSTEM_PROMPT,
+        alwaysAppendedWebSearchRule: webSearchRuleSuffix,
+        voiceFillerPhrase: DEFAULT_FILLER_TEXT,
+        userTurnSuffixWhenFastNoReasoning: "/no_think",
+        preSearchContextTemplate:
+          "[Live OpenCode Web Search Results (Date: YYYY-MM-DD)]:\n<results>\n\nIMPORTANT: The live OpenCode web search has ALREADY been executed above. Answer the user's question directly, accurately, and naturally using these live facts. Do NOT call the 'websearch' tool again. /no_think",
+      },
+      models: {
+        textAgentModel: DEFAULT_MODEL,
+        voiceAgentModel: GEMINI_VOICE_MODEL,
+        defaultVoice: GEMINI_TTS_VOICE,
       },
     });
   }
