@@ -20,9 +20,19 @@
 
 const http = require("node:http");
 const https = require("node:https");
+const dns = require("node:dns");
+const net = require("node:net");
 const crypto = require("node:crypto");
 const fs = require("node:fs");
 const path = require("node:path");
+
+// Force IPv4-first DNS resolution so Cloudflare endpoints (opencode.ai, image-api worker) never stall on unreachable IPv6 routes
+try {
+  dns.setDefaultResultOrder("ipv4first");
+  if (typeof net.setDefaultAutoSelectFamily === "function") {
+    net.setDefaultAutoSelectFamily(false);
+  }
+} catch {}
 
 // Load local .env file if present (for local dev; on Render use Environment Variables)
 const envPath = path.join(__dirname, ".env");
@@ -1450,28 +1460,27 @@ async function runMaxImageAgent({
       };
     })();
 
-    // Standby fast fallback that activates if the primary Cloudflare Worker queues beyond ~8.5s
+    // Standby fast fallback that only activates if the primary Cloudflare Worker queues beyond ~10s
     const standbyPromise = (async () => {
-      await new Promise((r) => setTimeout(r, 1500));
+      await new Promise((r) => setTimeout(r, 8500));
       if (standbyAbort.signal.aborted) throw new Error("Aborted");
-      const cleanPrompt = String(maxPrompt || userText || "beautiful artwork").slice(0, 380);
-      for (let attempt = 0; attempt < 2; attempt++) {
-        if (standbyAbort.signal.aborted) throw new Error("Aborted");
-        const seed = Math.floor(Math.random() * 900000) + 100000;
-        const pollUrl = `https://image.pollinations.ai/prompt/${encodeURIComponent(
-          cleanPrompt
-        )}?width=512&height=512&nologo=true&seed=${seed}`;
-        const pRes = await fetch(pollUrl, { signal: standbyAbort.signal });
-        const ct = (pRes.headers.get("content-type") || "").toLowerCase();
-        if (pRes.ok && ct.startsWith("image/")) {
-          const buf = Buffer.from(await pRes.arrayBuffer());
-          return {
-            contentType: ct.split(";")[0] || "image/jpeg",
-            buffer: buf,
-            source: "fast-standby",
-          };
-        }
-        await new Promise((r) => setTimeout(r, 1500));
+      const cleanPrompt = String(userText || maxPrompt || "cyberpunk portrait")
+        .replace(/[^a-zA-Z0-9 ,.-]/g, " ")
+        .replace(/\s+/g, " ")
+        .trim()
+        .slice(0, 140);
+      const pollUrl = `https://image.pollinations.ai/prompt/${encodeURIComponent(
+        cleanPrompt
+      )}?width=512&height=512&nologo=true`;
+      const pRes = await fetch(pollUrl, { signal: standbyAbort.signal });
+      const ct = (pRes.headers.get("content-type") || "").toLowerCase();
+      if (pRes.ok && ct.startsWith("image/")) {
+        const buf = Buffer.from(await pRes.arrayBuffer());
+        return {
+          contentType: ct.split(";")[0] || "image/jpeg",
+          buffer: buf,
+          source: "fast-standby",
+        };
       }
       throw new Error("Standby image fetch failed");
     })();
