@@ -237,6 +237,7 @@ let DEFAULT_SYSTEM_PROMPT =
     `When asked who you are or what your name/version is, always introduce yourself as ${AI_NAME} (the AI assistant of ${APP_NAME}). ` +
     `Reply clearly, naturally, and in the same language (English, Hindi, Hinglish, etc.) that the user uses. ` +
     `WEB SEARCH RULE: You have real-time internet access via the 'websearch' and 'webfetch' tools. Whenever the user asks about current events, latest news, live prices/rates (crypto, stocks, gold), weather, sports scores, recent releases, or asks you to search/check something online, call the 'websearch' tool first and answer using the live results. ` +
+    `IMAGE GENERATION & EDITING POWER: You ALSO have full real-time Image Generation ('generate') and Image Editing ('edit') power via the Vega Image Engine (https://image-api.pr3095079.workers.dev/). NEVER say that you cannot generate, create, draw, or edit images/photos! If asked whether you can generate or edit images, proudly say YES. Whenever the user asks you to generate/create/draw/make any image/photo/picture/art/logo/wallpaper OR edit/modify/change an uploaded image, output <IMAGE_TASK action="generate" status="Ek second bhai, aapke liye image bana raha hoon... 🎨" reply="Yeh lijiye bhai, aapki image ban kar taiyar hai! 🎨">Detailed 50-80 word English image prompt</IMAGE_TASK> (use action="edit" if editing an uploaded image). ` +
     `CRITICAL RULE: NEVER invoke or call local shell/file tools (bash, edit, glob, grep, or read)—they are unused gateway placeholders.`;
 
 let VOICE_FAST_SYSTEM_PROMPT =
@@ -849,7 +850,7 @@ function normalizeMessages(body, defaultSystem = DEFAULT_SYSTEM_PROMPT) {
   }
 
   const webSearchRuleSuffix =
-    ` WEB SEARCH RULE: You have real-time internet access via OpenCode 'websearch' and 'webfetch' tools. For current events, news, live prices/rates, weather, scores, 2025/2026 facts, or online lookups, use live OpenCode web search facts (or call 'websearch' if not already provided). CRITICAL RULE: NEVER call bash, edit, glob, grep, or read.`;
+    ` WEB SEARCH RULE: You have real-time internet access via OpenCode 'websearch' and 'webfetch' tools. For current events, news, live prices/rates, weather, scores, 2025/2026 facts, or online lookups, use live OpenCode web search facts (or call 'websearch' if not already provided). IMAGE GENERATION & EDITING POWER: You have full real-time Image Generation ('generate') and Image Editing ('edit') power via https://image-api.pr3095079.workers.dev/. NEVER say you cannot generate or edit images! Whenever the user asks to generate/create/draw an image or edit an uploaded photo, output <IMAGE_TASK action="generate" status="Ek second bhai, aapke liye image bana raha hoon... 🎨" reply="Yeh lijiye bhai, aapki image ban kar taiyar hai! 🎨">Detailed English image prompt</IMAGE_TASK> (or action="edit" for image edits). CRITICAL RULE: NEVER call bash, edit, glob, grep, or read.`;
 
   const hasSystem = messages.some(
     (m) => m && (m.role === "system" || m.role === "developer")
@@ -1200,13 +1201,45 @@ function detectImageTaskIntent(userText = "", hasImage = false, body = {}) {
 
   // Without an uploaded image: check if user is asking to generate/create/draw an image
   const generatePatterns = [
-    /\b(generate|create|draw|paint|make|design|render)\s+(an?\s+|me\s+an?\s+|ek\s+)?(image|photo|picture|pic|art|illustration|wallpaper|logo|poster|avatar|portrait|tasveer)\b/i,
-    /\b(image|photo|picture|pic|tasveer|wallpaper|logo|poster)\s+(generate|create|make|draw|banao|bana do|bana de|banaiye|dikhao)\b/i,
-    /\b(ek\s+.*?\s+ki\s+(image|photo|picture|tasveer)\s+(banao|bana do|bana de|generate karo))\b/i,
-    /(इमेज बनाओ|इमेज बना दो|फोटो बनाओ|फोटो बना दो|तस्वीर बनाओ|तस्वीर बना दो|पिक्चर बनाओ)/,
+    /\b(generate|create|draw|paint|make|design|render)\b[\s\S]{0,40}\b(image|photo|picture|pic|art|illustration|wallpaper|logo|poster|avatar|portrait|tasveer|scene|sketch|painting)\b/i,
+    /\b(image|photo|picture|pic|tasveer|wallpaper|logo|poster|portrait|sketch|painting)\b[\s\S]{0,40}\b(generate|create|make|draw|render|banao|bana|bana do|bana de|banaiye|dikhao|de do|bhej|nikal)\b/i,
+    /\b(banao|bana do|bana de|generate karo|generate kar|create karo|create kar|draw karo|draw kar)\b[\s\S]{0,40}\b(image|photo|picture|pic|tasveer|wallpaper|logo|poster)\b/i,
+    /(इमेज|फोटो|फ़ोटो|तस्वीर|पिक्चर|वॉलपेपर|लोगो|पोस्टर|पेंटिंग)[\s\S]{0,30}(बनाओ|बना दो|बना दे|जनरेट|क्रिएट|दिखाओ)/,
+    /(बनाओ|बना दो|जनरेट करो|क्रिएट करो)[\s\S]{0,30}(इमेज|फोटो|फ़ोटो|तस्वीर|पिक्चर|वॉलपेपर|लोगो)/,
   ];
   if (generatePatterns.some((re) => re.test(q))) {
     return "generate";
+  }
+  return null;
+}
+
+/**
+ * Checks if `mimo-v2.6-flash-free` emitted an `<IMAGE_TASK ...>prompt</IMAGE_TASK>` tag
+ * OR accidentally claimed it cannot generate/edit images when the user asked for one.
+ */
+function parseModelImageFallback(content = "", userText = "", hasImage = false) {
+  const raw = String(content || "").trim();
+  const tagMatch = raw.match(
+    /<IMAGE_TASK(?:\s+action=["']?(generate|edit)["']?)?(?:\s+status=["']([^"']*)["'])?(?:\s+reply=["']([^"']*)["'])?[^>]*>([\s\S]*?)<\/IMAGE_TASK>/i
+  );
+  if (tagMatch) {
+    return {
+      action: tagMatch[1] ? tagMatch[1].toLowerCase() : hasImage ? "edit" : "generate",
+      statusMessage: tagMatch[2] || "",
+      finalReply: tagMatch[3] || "",
+      maxPrompt: (tagMatch[4] || userText || "").trim(),
+    };
+  }
+  // Safety catch: if model accidentally refused image generation/editing in Hindi/Hinglish/English
+  const refusalPattern =
+    /(?:cannot|can't|unable to|do not have the ability to|don't have the power to)\s+(?:generate|create|draw|make|edit)\s+(?:an?\s+)?(?:image|images|photo|photos|picture|pictures)|(?:image|photo|tasveer|picture|इमेज|फोटो|तस्वीर)[\s\S]{0,40}(?:power|shamta|kshamta|suvidha|capability|feature|क्षमता|पावर|सुविधा)\s+(?:nahi|nhi|नहीं)/i;
+  if (refusalPattern.test(raw)) {
+    return {
+      action: hasImage ? "edit" : "generate",
+      statusMessage: "",
+      finalReply: "",
+      maxPrompt: userText,
+    };
   }
   return null;
 }
@@ -3665,6 +3698,60 @@ const server = http.createServer(async (req, res) => {
 
       const assembled = agentResult.assembled;
 
+      // Fallback check: if mimo-v2.6-flash-free emitted <IMAGE_TASK> or accidentally refused image gen
+      const fallbackImgTask = parseModelImageFallback(
+        assembled.content,
+        latestUserText,
+        Boolean(imageInput)
+      );
+      if (fallbackImgTask) {
+        const wantsStream = body.stream === true;
+        if (wantsStream) {
+          setCorsHeaders(res);
+          res.writeHead(200, {
+            "Content-Type": "text/event-stream; charset=utf-8",
+            "Cache-Control": "no-cache",
+            Connection: "keep-alive",
+          });
+        }
+        const imgResult = await runMaxImageAgent({
+          userText: fallbackImgTask.maxPrompt || latestUserText,
+          imageInput,
+          action: fallbackImgTask.action,
+          model: body.model || DEFAULT_MODEL,
+          onStatus: (statusPayload) => {
+            if (wantsStream) {
+              sendSSEEvent(res, "image_status", statusPayload);
+            }
+          },
+        });
+        const finalPayload = {
+          success: true,
+          ai: AI_NAME,
+          app: APP_NAME,
+          model: DEFAULT_MODEL,
+          isImageTask: true,
+          imageAction: imgResult.action,
+          imageStatus: "completed",
+          readyForImage: true,
+          statusMessage: fallbackImgTask.statusMessage || imgResult.statusMessage,
+          maxPrompt: imgResult.maxPrompt,
+          reply: fallbackImgTask.finalReply || imgResult.finalReply,
+          image: imgResult.image,
+          imageUrl: imgResult.image.dataUri,
+          usedWebSearch: false,
+          searchQueries: [],
+          reasoning: null,
+          usage: null,
+        };
+        if (wantsStream) {
+          sendSSEEvent(res, "image_ready", finalPayload);
+          res.write("data: [DONE]\n\n");
+          return res.end();
+        }
+        return sendJson(res, 200, finalPayload);
+      }
+
       if (body.stream === true) {
         setCorsHeaders(res);
         res.writeHead(200, {
@@ -3745,6 +3832,68 @@ const server = http.createServer(async (req, res) => {
     const forceWebSearch = body.webSearch === true || body.search === true;
 
     try {
+      const imageInput = extractLatestImageInput(body, messages);
+      const latestUserText = extractLatestUserText(messages);
+      const imageTaskAction = detectImageTaskIntent(latestUserText, Boolean(imageInput), body);
+
+      if (imageTaskAction) {
+        if (wantsStream) {
+          setCorsHeaders(res);
+          res.writeHead(200, {
+            "Content-Type": "text/event-stream; charset=utf-8",
+            "Cache-Control": "no-cache",
+            Connection: "keep-alive",
+          });
+        }
+        const imgResult = await runMaxImageAgent({
+          userText: latestUserText || "Generate or edit image",
+          imageInput,
+          action: imageTaskAction,
+          model: body.model || DEFAULT_MODEL,
+          onStatus: (statusPayload) => {
+            if (wantsStream) {
+              sendSSEEvent(res, "image_status", statusPayload);
+            }
+          },
+        });
+        const finalPayload = {
+          id: `chatcmpl-img-${Date.now()}`,
+          object: "chat.completion",
+          created: Math.floor(Date.now() / 1000),
+          model: DEFAULT_MODEL,
+          success: true,
+          ai: AI_NAME,
+          app: APP_NAME,
+          isImageTask: true,
+          imageAction: imgResult.action,
+          imageStatus: "completed",
+          readyForImage: true,
+          statusMessage: imgResult.statusMessage,
+          maxPrompt: imgResult.maxPrompt,
+          reply: imgResult.finalReply,
+          image: imgResult.image,
+          imageUrl: imgResult.image.dataUri,
+          choices: [
+            {
+              index: 0,
+              message: {
+                role: "assistant",
+                content: imgResult.finalReply,
+                image: imgResult.image,
+                imageUrl: imgResult.image.dataUri,
+              },
+              finish_reason: "stop",
+            },
+          ],
+        };
+        if (wantsStream) {
+          res.write(`data: ${JSON.stringify(finalPayload)}\n\n`);
+          res.write("data: [DONE]\n\n");
+          return res.end();
+        }
+        return sendJson(res, 200, finalPayload);
+      }
+
       const agentResult = await runOpenCodeAgentWithTools({
         model: body.model || DEFAULT_MODEL,
         messages,
@@ -3767,6 +3916,62 @@ const server = http.createServer(async (req, res) => {
       }
 
       const assembled = agentResult.assembled;
+
+      const fallbackImgTask = parseModelImageFallback(
+        assembled.content,
+        latestUserText,
+        Boolean(imageInput)
+      );
+      if (fallbackImgTask) {
+        const imgResult = await runMaxImageAgent({
+          userText: fallbackImgTask.maxPrompt || latestUserText,
+          imageInput,
+          action: fallbackImgTask.action,
+          model: body.model || DEFAULT_MODEL,
+        });
+        const finalPayload = {
+          id: `chatcmpl-img-${Date.now()}`,
+          object: "chat.completion",
+          created: Math.floor(Date.now() / 1000),
+          model: DEFAULT_MODEL,
+          success: true,
+          ai: AI_NAME,
+          app: APP_NAME,
+          isImageTask: true,
+          imageAction: imgResult.action,
+          imageStatus: "completed",
+          readyForImage: true,
+          statusMessage: fallbackImgTask.statusMessage || imgResult.statusMessage,
+          maxPrompt: imgResult.maxPrompt,
+          reply: fallbackImgTask.finalReply || imgResult.finalReply,
+          image: imgResult.image,
+          imageUrl: imgResult.image.dataUri,
+          choices: [
+            {
+              index: 0,
+              message: {
+                role: "assistant",
+                content: fallbackImgTask.finalReply || imgResult.finalReply,
+                image: imgResult.image,
+                imageUrl: imgResult.image.dataUri,
+              },
+              finish_reason: "stop",
+            },
+          ],
+        };
+        if (wantsStream) {
+          setCorsHeaders(res);
+          res.writeHead(200, {
+            "Content-Type": "text/event-stream; charset=utf-8",
+            "Cache-Control": "no-cache",
+            Connection: "keep-alive",
+          });
+          res.write(`data: ${JSON.stringify(finalPayload)}\n\n`);
+          res.write("data: [DONE]\n\n");
+          return res.end();
+        }
+        return sendJson(res, 200, finalPayload);
+      }
 
       if (wantsStream) {
         setCorsHeaders(res);
