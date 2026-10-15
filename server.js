@@ -1585,7 +1585,7 @@ function synthesizeWithGeminiLiveAudio({
               if (chunkIdleTimer) clearTimeout(chunkIdleTimer);
               chunkIdleTimer = setTimeout(() => {
                 if (pcmChunks.length > 0) finishSuccess();
-              }, 260);
+              }, 650);
             }
           }
         }
@@ -2055,7 +2055,7 @@ function runGeminiNativeVoiceTurn({
                 if (chunkIdleTimer) clearTimeout(chunkIdleTimer);
                 chunkIdleTimer = setTimeout(() => {
                   if (pcmChunks.length > 0) finishSuccess();
-                }, 260);
+                }, 650);
               }
               if (typeof p?.text === "string" && !p?.thought) {
                 modelTextParts.push(p.text);
