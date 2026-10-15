@@ -2977,9 +2977,72 @@ const server = http.createServer(async (req, res) => {
     }
   }
 
+  // 9. Server-Side ZentraGrid History Proxy (`ai_chats`, `ai_messages`, `/v1/files`)
+  //    In any web deployment, ZENTRAGRID_API_KEY stays strictly on the server and
+  //    the browser talks only to this route. Support chat collections (`messages`,
+  //    `presence`, `typing`) are never touched here.
+  const ztMatch = pathname.match(/^\/(?:api\/storage\/)?(v1\/(?:data\/(ai_chats|ai_messages)(?:\/[^/]+)?|files(?:\/[^/]+(?:\/download)?)?))$/);
+  if (ztMatch) {
+    const ztKey = (process.env.ZENTRAGRID_API_KEY || process.env.STORAGE_API_KEY || "").trim();
+    if (!ztKey) {
+      return sendJson(res, 401, {
+        error: {
+          message: "ZENTRAGRID_API_KEY is not configured on the server",
+          code: "INVALID_ID_TOKEN",
+        },
+        code: "INVALID_ID_TOKEN",
+        message: "ZENTRAGRID_API_KEY is not configured on the server",
+      });
+    }
+
+    const ztBase = (process.env.ZENTRAGRID_BASE_URL || "https://vega-storage.onrender.com").replace(/\/+$/, "");
+    const targetUrl = `${ztBase}/${ztMatch[1]}${url.search || ""}`;
+
+    try {
+      const chunks = [];
+      for await (const chunk of req) {
+        chunks.push(chunk);
+      }
+      const rawBody = chunks.length > 0 ? Buffer.concat(chunks) : undefined;
+
+      const forwardHeaders = {
+        Authorization: `Bearer ${ztKey}`,
+      };
+      if (req.headers["content-type"]) {
+        forwardHeaders["Content-Type"] = req.headers["content-type"];
+      }
+      if (req.headers["range"]) {
+        forwardHeaders["Range"] = req.headers["range"];
+      }
+
+      const upstreamRes = await fetch(targetUrl, {
+        method: req.method,
+        headers: forwardHeaders,
+        body: req.method !== "GET" && req.method !== "HEAD" ? rawBody : undefined,
+      });
+
+      const resHeaders = {};
+      for (const hName of ["content-type", "content-length", "content-range", "accept-ranges", "retry-after"]) {
+        const val = upstreamRes.headers.get(hName);
+        if (val) resHeaders[hName] = val;
+      }
+      setCorsHeaders(res);
+      res.writeHead(upstreamRes.status, resHeaders);
+      const arrayBuf = await upstreamRes.arrayBuffer();
+      return res.end(Buffer.from(arrayBuf));
+    } catch (err) {
+      return sendJson(res, 502, {
+        error: {
+          message: err.message || "Could not reach ZentraGrid storage service",
+          code: "UPSTREAM_ERROR",
+        },
+      });
+    }
+  }
+
   return sendJson(res, 404, {
     success: false,
-    error: `Route ${req.method} ${pathname} not found. Available routes: POST /api/voice, GET /api/voice/filler, POST /api/stt, POST /api/tts, POST /api/chat, POST /v1/chat/completions`,
+    error: `Route ${req.method} ${pathname} not found. Available routes: POST /api/voice, GET /api/voice/filler, POST /api/stt, POST /api/tts, POST /api/chat, POST /v1/chat/completions, /v1/data/ai_chats, /v1/data/ai_messages, /v1/files`,
   });
 });
 
