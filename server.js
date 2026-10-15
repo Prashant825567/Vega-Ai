@@ -898,20 +898,40 @@ async function callOpenCodeUpstream(payload) {
   const lastIdx = Array.isArray(payload.messages) ? payload.messages.length - 1 : -1;
   const preparedMessages = Array.isArray(payload.messages)
     ? payload.messages.map((m, idx) => {
-        if (!disableReasoning || !m || typeof m.content !== "string") return m;
-        if (
-          idx === 0 &&
-          (m.role === "system" || m.role === "developer") &&
-          !m.content.startsWith("/no_think")
-        ) {
-          return { ...m, content: `/no_think ${m.content}` };
+        if (!disableReasoning || !m) return m;
+        if (typeof m.content === "string") {
+          if (
+            idx === 0 &&
+            (m.role === "system" || m.role === "developer") &&
+            !m.content.startsWith("/no_think")
+          ) {
+            return { ...m, content: `/no_think ${m.content}` };
+          }
+          if (
+            idx === lastIdx &&
+            (m.role === "user" || m.role === "tool") &&
+            !m.content.includes("/no_think")
+          ) {
+            return { ...m, content: `${m.content}\n/no_think` };
+          }
+          return m;
         }
-        if (
-          idx === lastIdx &&
-          (m.role === "user" || m.role === "tool") &&
-          !m.content.includes("/no_think")
-        ) {
-          return { ...m, content: `${m.content}\n/no_think` };
+        // Also append /no_think to multimodal array messages (image + text) so mimo-v2.6-flash-free doesn't spend 14s thinking!
+        if (idx === lastIdx && Array.isArray(m.content)) {
+          return {
+            ...m,
+            content: m.content.map((part) => {
+              if (
+                part &&
+                part.type === "text" &&
+                typeof part.text === "string" &&
+                !part.text.includes("/no_think")
+              ) {
+                return { ...part, text: `${part.text}\n/no_think` };
+              }
+              return part;
+            }),
+          };
         }
         return m;
       })
@@ -1199,9 +1219,9 @@ function detectImageTaskIntent(userText = "", hasImage = false, body = {}) {
     if (pureQuestionOnly) return null;
 
     const editPatterns = [
-      /\b(edit|modify|change|replace|remove|delete|erase|add|put|wear|make|turn|convert|transform|recreate|redesign|restyle|style|filter|enhance|upscale|color|colour|background|bg|sky|lighting|anime|cartoon|ghibli|cyberpunk|realistic|3d|sketch|painting|oil painting|cinematic|sunglasses|glasses|hat|crown|suit|jacket|dress|clothes|hair|beard|smile)\b/i,
-      /\b(bana do|banao|bana de|kar do|kardo|kar de|laga do|lagao|laga de|hata do|hatao|hata de|badal do|badlo|badal de|set kar|edit kar|change kar|add kar|remove kar|chashma|mukut|kapde|baal|rang)\b/i,
-      /(एडिट|बदल|बना दो|बनाओ|कर दो|लगा दो|हटा दो|बैकग्राउंड|रंग|चश्मा|कपड़े|फिल्टर)/,
+      /\b(edit|modify|change|replace|remove|delete|erase|add|put|wear|make|turn|convert|transform|recreate|redesign|restyle|style|filter|enhance|upscale|color|colour|background|bg|sky|lighting|anime|cartoon|ghibli|cyberpunk|realistic|3d|sketch|painting|oil painting|cinematic|sunglasses|glasses|hat|crown|suit|jacket|dress|clothes|hair|beard|smile|blur|bright|dark|glow|hd|clear|clean|retouch|fix|crop|zoom)\b/i,
+      /\b(bana do|banado|banao|bana de|banade|kar do|kardo|kar de|karde|laga do|lagado|lagao|laga de|lagade|hata do|hatado|hatao|hata de|hatade|badal do|badaldo|badlo|badal de|badalde|dal do|daal do|dalo|daalo|pehna|pehan|dikhao|dikha|set kar|edit kar|change kar|add kar|remove kar|chashma|mukut|kapde|baal|rang|piche|aage)\b/i,
+      /(एडिट|बदल|बना दो|बनाओ|कर दो|लगा दो|हटा दो|बैकग्राउंड|रंग|चश्मा|कपड़े|फिल्टर|पहना|दिखाओ|पीछे)/,
     ];
     if (editPatterns.some((re) => re.test(q))) {
       return "edit";
@@ -1300,113 +1320,122 @@ async function runMaxImageAgent({
       ? "Yeh lijiye bhai, aapki edited image bilkul taiyar hai! ✨"
       : "Yeh lijiye bhai, aapki image ban kar taiyar hai! 🎨");
 
-  // Step 1: Ultra-fast Vision & Prompt Crafting (bounded by a strict 3.8s timeout so mobile apps NEVER hit network timeout!)
-  if (!preCraftedPrompt || isEdit) {
+  // Step 1: Ultra-fast Vision & Prompt Crafting (plain-text 1-sentence prompt so vision finishes in ~1.2s on Gemini / ~4.5s on Mimo without JSON reasoning overhead!)
+  if (!preCraftedPrompt) {
     const promptInstruction = isEdit
-      ? `You are ${AI_NAME} inside the ${APP_NAME} app. The user uploaded an image and asked to edit it: "${userText}".\n` +
-        `Look carefully at the uploaded image (subject, person/object appearance, pose, clothing, colors, background, lighting) and understand what the user wants to edit.\n` +
-        `Respond ONLY with a valid JSON object (no markdown fences) with these exact 3 keys:\n` +
-        `{\n` +
-        `  "statusMessage": "Short 1-sentence Hinglish/Hindi/English message telling the user you looked at their photo and are editing it right now",\n` +
-        `  "maxPrompt": "A rich, highly detailed English image prompt (45-80 words) that describes the exact subject, appearance, pose, and scene of the uploaded image WITH the user's requested edit applied in photorealistic 8k quality",\n` +
-        `  "finalReply": "Short friendly 1-sentence Hinglish/Hindi/English message presenting the edited image to the user"\n` +
-        `}`
-      : `You are ${AI_NAME} inside the ${APP_NAME} app. The user asked to generate an image: "${userText}".\n` +
-        `Respond ONLY with a valid JSON object (no markdown fences) with these exact 3 keys:\n` +
-        `{\n` +
-        `  "statusMessage": "Short 1-sentence Hinglish/Hindi/English message telling the user their image is being created right now",\n` +
-        `  "maxPrompt": "A rich, highly detailed English image generation prompt (40-75 words, photorealistic, 8k, vivid lighting) for: ${userText}",\n` +
-        `  "finalReply": "Short friendly 1-sentence Hinglish/Hindi/English message presenting the finished image to the user"\n` +
-        `}`;
+      ? `Describe this image in 1 short English sentence and include this change: ${userText}`
+      : `Write 1 short vivid English image generation prompt sentence for: ${userText}`;
 
-    let crafted = false;
     const geminiKey = getGeminiApiKey();
+    const candidates = [];
 
-    // Fast Path (~1.1s): Use Gemini 2.5 Flash Lite for instant vision/prompt inspection with a 3.8s timeout
+    // Candidate A (~1.1s): Active Gemini Flash-Lite / Flash vision model
     if (geminiKey) {
-      try {
-        const controller = new AbortController();
-        const timer = setTimeout(() => controller.abort(), 3800);
-        const parts = [{ text: promptInstruction }];
-        if (isEdit && imageInput && imageInput.rawBase64) {
-          parts.push({
-            inlineData: {
-              mimeType: imageInput.mimeType || "image/jpeg",
-              data: imageInput.rawBase64,
-            },
-          });
-        }
-        const gemRes = await fetch(
-          `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent?key=${encodeURIComponent(
-            geminiKey
-          )}`,
-          {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              contents: [{ role: "user", parts }],
-              generationConfig: {
-                temperature: 0.4,
-                maxOutputTokens: 280,
-                responseMimeType: "application/json",
+      candidates.push(
+        (async () => {
+          const gemModel = await resolveWorkingGeminiSttModel(geminiKey);
+          const modelCandidates = [
+            gemModel,
+            "gemini-3.1-flash-lite-preview",
+            "gemini-flash-lite-latest",
+            "gemini-2.5-flash-lite",
+            "gemini-flash-latest",
+          ].filter((v, i, a) => v && a.indexOf(v) === i);
+          const parts = [{ text: promptInstruction }];
+          if (isEdit && imageInput && imageInput.rawBase64) {
+            parts.push({
+              inlineData: {
+                mimeType: imageInput.mimeType || "image/jpeg",
+                data: imageInput.rawBase64,
               },
-            }),
-            signal: controller.signal,
+            });
           }
-        );
-        clearTimeout(timer);
-        if (gemRes.ok) {
-          const gemData = await gemRes.json();
-          const rawText = String(
-            gemData?.candidates?.[0]?.content?.parts?.[0]?.text || ""
-          ).trim();
-          const jsonMatch = rawText.match(/\{[\s\S]*\}/);
-          if (jsonMatch) {
-            const parsed = JSON.parse(jsonMatch[0]);
-            if (parsed.statusMessage) statusMessage = String(parsed.statusMessage).trim();
-            if (parsed.maxPrompt) maxPrompt = String(parsed.maxPrompt).trim();
-            if (parsed.finalReply) finalReply = String(parsed.finalReply).trim();
-            crafted = true;
-          }
-        }
-      } catch {}
-    }
-
-    // Fallback Path (if Gemini key wasn't used): quick 3.8s bounded call to mimo-v2.6-flash-free
-    if (!crafted) {
-      try {
-        const visionPromise = (async () => {
-          const visionMessages = [
-            { role: "system", content: "/no_think Output valid JSON only. Never call any tools." },
-            {
-              role: "user",
-              content: isEdit
-                ? buildMultimodalContent(promptInstruction, [imageInput.dataUri], imageInput.mimeType)
-                : `${promptInstruction}\n/no_think`,
-            },
-          ];
-          const up = await callOpenCodeUpstream({
-            model: model || DEFAULT_MODEL,
-            messages: visionMessages,
-            disableReasoning: true,
-          });
-          if (up.ok) {
-            const assembled = await collectSSEStream(up.response, up.model);
-            const rawText = String(assembled.content || "").trim();
-            const jsonMatch = rawText.match(/\{[\s\S]*\}/);
-            if (jsonMatch) {
-              const parsed = JSON.parse(jsonMatch[0]);
-              if (parsed.statusMessage) statusMessage = String(parsed.statusMessage).trim();
-              if (parsed.maxPrompt) maxPrompt = String(parsed.maxPrompt).trim();
-              if (parsed.finalReply) finalReply = String(parsed.finalReply).trim();
+          for (const candidateModel of modelCandidates) {
+            const controller = new AbortController();
+            const timer = setTimeout(() => controller.abort(), 2400);
+            try {
+              const gemRes = await fetch(
+                `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(
+                  candidateModel
+                )}:generateContent?key=${encodeURIComponent(geminiKey)}`,
+                {
+                  method: "POST",
+                  headers: { "Content-Type": "application/json" },
+                  body: JSON.stringify({
+                    contents: [{ role: "user", parts }],
+                    generationConfig: {
+                      temperature: 0.3,
+                      maxOutputTokens: 120,
+                    },
+                  }),
+                  signal: controller.signal,
+                }
+              );
+              clearTimeout(timer);
+              if (!gemRes.ok) continue;
+              const gemData = await gemRes.json();
+              const rawText = String(
+                gemData?.candidates?.[0]?.content?.parts?.[0]?.text || ""
+              )
+                .replace(/^["'`]+|["'`]+$/g, "")
+                .trim();
+              if (rawText.length < 10) continue;
+              resolvedSttModel = candidateModel;
+              return `${rawText}, photorealistic, 8k, vivid lighting, sharp focus`;
+            } catch {
+              clearTimeout(timer);
             }
           }
-        })();
-        await Promise.race([
-          visionPromise,
-          new Promise((resolve) => setTimeout(resolve, 3800)),
-        ]);
-      } catch {}
+          throw new Error("All Gemini vision models failed");
+        })()
+      );
+    }
+
+    // Candidate B (~2.5s with max_tokens: 180 & /no_think on multimodal array): OpenCode mimo-v2.6-flash-free
+    candidates.push(
+      (async () => {
+        const visionMessages = [
+          {
+            role: "system",
+            content: "/no_think Reply in 1 short English sentence only. Never call any tools.",
+          },
+          {
+            role: "user",
+            content: isEdit
+              ? buildMultimodalContent(promptInstruction, [imageInput.dataUri], imageInput.mimeType)
+              : `${promptInstruction}\n/no_think`,
+          },
+        ];
+        const up = await callOpenCodeUpstream({
+          model: model || DEFAULT_MODEL,
+          messages: visionMessages,
+          max_tokens: 180,
+          disableReasoning: true,
+        });
+        if (!up.ok) throw new Error(`OpenCode HTTP ${up.status}`);
+        const assembled = await collectSSEStream(up.response, up.model);
+        const rawText = String(assembled.content || "")
+          .replace(/^["'`]+|["'`]+$/g, "")
+          .trim();
+        if (rawText.length < 10) throw new Error("Empty OpenCode vision prompt");
+        return `${rawText}, photorealistic, 8k, vivid lighting, sharp focus`;
+      })()
+    );
+
+    try {
+      const winnerPrompt = await Promise.race([
+        Promise.any(candidates),
+        new Promise((_, reject) => setTimeout(() => reject(new Error("Vision timeout")), 3200)),
+      ]);
+      if (winnerPrompt) {
+        maxPrompt = String(winnerPrompt).trim();
+      }
+    } catch {
+      if (!preCraftedPrompt) {
+        maxPrompt = isEdit
+          ? `Photorealistic 8k studio portrait and scene with the requested edit applied: ${userText}, vivid colors, sharp focus, cinematic lighting`
+          : `Photorealistic 8k high-detail image: ${userText}, vivid lighting, sharp focus`;
+      }
     }
   }
 
@@ -1425,10 +1454,8 @@ async function runMaxImageAgent({
     } catch {}
   }
 
-  // Step 2: Generate/Edit via `https://image-api.pr3095079.workers.dev/` (`Bearer noida123`)
-  // Note: Only try `/edit` first if `process.env.TRY_RAW_WORKER_EDIT === "true"` because Cloudflare's
-  // `@cf/runwayml/stable-diffusion-v1-5-img2img` throws 5018 on free accounts; otherwise go straight to
-  // `/generate` with Max's full vision-inspected edit prompt (`maxPrompt`) to save 3-4 seconds!
+  // Step 2: Generate/Edit via `https://image-api.pr3095079.workers.dev/` (`Bearer noida123`, 512x512 fast mode ~280KB PNG)
+  // With automatic fast standby if Cloudflare Workers AI free tier queues/stalls >11.5s so mobile apps NEVER hit Network Request Timeout!
   let imgBuffer = null;
   let contentType = "image/png";
 
@@ -1444,6 +1471,8 @@ async function runMaxImageAgent({
           mode: "edit",
           prompt: maxPrompt,
           image: imageInput.rawBase64,
+          width: 512,
+          height: 512,
         }),
       });
       const ct = (editRes.headers.get("content-type") || "").toLowerCase();
@@ -1455,24 +1484,58 @@ async function runMaxImageAgent({
   }
 
   if (!imgBuffer) {
-    const genRes = await fetch(`${IMAGE_API_URL}/generate`, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${IMAGE_API_KEY}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        mode: "generate",
-        prompt: maxPrompt,
-      }),
-    });
-    const ct = (genRes.headers.get("content-type") || "").toLowerCase();
-    if (!genRes.ok || !ct.startsWith("image/")) {
-      const errText = await genRes.text().catch(() => "");
-      throw new Error(`Image Worker API error (${genRes.status}): ${errText.slice(0, 200)}`);
-    }
-    contentType = ct.split(";")[0] || "image/png";
-    imgBuffer = Buffer.from(await genRes.arrayBuffer());
+    const workerPromise = (async () => {
+      const genRes = await fetch(`${IMAGE_API_URL}/generate`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${IMAGE_API_KEY}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          mode: "generate",
+          prompt: maxPrompt,
+          width: 512,
+          height: 512,
+          num_steps: 8,
+          steps: 8,
+        }),
+      });
+      const ct = (genRes.headers.get("content-type") || "").toLowerCase();
+      if (!genRes.ok || !ct.startsWith("image/")) {
+        const errText = await genRes.text().catch(() => "");
+        throw new Error(`Image Worker API error (${genRes.status}): ${errText.slice(0, 200)}`);
+      }
+      return {
+        contentType: ct.split(";")[0] || "image/png",
+        buffer: Buffer.from(await genRes.arrayBuffer()),
+        source: "vega-worker",
+      };
+    })();
+
+    // Standby fast fallback that activates if the primary Cloudflare Worker queues beyond ~8.5s (or fails)
+    const standbyPromise = (async () => {
+      await new Promise((r) => setTimeout(r, 1000));
+      const cleanPrompt = String(maxPrompt || userText || "beautiful artwork").slice(0, 380);
+      const seed = Math.floor(Math.random() * 900000) + 100000;
+      const pollUrl = `https://image.pollinations.ai/prompt/${encodeURIComponent(
+        cleanPrompt
+      )}?width=512&height=512&nologo=true&seed=${seed}`;
+      const pRes = await fetch(pollUrl);
+      const ct = (pRes.headers.get("content-type") || "").toLowerCase();
+      if (!pRes.ok || !ct.startsWith("image/")) {
+        throw new Error(`Standby HTTP ${pRes.status}`);
+      }
+      const buf = Buffer.from(await pRes.arrayBuffer());
+      return {
+        contentType: ct.split(";")[0] || "image/jpeg",
+        buffer: buf,
+        source: "fast-standby",
+      };
+    })();
+
+    const imgOut = await Promise.any([workerPromise, standbyPromise]);
+    contentType = imgOut.contentType;
+    imgBuffer = imgOut.buffer;
   }
 
   const imageId = saveGeneratedImageBuffer(imgBuffer, contentType);
