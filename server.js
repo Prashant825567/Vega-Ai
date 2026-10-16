@@ -1399,39 +1399,73 @@ async function runMaxImageAgent({
   }
 
   // Step 2: Generate/Edit via `https://image-api.pr3095079.workers.dev/` (`Bearer noida123`, 512x512 fast mode ~280KB PNG)
-  // With clean AbortController cleanup so zero zombie requests remain on Cloudflare!
+  // For `edit`, ALWAYS sends BOTH the user's image (`image: imageInput.rawBase64`) AND Max's vision-crafted `prompt: maxPrompt` to `/edit`!
   let imgBuffer = null;
   let contentType = "image/png";
-
-  if (isEdit && imageInput && imageInput.rawBase64 && process.env.TRY_RAW_WORKER_EDIT === "true") {
-    try {
-      const editRes = await fetch(`${IMAGE_API_URL}/edit`, {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${IMAGE_API_KEY}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          mode: "edit",
-          prompt: maxPrompt,
-          image: imageInput.rawBase64,
-          width: 512,
-          height: 512,
-        }),
-      });
-      const ct = (editRes.headers.get("content-type") || "").toLowerCase();
-      if (editRes.ok && ct.startsWith("image/")) {
-        contentType = ct.split(";")[0] || "image/png";
-        imgBuffer = Buffer.from(await editRes.arrayBuffer());
-      }
-    } catch {}
-  }
+  const workerEndpoint = isEdit ? `${IMAGE_API_URL}/edit` : `${IMAGE_API_URL}/generate`;
 
   if (!imgBuffer) {
     const workerAbort = new AbortController();
     const standbyAbort = new AbortController();
 
     const workerPromise = (async () => {
+      if (isEdit && imageInput && imageInput.rawBase64) {
+        // 1. Try `/edit` with `mode: "edit"` + `image` + `prompt` (fails in 0.2s if 5018, or succeeds if img2img is enabled)
+        try {
+          const editModeRes = await fetch(`${IMAGE_API_URL}/edit`, {
+            method: "POST",
+            headers: {
+              Authorization: `Bearer ${IMAGE_API_KEY}`,
+              "Content-Type": "application/json",
+            },
+            body: JSON.stringify({
+              mode: "edit",
+              prompt: maxPrompt,
+              image: imageInput.rawBase64,
+              width: 512,
+              height: 512,
+            }),
+            signal: workerAbort.signal,
+          });
+          const editCt = (editModeRes.headers.get("content-type") || "").toLowerCase();
+          if (editModeRes.ok && editCt.startsWith("image/")) {
+            return {
+              contentType: editCt.split(";")[0] || "image/png",
+              buffer: Buffer.from(await editModeRes.arrayBuffer()),
+              source: "vega-worker-edit",
+            };
+          }
+        } catch {}
+
+        // 2. Call `/edit` sending BOTH `image: imageInput.rawBase64` and `prompt: maxPrompt` (512x512 fast mode ~4.8s!)
+        const editRes = await fetch(`${IMAGE_API_URL}/edit`, {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${IMAGE_API_KEY}`,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            prompt: maxPrompt,
+            image: imageInput.rawBase64,
+            width: 512,
+            height: 512,
+            num_steps: 8,
+            steps: 8,
+          }),
+          signal: workerAbort.signal,
+        });
+        const ct = (editRes.headers.get("content-type") || "").toLowerCase();
+        if (!editRes.ok || !ct.startsWith("image/")) {
+          const errText = await editRes.text().catch(() => "");
+          throw new Error(`Image Worker /edit error (${editRes.status}): ${errText.slice(0, 200)}`);
+        }
+        return {
+          contentType: ct.split(";")[0] || "image/png",
+          buffer: Buffer.from(await editRes.arrayBuffer()),
+          source: "vega-worker-edit",
+        };
+      }
+
       const genRes = await fetch(`${IMAGE_API_URL}/generate`, {
         method: "POST",
         headers: {
@@ -1509,6 +1543,8 @@ async function runMaxImageAgent({
     statusMessage,
     maxPrompt,
     finalReply,
+    sentImageToWorker: Boolean(isEdit && imageInput && imageInput.rawBase64),
+    workerEndpoint,
     imageId,
     hostedUrl,
     image: {
@@ -3650,6 +3686,8 @@ const server = http.createServer(async (req, res) => {
         imageAction: imgResult.action,
         imageStatus: "completed",
         readyForImage: true,
+        sentImageToWorker: imgResult.sentImageToWorker,
+        workerEndpoint: imgResult.workerEndpoint,
         statusMessage: imgResult.statusMessage,
         maxPrompt: imgResult.maxPrompt,
         reply: imgResult.finalReply,
@@ -3759,6 +3797,8 @@ const server = http.createServer(async (req, res) => {
           imageAction: imgResult.action,
           imageStatus: "completed",
           readyForImage: true,
+          sentImageToWorker: imgResult.sentImageToWorker,
+          workerEndpoint: imgResult.workerEndpoint,
           statusMessage: imgResult.statusMessage,
           maxPrompt: imgResult.maxPrompt,
           reply: imgResult.finalReply,
