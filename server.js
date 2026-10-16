@@ -1494,9 +1494,9 @@ async function runMaxImageAgent({
       };
     })();
 
-    // Standby fast fallback that only activates if the primary Cloudflare Worker queues beyond ~10s
+    // Standby fast fallback that only activates if the primary Cloudflare Worker queues beyond ~14.5s
     const standbyPromise = (async () => {
-      await new Promise((r) => setTimeout(r, 8500));
+      await new Promise((r) => setTimeout(r, 14500));
       if (standbyAbort.signal.aborted) throw new Error("Aborted");
       const cleanPrompt = String(userText || maxPrompt || "cyberpunk portrait")
         .replace(/[^a-zA-Z0-9 ,.-]/g, " ")
