@@ -1330,7 +1330,7 @@ async function runMaxImageAgent({
       ? "Yeh lijiye bhai, aapki edited image bilkul taiyar hai! ✨"
       : "Yeh lijiye bhai, aapki image ban kar taiyar hai! 🎨");
 
-  // Step 1: Ultra-fast Vision Inspection for Image Edits (bounded by 4.0s with immediate stream reader cancellation so zero zombie streams remain!)
+  // Step 1: Ultra-fast Vision Inspection for Image Edits (mimo-v2.6-flash-free inspects the image & writes the English edit prompt for flux-2-klein-4b)
   if (!preCraftedPrompt) {
     if (!isEdit) {
       // For text-to-image generation, craft the enriched prompt in 0ms without an extra LLM round-trip
@@ -1341,12 +1341,13 @@ async function runMaxImageAgent({
         const visionMessages = [
           {
             role: "system",
-            content: DEFAULT_SYSTEM_PROMPT,
+            content:
+              "/no_think You are an expert image-editing prompt writer for FLUX.2 (@cf/black-forest-labs/flux-2-klein-4b). Look at the attached image and the user's edit request, and output ONLY 1 clear, direct English sentence instructing what to change/edit in the image while preserving the main subject. Never call any tools and never output <IMAGE_TASK> tags here.",
           },
           {
             role: "user",
             content: buildMultimodalContent(
-              "Describe in 1 sentence.",
+              `Look at this image and write ONLY 1 clear English image-edit instruction sentence for this user request: "${userText}"`,
               [imageInput.dataUri],
               imageInput.mimeType
             ),
@@ -1359,7 +1360,11 @@ async function runMaxImageAgent({
         });
         if (up.ok && up.response) {
           const assembled = await collectSSEStream(up.response, up.model);
-          const cleaned = String(assembled.content || "").replace(/\s+/g, " ").trim();
+          const cleaned = String(assembled.content || "")
+            .replace(/<IMAGE_TASK[^>]*>([\s\S]*?)<\/IMAGE_TASK>/gi, "$1")
+            .replace(/^["'`]+|["'`]+$/g, "")
+            .replace(/\s+/g, " ")
+            .trim();
           if (cleaned.length >= 8) {
             visionDesc = cleaned;
           } else if (assembled.reasoning && assembled.reasoning.trim().length >= 15) {
@@ -1376,9 +1381,9 @@ async function runMaxImageAgent({
       } catch {}
 
       if (visionDesc) {
-        maxPrompt = `${visionDesc} — edited with: ${userText}, photorealistic, 8k, vivid lighting, sharp focus`;
+        maxPrompt = visionDesc;
       } else {
-        maxPrompt = `Photorealistic 8k studio portrait and scene with the requested edit applied: ${userText}, vivid colors, sharp focus, cinematic lighting`;
+        maxPrompt = `Edit this image as requested: ${userText}, keeping the subject's identity and composition intact, photorealistic, high detail`;
       }
     }
   }
@@ -1398,138 +1403,86 @@ async function runMaxImageAgent({
     } catch {}
   }
 
-  // Step 2: Generate/Edit via `https://image-api.pr3095079.workers.dev/` (`Bearer noida123`, 512x512 fast mode ~280KB PNG)
-  // For `edit`, ALWAYS sends BOTH the user's image (`image: imageInput.rawBase64`) AND Max's vision-crafted `prompt: maxPrompt` to `/edit`!
+  // Step 2: Generate/Edit via `https://image-api.pr3095079.workers.dev/` (`@cf/black-forest-labs/flux-2-klein-4b`, `Bearer noida123`)
+  // For `edit`, sends `mode: "edit"`, `prompt: maxPrompt`, and `image` (normalized PNG/JPEG/WebP base64 data URI) to the worker!
   let imgBuffer = null;
   let contentType = "image/png";
   const workerEndpoint = isEdit ? `${IMAGE_API_URL}/edit` : `${IMAGE_API_URL}/generate`;
 
   if (!imgBuffer) {
-    const workerAbort = new AbortController();
-    const standbyAbort = new AbortController();
+    let workerImageField = undefined;
+    if (isEdit && imageInput && imageInput.rawBase64) {
+      let normMime = String(imageInput.mimeType || "image/png").toLowerCase();
+      if (normMime === "image/jpg") normMime = "image/jpeg";
+      if (!["image/png", "image/jpeg", "image/webp"].includes(normMime)) {
+        normMime = "image/png";
+      }
+      workerImageField = `data:${normMime};base64,${imageInput.rawBase64}`;
+    }
 
-    const workerPromise = (async () => {
-      if (isEdit && imageInput && imageInput.rawBase64) {
-        // 1. Try `/edit` with `mode: "edit"` + `image` + `prompt` (fails in 0.2s if 5018, or succeeds if img2img is enabled)
-        try {
-          const editModeRes = await fetch(`${IMAGE_API_URL}/edit`, {
-            method: "POST",
-            headers: {
-              Authorization: `Bearer ${IMAGE_API_KEY}`,
-              "Content-Type": "application/json",
-            },
-            body: JSON.stringify({
-              mode: "edit",
-              prompt: maxPrompt,
-              image: imageInput.rawBase64,
-              width: 512,
-              height: 512,
-            }),
-            signal: workerAbort.signal,
-          });
-          const editCt = (editModeRes.headers.get("content-type") || "").toLowerCase();
-          if (editModeRes.ok && editCt.startsWith("image/")) {
-            return {
-              contentType: editCt.split(";")[0] || "image/png",
-              buffer: Buffer.from(await editModeRes.arrayBuffer()),
-              source: "vega-worker-edit",
-            };
-          }
-        } catch {}
+    const workerBody = isEdit
+      ? {
+          mode: "edit",
+          prompt: maxPrompt,
+          image: workerImageField,
+          width: 512,
+          height: 512,
+        }
+      : {
+          mode: "generate",
+          prompt: maxPrompt,
+          width: 512,
+          height: 512,
+        };
 
-        // 2. Call `/edit` sending BOTH `image: imageInput.rawBase64` and `prompt: maxPrompt` (512x512 fast mode ~4.8s!)
-        const editRes = await fetch(`${IMAGE_API_URL}/edit`, {
+    let lastWorkerErr = "";
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        const workerRes = await fetch(workerEndpoint, {
           method: "POST",
           headers: {
             Authorization: `Bearer ${IMAGE_API_KEY}`,
             "Content-Type": "application/json",
           },
-          body: JSON.stringify({
-            prompt: maxPrompt,
-            image: imageInput.rawBase64,
-            width: 512,
-            height: 512,
-            num_steps: 8,
-            steps: 8,
-          }),
-          signal: workerAbort.signal,
+          body: JSON.stringify(workerBody),
         });
-        const ct = (editRes.headers.get("content-type") || "").toLowerCase();
-        if (!editRes.ok || !ct.startsWith("image/")) {
-          const errText = await editRes.text().catch(() => "");
-          throw new Error(`Image Worker /edit error (${editRes.status}): ${errText.slice(0, 200)}`);
+
+        const ct = (workerRes.headers.get("content-type") || "").toLowerCase();
+        if (workerRes.ok && ct.startsWith("image/")) {
+          imgBuffer = Buffer.from(await workerRes.arrayBuffer());
+          // Detect actual image magic bytes (FLUX.2 Klein 4B returns JPEG bytes inside the response stream)
+          if (
+            imgBuffer.length >= 3 &&
+            imgBuffer[0] === 0xff &&
+            imgBuffer[1] === 0xd8 &&
+            imgBuffer[2] === 0xff
+          ) {
+            contentType = "image/jpeg";
+          } else if (
+            imgBuffer.length >= 4 &&
+            imgBuffer[0] === 0x89 &&
+            imgBuffer[1] === 0x50 &&
+            imgBuffer[2] === 0x4e &&
+            imgBuffer[3] === 0x47
+          ) {
+            contentType = "image/png";
+          } else {
+            contentType = ct.split(";")[0] || "image/png";
+          }
+          break;
         }
-        return {
-          contentType: ct.split(";")[0] || "image/png",
-          buffer: Buffer.from(await editRes.arrayBuffer()),
-          source: "vega-worker-edit",
-        };
+        const errText = await workerRes.text().catch(() => "");
+        lastWorkerErr = `Image Worker API error (${workerRes.status}): ${errText.slice(0, 240)}`;
+      } catch (e) {
+        lastWorkerErr = e.message || "Worker fetch failed";
       }
-
-      const genRes = await fetch(`${IMAGE_API_URL}/generate`, {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${IMAGE_API_KEY}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          mode: "generate",
-          prompt: maxPrompt,
-          width: 512,
-          height: 512,
-          num_steps: 8,
-          steps: 8,
-        }),
-        signal: workerAbort.signal,
-      });
-      const ct = (genRes.headers.get("content-type") || "").toLowerCase();
-      if (!genRes.ok || !ct.startsWith("image/")) {
-        const errText = await genRes.text().catch(() => "");
-        throw new Error(`Image Worker API error (${genRes.status}): ${errText.slice(0, 200)}`);
+      if (attempt === 0) {
+        await new Promise((r) => setTimeout(r, 600));
       }
-      return {
-        contentType: ct.split(";")[0] || "image/png",
-        buffer: Buffer.from(await genRes.arrayBuffer()),
-        source: "vega-worker",
-      };
-    })();
+    }
 
-    // Standby fast fallback that only activates if the primary Cloudflare Worker queues beyond ~14.5s
-    const standbyPromise = (async () => {
-      await new Promise((r) => setTimeout(r, 14500));
-      if (standbyAbort.signal.aborted) throw new Error("Aborted");
-      const cleanPrompt = String(userText || maxPrompt || "cyberpunk portrait")
-        .replace(/[^a-zA-Z0-9 ,.-]/g, " ")
-        .replace(/\s+/g, " ")
-        .trim()
-        .slice(0, 140);
-      const pollUrl = `https://image.pollinations.ai/prompt/${encodeURIComponent(
-        cleanPrompt
-      )}?width=512&height=512&nologo=true`;
-      const pRes = await fetch(pollUrl, { signal: standbyAbort.signal });
-      const ct = (pRes.headers.get("content-type") || "").toLowerCase();
-      if (pRes.ok && ct.startsWith("image/")) {
-        const buf = Buffer.from(await pRes.arrayBuffer());
-        return {
-          contentType: ct.split(";")[0] || "image/jpeg",
-          buffer: buf,
-          source: "fast-standby",
-        };
-      }
-      throw new Error("Standby image fetch failed");
-    })();
-
-    try {
-      const imgOut = await Promise.any([workerPromise, standbyPromise]);
-      contentType = imgOut.contentType;
-      imgBuffer = imgOut.buffer;
-    } finally {
-      try {
-        workerAbort.abort();
-      } catch {}
-      try {
-        standbyAbort.abort();
-      } catch {}
+    if (!imgBuffer) {
+      throw new Error(lastWorkerErr || "Image generation/editing failed on worker");
     }
   }
 
