@@ -872,6 +872,33 @@ function normalizeMessages(body, defaultSystem = DEFAULT_SYSTEM_PROMPT) {
     }
   }
 
+  // Collapse consecutive unanswered `role: "user"` messages (caused when an earlier turn timed out or errored in the client app)
+  // so old unanswered requests don't hijack a new user message like "Hello" or "Tumhara name kya hai".
+  if (messages.length >= 2) {
+    const collapsed = [];
+    for (let i = 0; i < messages.length; i++) {
+      const curr = messages[i];
+      const prev = collapsed.length > 0 ? collapsed[collapsed.length - 1] : null;
+      if (prev && prev.role === "user" && curr && curr.role === "user") {
+        const currTxt = typeof curr.content === "string" ? curr.content.trim() : "";
+        const prevTxt = typeof prev.content === "string" ? prev.content.trim() : "";
+        const isNudge =
+          /^(karo|karo na|banao|banao na|bana do|bana de|haan|haan karo|haan banao|ok karo|okay karo|jaldi karo|jaldi banao|please karo|plz karo|abhi karo|do it|yes do it|generate it|make it|try again|phir se karo|fir se banao)[?!.\s]*$/i.test(
+            currTxt
+          );
+        if (isNudge && prevTxt) {
+          collapsed[collapsed.length - 1] = prev;
+        } else {
+          // Replace the stale unanswered user message with the newer user message
+          collapsed[collapsed.length - 1] = curr;
+        }
+      } else {
+        collapsed.push(curr);
+      }
+    }
+    messages = collapsed;
+  }
+
   const webSearchRuleSuffix =
     ` WEB SEARCH RULE: You have real-time internet access via OpenCode 'websearch' and 'webfetch' tools. For current events, news, live prices/rates, weather, scores, 2025/2026 facts, or online lookups, use live OpenCode web search facts (or call 'websearch' if not already provided). IMAGE GENERATION & EDITING POWER: You have full real-time Image Generation ('generate') and Image Editing ('edit') power via NVIDIA NIM ${NVIDIA_IMAGE_MODEL} (1024x1024 default + dynamic aspect ratios). NEVER say you cannot generate or edit images! Whenever the user asks to generate/create/draw an image or edit an uploaded photo, output <IMAGE_TASK action="generate" status="Ek second bhai, aapke liye image bana raha hoon... 🎨" reply="Yeh lijiye bhai, aapki image ban kar taiyar hai! 🎨">Detailed English image prompt</IMAGE_TASK> (or action="edit" for image edits). CRITICAL RULE: NEVER call bash, edit, glob, grep, or read.`;
 
@@ -1125,6 +1152,12 @@ async function collectSSEStream(response, fallbackModel) {
   }
 
   const toolCalls = Array.from(toolCallsMap.values()).filter((tc) => tc.function.name);
+  if (!reasoning && typeof content === "string") {
+    const thinkTagMatch = content.match(/<think>([\s\S]*?)<\/think>/i);
+    if (thinkTagMatch && thinkTagMatch[1]) {
+      reasoning = thinkTagMatch[1].trim();
+    }
+  }
   content = stripLeakedReasoning(content);
   return { id, created, model, content, reasoning, finishReason, usage, toolCalls };
 }
@@ -4409,9 +4442,7 @@ const server = http.createServer(async (req, res) => {
       }
 
       const disableReasoning =
-        body.reasoning === false || body.thinking === false || body.noThink === true
-          ? true
-          : false;
+        body.deepThinking === true || body.noThink === false ? false : true;
       const allowWebSearch = body.webSearch !== false && body.allowWebSearch !== false;
       const forceWebSearch = body.webSearch === true || body.search === true;
 
@@ -4601,9 +4632,7 @@ const server = http.createServer(async (req, res) => {
     const messages = normalizeMessages(body, DEFAULT_SYSTEM_PROMPT);
     const wantsStream = body.stream === true;
     const disableReasoning =
-      body.reasoning === false || body.thinking === false || body.noThink === true
-        ? true
-        : false;
+      body.deepThinking === true || body.noThink === false ? false : true;
     const allowWebSearch = body.webSearch !== false && body.allowWebSearch !== false;
     const forceWebSearch = body.webSearch === true || body.search === true;
 
