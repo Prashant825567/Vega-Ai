@@ -1911,7 +1911,7 @@ async function runMaxImageAgent({
     try {
       await Promise.race([
         promptCraftTask,
-        new Promise((resolve) => setTimeout(resolve, 6800)),
+        new Promise((resolve) => setTimeout(resolve, 10500)),
       ]);
     } catch {}
 
@@ -1928,12 +1928,14 @@ async function runMaxImageAgent({
     maxPrompt = debrandForNvidiaCosmos(maxPrompt);
   }
 
-  // Ensure `mimoThinking` always includes both mimo-v2.6-flash-free's thought process AND the enhanced English prompt it wrote
-  const fullThinking = mimoThinking
-    ? `${mimoThinking}\n\nEnhanced English Prompt (${isEdit ? "Edit" : "Generate"}): "${maxPrompt}"`
-    : `Understanding user requirement ("${userText}") and crafting an enhanced detailed English prompt for ${
-        isEdit ? CLOUDFLARE_EDIT_MODEL : NVIDIA_IMAGE_MODEL
-      }.\n\nEnhanced English Prompt: "${maxPrompt}"`;
+  const buildThinkingSummary = () =>
+    mimoThinking
+      ? `${mimoThinking}\n\nEnhanced English Prompt (${isEdit ? "Edit" : "Generate"}): "${maxPrompt}"`
+      : `Understanding user requirement ("${userText}") and crafting an enhanced detailed English prompt for ${
+          isEdit ? CLOUDFLARE_EDIT_MODEL : NVIDIA_IMAGE_MODEL
+        }.\n\nEnhanced English Prompt: "${maxPrompt}"`;
+
+  const fullThinking = buildThinkingSummary();
 
   const outWidth = isEdit ? Number(options.width) || 1024 : width;
   const outHeight = isEdit ? Number(options.height) || 1024 : height;
@@ -2134,6 +2136,8 @@ async function runMaxImageAgent({
   const outBase64 = imgBuffer.toString("base64");
   const outDataUri = `data:${contentType};base64,${outBase64}`;
 
+  const finalThinking = buildThinkingSummary();
+
   return {
     action: isEdit ? "edit" : "generate",
     imageModel: isEdit ? CLOUDFLARE_EDIT_MODEL : NVIDIA_IMAGE_MODEL,
@@ -2145,8 +2149,8 @@ async function runMaxImageAgent({
     statusMessage,
     userPrompt: userText,
     maxPrompt,
-    thinking: fullThinking,
-    reasoning: fullThinking,
+    thinking: finalThinking,
+    reasoning: finalThinking,
     finalReply,
     imageId,
     hostedUrl,
