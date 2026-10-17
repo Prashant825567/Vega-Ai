@@ -26,7 +26,7 @@ const crypto = require("node:crypto");
 const fs = require("node:fs");
 const path = require("node:path");
 
-// Force IPv4-first DNS resolution so Cloudflare endpoints (opencode.ai, image-api worker) never stall on unreachable IPv6 routes
+// Force IPv4-first DNS resolution so upstream endpoints never stall on unreachable IPv6 routes
 try {
   dns.setDefaultResultOrder("ipv4first");
   if (typeof net.setDefaultAutoSelectFamily === "function") {
@@ -232,11 +232,22 @@ const AI_NAME = process.env.AI_NAME || "Max v1.0";
 const APP_NAME = process.env.APP_NAME || "Vega";
 const BACKEND_API_KEY = (process.env.BACKEND_API_KEY || "").trim();
 
-// Image Generation & Editing Worker Configuration
-const IMAGE_API_URL = (
-  process.env.IMAGE_API_URL || "https://image-api.pr3095079.workers.dev"
+// NVIDIA NIM FLUX.3 Klein Image Generation & Vision-Guided Editing Configuration
+const NVIDIA_IMAGE_MODEL = "black-forest-labs/flux-3-image-klein";
+const NVIDIA_IMAGE_API_URL = (
+  process.env.NVIDIA_IMAGE_API_URL ||
+  process.env.IMAGE_API_URL ||
+  "https://ai.api.nvidia.com/v1/genai/black-forest-labs/flux-3-image-klein"
 ).replace(/\/+$/, "");
-const IMAGE_API_KEY = (process.env.IMAGE_API_KEY || "noida123").trim();
+
+function getNvidiaApiKey() {
+  return (
+    process.env.NVIDIA_API_KEY ||
+    process.env.NVAPI_KEY ||
+    process.env.IMAGE_API_KEY ||
+    ""
+  ).trim();
+}
 
 const DEFAULT_FILLER_TEXT =
   process.env.VOICE_FILLER_TEXT || "Ek second, abhi batata hoon.";
@@ -247,7 +258,7 @@ let DEFAULT_SYSTEM_PROMPT =
     `When asked who you are or what your name/version is, always introduce yourself as ${AI_NAME} (the AI assistant of ${APP_NAME}). ` +
     `Reply clearly, naturally, and in the same language (English, Hindi, Hinglish, etc.) that the user uses. ` +
     `WEB SEARCH RULE: You have real-time internet access via the 'websearch' and 'webfetch' tools. Whenever the user asks about current events, latest news, live prices/rates (crypto, stocks, gold), weather, sports scores, recent releases, or asks you to search/check something online, call the 'websearch' tool first and answer using the live results. ` +
-    `IMAGE GENERATION & EDITING POWER: You ALSO have full real-time Image Generation ('generate') and Image Editing ('edit') power via the Vega Image Engine (https://image-api.pr3095079.workers.dev/). NEVER say that you cannot generate, create, draw, or edit images/photos! If asked whether you can generate or edit images, proudly say YES. Whenever the user asks you to generate/create/draw/make any image/photo/picture/art/logo/wallpaper OR edit/modify/change an uploaded image, output <IMAGE_TASK action="generate" status="Ek second bhai, aapke liye image bana raha hoon... 🎨" reply="Yeh lijiye bhai, aapki image ban kar taiyar hai! 🎨">Detailed 50-80 word English image prompt</IMAGE_TASK> (use action="edit" if editing an uploaded image). ` +
+    `IMAGE GENERATION & EDITING POWER: You ALSO have full real-time Image Generation ('generate') and Image Editing ('edit') power via NVIDIA NIM ${NVIDIA_IMAGE_MODEL} (1024x1024 default + dynamic aspect ratios 9:16, 16:9, 4:5, 5:4, 2:3, 3:2). NEVER say that you cannot generate, create, draw, or edit images/photos! If asked whether you can generate or edit images, proudly say YES. Whenever the user asks you to generate/create/draw/make any image/photo/picture/art/logo/wallpaper OR edit/modify/change an uploaded image, output <IMAGE_TASK action="generate" status="Ek second bhai, aapke liye image bana raha hoon... 🎨" reply="Yeh lijiye bhai, aapki image ban kar taiyar hai! 🎨">Detailed 50-80 word English image prompt</IMAGE_TASK> (use action="edit" if editing an uploaded image). ` +
     `CRITICAL RULE: NEVER invoke or call local shell/file tools (bash, edit, glob, grep, or read)—they are unused gateway placeholders.`;
 
 let VOICE_FAST_SYSTEM_PROMPT =
@@ -860,7 +871,7 @@ function normalizeMessages(body, defaultSystem = DEFAULT_SYSTEM_PROMPT) {
   }
 
   const webSearchRuleSuffix =
-    ` WEB SEARCH RULE: You have real-time internet access via OpenCode 'websearch' and 'webfetch' tools. For current events, news, live prices/rates, weather, scores, 2025/2026 facts, or online lookups, use live OpenCode web search facts (or call 'websearch' if not already provided). IMAGE GENERATION & EDITING POWER: You have full real-time Image Generation ('generate') and Image Editing ('edit') power via https://image-api.pr3095079.workers.dev/. NEVER say you cannot generate or edit images! Whenever the user asks to generate/create/draw an image or edit an uploaded photo, output <IMAGE_TASK action="generate" status="Ek second bhai, aapke liye image bana raha hoon... 🎨" reply="Yeh lijiye bhai, aapki image ban kar taiyar hai! 🎨">Detailed English image prompt</IMAGE_TASK> (or action="edit" for image edits). CRITICAL RULE: NEVER call bash, edit, glob, grep, or read.`;
+    ` WEB SEARCH RULE: You have real-time internet access via OpenCode 'websearch' and 'webfetch' tools. For current events, news, live prices/rates, weather, scores, 2025/2026 facts, or online lookups, use live OpenCode web search facts (or call 'websearch' if not already provided). IMAGE GENERATION & EDITING POWER: You have full real-time Image Generation ('generate') and Image Editing ('edit') power via NVIDIA NIM ${NVIDIA_IMAGE_MODEL} (1024x1024 default + dynamic aspect ratios). NEVER say you cannot generate or edit images! Whenever the user asks to generate/create/draw an image or edit an uploaded photo, output <IMAGE_TASK action="generate" status="Ek second bhai, aapke liye image bana raha hoon... 🎨" reply="Yeh lijiye bhai, aapki image ban kar taiyar hai! 🎨">Detailed English image prompt</IMAGE_TASK> (or action="edit" for image edits). CRITICAL RULE: NEVER call bash, edit, glob, grep, or read.`;
 
   const hasSystem = messages.some(
     (m) => m && (m.role === "system" || m.role === "developer")
@@ -1284,10 +1295,11 @@ function parseModelImageFallback(content = "", userText = "", hasImage = false) 
   return null;
 }
 
-// In-memory store for recent generated/edited images so they can also be served via fast HTTPS URLs (`/api/image/view/:id.png`)
+// In-memory store for recent generated/edited images so they can also be served via fast HTTPS URLs (`/api/image/view/:id.jpg`)
 const generatedImagesStore = new Map();
-function saveGeneratedImageBuffer(buffer, mimeType = "image/png") {
-  const id = `img_${Date.now()}_${crypto.randomBytes(4).toString("hex")}.png`;
+function saveGeneratedImageBuffer(buffer, mimeType = "image/jpeg") {
+  const ext = mimeType.includes("png") ? "png" : "jpg";
+  const id = `img_${Date.now()}_${crypto.randomBytes(4).toString("hex")}.${ext}`;
   generatedImagesStore.set(id, { buffer, mimeType, createdAt: Date.now() });
   if (generatedImagesStore.size > 25) {
     const oldestKey = generatedImagesStore.keys().next().value;
@@ -1297,13 +1309,162 @@ function saveGeneratedImageBuffer(buffer, mimeType = "image/png") {
 }
 
 /**
- * Max v1.0 (`mimo-v2.6-flash-free` + Ultra-Fast Vision) Image-Edit & Text-to-Image Pipeline:
- * 1. For `edit`: Inspects the uploaded image + user's edit request in ~1.2s (hard 3.5s timeout so it never hangs), crafts:
+ * Reads width & height from a PNG or JPEG buffer (zero external dependencies)
+ * so edited images automatically preserve the uploaded image's orientation.
+ */
+function getBufferImageDimensions(buf) {
+  try {
+    if (!Buffer.isBuffer(buf) || buf.length < 24) return null;
+    // PNG: 89 50 4E 47 ... IHDR width @ 16, height @ 20
+    if (buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47) {
+      const width = buf.readUInt32BE(16);
+      const height = buf.readUInt32BE(20);
+      if (width > 0 && height > 0) return { width, height };
+    }
+    // JPEG: FF D8 ... scan for SOF0..SOF3 markers (FF C0 .. FF C3)
+    if (buf[0] === 0xff && buf[1] === 0xd8) {
+      let offset = 2;
+      while (offset + 9 < buf.length) {
+        if (buf[offset] !== 0xff) {
+          offset++;
+          continue;
+        }
+        const marker = buf[offset + 1];
+        if (
+          marker === 0xc0 ||
+          marker === 0xc1 ||
+          marker === 0xc2 ||
+          marker === 0xc3
+        ) {
+          const height = buf.readUInt16BE(offset + 5);
+          const width = buf.readUInt16BE(offset + 7);
+          if (width > 0 && height > 0) return { width, height };
+          break;
+        }
+        if (marker === 0xd9 || marker === 0xda) break;
+        const segLen = buf.readUInt16BE(offset + 2);
+        if (segLen < 2) break;
+        offset += 2 + segLen;
+      }
+    }
+  } catch {}
+  return null;
+}
+
+/**
+ * Resolves the target resolution for NVIDIA NIM `black-forest-labs/flux-3-image-klein`.
+ * - Default: `1024 × 1024` (`1:1`)
+ * - Automatically adapts to user-requested aspect ratio/orientation in text or body:
+ *   - `9:16` (Mobile wallpaper / Reel / Story / Shorts / Vertical): `768 × 1344`
+ *   - `16:9` (YouTube thumbnail / Banner / Desktop wallpaper / Landscape / Wide): `1344 × 768`
+ *   - `4:5` (Instagram portrait): `896 × 1152`
+ *   - `5:4` (Classic horizontal): `1152 × 896`
+ *   - `2:3` (Portrait / Poster): `832 × 1216`
+ *   - `3:2` (DSLR landscape): `1216 × 832`
+ */
+const FLUX3_ALLOWED_DIMS = [768, 832, 896, 960, 1024, 1088, 1152, 1216, 1280, 1344];
+function snapToFlux3Dim(val) {
+  const n = Number(val);
+  if (!Number.isFinite(n) || n <= 0) return 1024;
+  let best = 1024;
+  let bestDiff = Infinity;
+  for (const d of FLUX3_ALLOWED_DIMS) {
+    const diff = Math.abs(d - n);
+    if (diff < bestDiff) {
+      bestDiff = diff;
+      best = d;
+    }
+  }
+  return best;
+}
+
+function resolveFlux3Dimensions(userText = "", options = {}, imageInput = null) {
+  const q = String(userText || "").toLowerCase();
+  const explicitRatio = String(
+    options.aspect_ratio || options.aspectRatio || options.ratio || ""
+  ).trim();
+
+  // 1. Explicit width & height in request body or mentioned as e.g. "768x1344" in user prompt
+  const dimMatch = q.match(/\b(\d{3,4})\s*[x×*]\s*(\d{3,4})\b/);
+  if (dimMatch) {
+    const w = snapToFlux3Dim(Number(dimMatch[1]));
+    const h = snapToFlux3Dim(Number(dimMatch[2]));
+    return { width: w, height: h, aspectRatio: `${w}x${h}` };
+  }
+  if (options.width && options.height) {
+    const w = snapToFlux3Dim(options.width);
+    const h = snapToFlux3Dim(options.height);
+    return { width: w, height: h, aspectRatio: `${w}x${h}` };
+  }
+
+  // 2. Explicit aspect ratio string or ratio mentioned in prompt
+  const ratioSignal = explicitRatio || (q.match(/\b(9:16|16:9|4:5|5:4|2:3|3:2|1:1)\b/) || [])[1] || "";
+  if (ratioSignal === "9:16") return { width: 768, height: 1344, aspectRatio: "9:16" };
+  if (ratioSignal === "16:9") return { width: 1344, height: 768, aspectRatio: "16:9" };
+  if (ratioSignal === "4:5") return { width: 896, height: 1152, aspectRatio: "4:5" };
+  if (ratioSignal === "5:4") return { width: 1152, height: 896, aspectRatio: "5:4" };
+  if (ratioSignal === "2:3") return { width: 832, height: 1216, aspectRatio: "2:3" };
+  if (ratioSignal === "3:2") return { width: 1216, height: 832, aspectRatio: "3:2" };
+  if (ratioSignal === "1:1") return { width: 1024, height: 1024, aspectRatio: "1:1" };
+
+  // 3. Natural-language orientation / use-case keywords in user prompt (Hindi, Hinglish, English)
+  if (
+    /\b(phone wallpaper|mobile wallpaper|lockscreen|lock screen|reel|reels|story|stories|shorts|status|vertical|tall|lamba|khada)\b/i.test(
+      q
+    ) ||
+    /(मोबाइल वॉलपेपर|फोन वॉलपेपर|रील|स्टोरी|लम्बा|वर्टिकल)/.test(q)
+  ) {
+    return { width: 768, height: 1344, aspectRatio: "9:16" };
+  }
+  if (
+    /\b(youtube|thumbnail|banner|cover photo|desktop wallpaper|pc wallpaper|laptop wallpaper|landscape|widescreen|wide|horizontal|cinematic wide|chauda)\b/i.test(
+      q
+    ) ||
+    /(थंबनेल|बैनर|लैंडस्केप|चौड़ा|वाइड)/.test(q)
+  ) {
+    return { width: 1344, height: 768, aspectRatio: "16:9" };
+  }
+  if (/\b(instagram portrait|insta post|4 by 5)\b/i.test(q)) {
+    return { width: 896, height: 1152, aspectRatio: "4:5" };
+  }
+  if (/\b(poster|book cover|portrait mode|portrait size|full body portrait)\b/i.test(q)) {
+    return { width: 832, height: 1216, aspectRatio: "2:3" };
+  }
+  if (/\b(square|dp|profile pic|profile photo|avatar|logo|icon)\b/i.test(q)) {
+    return { width: 1024, height: 1024, aspectRatio: "1:1" };
+  }
+
+  // 4. If editing an uploaded image and no size was requested in text, match the uploaded image's aspect ratio
+  if (imageInput && imageInput.rawBase64) {
+    try {
+      const inBuf = Buffer.from(imageInput.rawBase64, "base64");
+      const dims = getBufferImageDimensions(inBuf);
+      if (dims && dims.width > 0 && dims.height > 0) {
+        const ratio = dims.width / dims.height;
+        if (ratio < 0.65) return { width: 768, height: 1344, aspectRatio: "9:16" };
+        if (ratio < 0.75) return { width: 832, height: 1216, aspectRatio: "2:3" };
+        if (ratio < 0.88) return { width: 896, height: 1152, aspectRatio: "4:5" };
+        if (ratio > 1.55) return { width: 1344, height: 768, aspectRatio: "16:9" };
+        if (ratio > 1.35) return { width: 1216, height: 832, aspectRatio: "3:2" };
+        if (ratio > 1.15) return { width: 1152, height: 896, aspectRatio: "5:4" };
+      }
+    } catch {}
+  }
+
+  // Default: 1024 × 1024 (1:1)
+  return { width: 1024, height: 1024, aspectRatio: "1:1" };
+}
+
+/**
+ * Max v1.0 (`mimo-v2.6-flash-free` + NVIDIA NIM `black-forest-labs/flux-3-image-klein`)
+ * Image Generation & Vision-Guided Image Editing Pipeline:
+ * 1. Resolves output dimensions (`1024 × 1024` default, or dynamic `9:16` `768×1344`, `16:9` `1344×768`, etc. based on user requirement).
+ * 2. For `edit`: `mimo-v2.6-flash-free` inspects the uploaded image via Multimodal Vision + user's edit request, crafts:
  *    - `statusMessage`: immediate message so the user & app know the image is being edited right now
- *    - `maxPrompt`: detailed English visual prompt describing the uploaded image WITH the user's requested edit applied
+ *    - `maxPrompt`: detailed English visual scene prompt describing the uploaded image WITH the user's requested edit applied
  *    - `finalReply`: presentation message for the finished image
- * 2. Calls `https://image-api.pr3095079.workers.dev/` (`Bearer noida123`).
- * 3. Returns `{ action, statusMessage, maxPrompt, finalReply, imageId, image: { mimeType, url, base64, dataUri } }`.
+ * 3. Calls NVIDIA NIM `https://ai.api.nvidia.com/v1/genai/black-forest-labs/flux-3-image-klein` using `NVIDIA_API_KEY`.
+ * 4. Returns `{ action, statusMessage, maxPrompt, finalReply, width, height, aspectRatio, imageId, image: { mimeType, url, dataUri } }`.
  */
 async function runMaxImageAgent({
   userText = "",
@@ -1314,9 +1475,11 @@ async function runMaxImageAgent({
   preCraftedPrompt = "",
   preStatusMessage = "",
   preFinalReply = "",
+  options = {},
   publicBaseUrl = "https://vega-ai-6m2k.onrender.com",
 }) {
   const isEdit = action === "edit" && Boolean(imageInput && imageInput.dataUri);
+  const { width, height, aspectRatio } = resolveFlux3Dimensions(userText, options, imageInput);
 
   let statusMessage =
     preStatusMessage ||
@@ -1330,60 +1493,54 @@ async function runMaxImageAgent({
       ? "Yeh lijiye bhai, aapki edited image bilkul taiyar hai! ✨"
       : "Yeh lijiye bhai, aapki image ban kar taiyar hai! 🎨");
 
-  // Step 1: Ultra-fast Vision Inspection for Image Edits (mimo-v2.6-flash-free inspects the image & writes the English edit prompt for flux-2-klein-4b)
+  // Step 1: Ultra-fast Vision Inspection for Image Edits (mimo-v2.6-flash-free inspects the uploaded image & writes a complete visual reconstruction prompt with the requested edit applied)
   if (!preCraftedPrompt) {
     if (!isEdit) {
-      // For text-to-image generation, craft the enriched prompt in 0ms without an extra LLM round-trip
       maxPrompt = `${userText}, photorealistic, 8k, ultra-detailed, vivid cinematic lighting, sharp focus`;
     } else {
       let visionDesc = "";
-      const visionTask = (async () => {
-        const visionMessages = [
-          {
-            role: "system",
-            content:
-              "/no_think You are an expert image-editing prompt writer for FLUX.2 (@cf/black-forest-labs/flux-2-klein-4b). Look at the attached image and the user's edit request, and output ONLY 1 clear, direct English sentence instructing what to change/edit in the image while preserving the main subject. Never call any tools and never output <IMAGE_TASK> tags here.",
-          },
-          {
-            role: "user",
-            content: buildMultimodalContent(
-              `Look at this image and write ONLY 1 clear English image-edit instruction sentence for this user request: "${userText}"`,
-              [imageInput.dataUri],
-              imageInput.mimeType
-            ),
-          },
-        ];
-        const up = await callOpenCodeUpstream({
-          model: model || DEFAULT_MODEL,
-          messages: visionMessages,
-          disableReasoning: true,
-        });
-        if (up.ok && up.response) {
-          const assembled = await collectSSEStream(up.response, up.model);
-          const cleaned = String(assembled.content || "")
-            .replace(/<IMAGE_TASK[^>]*>([\s\S]*?)<\/IMAGE_TASK>/gi, "$1")
-            .replace(/^["'`]+|["'`]+$/g, "")
-            .replace(/\s+/g, " ")
-            .trim();
-          if (cleaned.length >= 8) {
-            visionDesc = cleaned;
-          } else if (assembled.reasoning && assembled.reasoning.trim().length >= 15) {
-            visionDesc = assembled.reasoning.replace(/\s+/g, " ").trim().slice(0, 200);
+      if (OPENCODE_API_KEY) {
+        const visionTask = (async () => {
+          const visionMessages = normalizeMessages(
+            {
+              message: `Describe this scene in 35 English words, applying this change: ${userText}. Output only the English scene description.`,
+              image: imageInput.dataUri,
+              mimeType: imageInput.mimeType,
+            },
+            DEFAULT_SYSTEM_PROMPT
+          );
+          const up = await callOpenCodeUpstream({
+            model: model || DEFAULT_MODEL,
+            messages: visionMessages,
+            disableReasoning: true,
+          });
+          if (up.ok && up.response) {
+            const assembled = await collectSSEStream(up.response, up.model);
+            const cleaned = String(assembled.content || "")
+              .replace(/<IMAGE_TASK[^>]*>([\s\S]*?)<\/IMAGE_TASK>/gi, "$1")
+              .replace(/^["'`]+|["'`]+$/g, "")
+              .replace(/\s+/g, " ")
+              .trim();
+            if (cleaned.length >= 12) {
+              visionDesc = cleaned;
+            } else if (assembled.reasoning && assembled.reasoning.trim().length >= 15) {
+              visionDesc = assembled.reasoning.replace(/\s+/g, " ").trim().slice(0, 260);
+            }
           }
-        }
-      })();
+        })();
 
-      try {
-        await Promise.race([
-          visionTask,
-          new Promise((resolve) => setTimeout(resolve, 6200)),
-        ]);
-      } catch {}
+        try {
+          await Promise.race([
+            visionTask,
+            new Promise((resolve) => setTimeout(resolve, 6500)),
+          ]);
+        } catch {}
+      }
 
       if (visionDesc) {
-        maxPrompt = visionDesc;
+        maxPrompt = `${visionDesc}, photorealistic, 8k, ultra-detailed, sharp focus`;
       } else {
-        maxPrompt = `Edit this image as requested: ${userText}, keeping the subject's identity and composition intact, photorealistic, high detail`;
+        maxPrompt = `${userText}, photorealistic, 8k, ultra-detailed, vivid cinematic lighting, sharp focus`;
       }
     }
   }
@@ -1397,60 +1554,65 @@ async function runMaxImageAgent({
         imageAction: isEdit ? "edit" : "generate",
         imageStatus: "processing",
         readyForImage: true,
+        width,
+        height,
+        aspectRatio,
         statusMessage,
         maxPrompt,
       });
     } catch {}
   }
 
-  // Step 2: Generate/Edit via `https://image-api.pr3095079.workers.dev/` (`@cf/black-forest-labs/flux-2-klein-4b`, `Bearer noida123`)
-  // For `edit`, sends `mode: "edit"`, `prompt: maxPrompt`, and `image` (normalized PNG/JPEG/WebP base64 data URI) to the worker!
+  // Step 2: Generate via NVIDIA NIM `black-forest-labs/flux-3-image-klein`
+  const nvidiaApiKey = getNvidiaApiKey();
+  if (!nvidiaApiKey) {
+    throw new Error(
+      "Missing NVIDIA_API_KEY in environment variables. Please set NVIDIA_API_KEY in Render Environment settings."
+    );
+  }
+
   let imgBuffer = null;
-  let contentType = "image/png";
-  const workerEndpoint = isEdit ? `${IMAGE_API_URL}/edit` : `${IMAGE_API_URL}/generate`;
+  let contentType = "image/jpeg";
+  const nvidiaPayload = {
+    prompt: maxPrompt.slice(0, 1950),
+    width,
+    height,
+    steps: Number(options.steps) > 0 && Number(options.steps) <= 50 ? Number(options.steps) : 28,
+    seed: Number.isInteger(Number(options.seed)) && Number(options.seed) >= 0 ? Number(options.seed) : 0,
+  };
 
-  if (!imgBuffer) {
-    let workerImageField = undefined;
-    if (isEdit && imageInput && imageInput.rawBase64) {
-      let normMime = String(imageInput.mimeType || "image/png").toLowerCase();
-      if (normMime === "image/jpg") normMime = "image/jpeg";
-      if (!["image/png", "image/jpeg", "image/webp"].includes(normMime)) {
-        normMime = "image/png";
-      }
-      workerImageField = `data:${normMime};base64,${imageInput.rawBase64}`;
-    }
+  let lastNvidiaErr = "";
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const nvRes = await fetch(NVIDIA_IMAGE_API_URL, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${nvidiaApiKey}`,
+          Accept: "application/json",
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(nvidiaPayload),
+      });
 
-    const workerBody = isEdit
-      ? {
-          mode: "edit",
-          prompt: maxPrompt,
-          image: workerImageField,
-          width: 512,
-          height: 512,
+      if (nvRes.ok) {
+        const ct = (nvRes.headers.get("content-type") || "").toLowerCase();
+        if (ct.startsWith("image/")) {
+          imgBuffer = Buffer.from(await nvRes.arrayBuffer());
+        } else {
+          const data = await nvRes.json();
+          const b64 =
+            data?.artifacts?.[0]?.base64 ||
+            data?.image ||
+            data?.data?.[0]?.b64_json ||
+            "";
+          if (b64) {
+            imgBuffer = Buffer.from(b64, "base64");
+          } else {
+            lastNvidiaErr = `NVIDIA NIM returned 200 without base64 artifact: ${JSON.stringify(data).slice(0, 200)}`;
+          }
         }
-      : {
-          mode: "generate",
-          prompt: maxPrompt,
-          width: 512,
-          height: 512,
-        };
 
-    let lastWorkerErr = "";
-    for (let attempt = 0; attempt < 2; attempt++) {
-      try {
-        const workerRes = await fetch(workerEndpoint, {
-          method: "POST",
-          headers: {
-            Authorization: `Bearer ${IMAGE_API_KEY}`,
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify(workerBody),
-        });
-
-        const ct = (workerRes.headers.get("content-type") || "").toLowerCase();
-        if (workerRes.ok && ct.startsWith("image/")) {
-          imgBuffer = Buffer.from(await workerRes.arrayBuffer());
-          // Detect actual image magic bytes (FLUX.2 Klein 4B returns JPEG bytes inside the response stream)
+        if (imgBuffer && imgBuffer.length > 0) {
           if (
             imgBuffer.length >= 3 &&
             imgBuffer[0] === 0xff &&
@@ -1466,24 +1628,23 @@ async function runMaxImageAgent({
             imgBuffer[3] === 0x47
           ) {
             contentType = "image/png";
-          } else {
-            contentType = ct.split(";")[0] || "image/png";
           }
           break;
         }
-        const errText = await workerRes.text().catch(() => "");
-        lastWorkerErr = `Image Worker API error (${workerRes.status}): ${errText.slice(0, 240)}`;
-      } catch (e) {
-        lastWorkerErr = e.message || "Worker fetch failed";
+      } else {
+        const errText = await nvRes.text().catch(() => "");
+        lastNvidiaErr = `NVIDIA NIM API error (${nvRes.status}): ${errText.slice(0, 240)}`;
       }
-      if (attempt === 0) {
-        await new Promise((r) => setTimeout(r, 600));
-      }
+    } catch (e) {
+      lastNvidiaErr = e.message || "NVIDIA NIM fetch failed";
     }
+    if (attempt === 0) {
+      await new Promise((r) => setTimeout(r, 500));
+    }
+  }
 
-    if (!imgBuffer) {
-      throw new Error(lastWorkerErr || "Image generation/editing failed on worker");
-    }
+  if (!imgBuffer) {
+    throw new Error(lastNvidiaErr || "Image generation failed on NVIDIA NIM flux-3-image-klein");
   }
 
   const imageId = saveGeneratedImageBuffer(imgBuffer, contentType);
@@ -1493,15 +1654,20 @@ async function runMaxImageAgent({
 
   return {
     action: isEdit ? "edit" : "generate",
+    imageModel: NVIDIA_IMAGE_MODEL,
+    width,
+    height,
+    aspectRatio,
     statusMessage,
     maxPrompt,
     finalReply,
-    sentImageToWorker: Boolean(isEdit && imageInput && imageInput.rawBase64),
-    workerEndpoint,
     imageId,
     hostedUrl,
     image: {
       mimeType: contentType,
+      width,
+      height,
+      aspectRatio,
       url: hostedUrl,
       dataUri: outDataUri,
     },
@@ -3012,6 +3178,7 @@ const server = http.createServer(async (req, res) => {
         stt: GEMINI_VOICE_MODEL,
         llm: GEMINI_VOICE_MODEL,
         chatLlm: DEFAULT_MODEL,
+        image: NVIDIA_IMAGE_MODEL,
         tts: GEMINI_VOICE_MODEL,
         ttsDefaultVoice: GEMINI_TTS_VOICE,
       },
@@ -3025,6 +3192,7 @@ const server = http.createServer(async (req, res) => {
       configuredKeys: {
         OPENCODE_API_KEY: Boolean(OPENCODE_API_KEY),
         GEMINI_API_KEY: GEMINI_API_KEYS.length > 0,
+        NVIDIA_API_KEY: Boolean(getNvidiaApiKey()),
       },
       endpoints: {
         prompt: "GET /api/prompt",
@@ -3623,6 +3791,7 @@ const server = http.createServer(async (req, res) => {
         imageInput,
         action: forcedAction,
         model: body.model || DEFAULT_MODEL,
+        options: body,
         onStatus: (statusPayload) => {
           if (wantsStream) {
             sendSSEEvent(res, "image_status", statusPayload);
@@ -3635,12 +3804,14 @@ const server = http.createServer(async (req, res) => {
         ai: AI_NAME,
         app: APP_NAME,
         model: DEFAULT_MODEL,
+        imageModel: imgResult.imageModel,
         isImageTask: true,
         imageAction: imgResult.action,
         imageStatus: "completed",
         readyForImage: true,
-        sentImageToWorker: imgResult.sentImageToWorker,
-        workerEndpoint: imgResult.workerEndpoint,
+        width: imgResult.width,
+        height: imgResult.height,
+        aspectRatio: imgResult.aspectRatio,
         statusMessage: imgResult.statusMessage,
         maxPrompt: imgResult.maxPrompt,
         reply: imgResult.finalReply,
@@ -3708,6 +3879,7 @@ const server = http.createServer(async (req, res) => {
           imageInput,
           action: imageTaskAction,
           model: body.model || DEFAULT_MODEL,
+          options: body,
           onStatus: (statusPayload) => {
             if (wantsStream) {
               // 1. Send dedicated SSE event so app immediately prepares its image slot
@@ -3719,10 +3891,14 @@ const server = http.createServer(async (req, res) => {
                   object: "chat.completion.chunk",
                   created: Math.floor(Date.now() / 1000),
                   model: DEFAULT_MODEL,
+                  imageModel: NVIDIA_IMAGE_MODEL,
                   isImageTask: true,
                   imageAction: statusPayload.imageAction,
                   imageStatus: "processing",
                   readyForImage: true,
+                  width: statusPayload.width,
+                  height: statusPayload.height,
+                  aspectRatio: statusPayload.aspectRatio,
                   statusMessage: statusPayload.statusMessage,
                   maxPrompt: statusPayload.maxPrompt,
                   choices: [
@@ -3746,12 +3922,14 @@ const server = http.createServer(async (req, res) => {
           ai: AI_NAME,
           app: APP_NAME,
           model: DEFAULT_MODEL,
+          imageModel: imgResult.imageModel,
           isImageTask: true,
           imageAction: imgResult.action,
           imageStatus: "completed",
           readyForImage: true,
-          sentImageToWorker: imgResult.sentImageToWorker,
-          workerEndpoint: imgResult.workerEndpoint,
+          width: imgResult.width,
+          height: imgResult.height,
+          aspectRatio: imgResult.aspectRatio,
           statusMessage: imgResult.statusMessage,
           maxPrompt: imgResult.maxPrompt,
           reply: imgResult.finalReply,
@@ -3840,6 +4018,7 @@ const server = http.createServer(async (req, res) => {
           preCraftedPrompt: fallbackImgTask.maxPrompt,
           preStatusMessage: fallbackImgTask.statusMessage,
           preFinalReply: fallbackImgTask.finalReply,
+          options: body,
           onStatus: (statusPayload) => {
             if (wantsStream) {
               sendSSEEvent(res, "image_status", statusPayload);
@@ -3851,10 +4030,14 @@ const server = http.createServer(async (req, res) => {
           ai: AI_NAME,
           app: APP_NAME,
           model: DEFAULT_MODEL,
+          imageModel: imgResult.imageModel,
           isImageTask: true,
           imageAction: imgResult.action,
           imageStatus: "completed",
           readyForImage: true,
+          width: imgResult.width,
+          height: imgResult.height,
+          aspectRatio: imgResult.aspectRatio,
           statusMessage: fallbackImgTask.statusMessage || imgResult.statusMessage,
           maxPrompt: imgResult.maxPrompt,
           reply: fallbackImgTask.finalReply || imgResult.finalReply,
@@ -4530,6 +4713,8 @@ server.listen(PORT, HOST, () => {
   console.log(`🚀 ${AI_NAME} (${APP_NAME}) Backend & Voice Agent API on http://${HOST}:${PORT}`);
   console.log(`🔑 OPENCODE_API_KEY: ${OPENCODE_API_KEY ? "Configured (env)" : "MISSING"}`);
   console.log(`🔑 GEMINI_API_KEY:   ${GEMINI_API_KEYS.length > 0 ? `Configured (${GEMINI_API_KEYS.length} key(s))` : "MISSING"}`);
+  console.log(`🔑 NVIDIA_API_KEY:   ${getNvidiaApiKey() ? "Configured (env)" : "MISSING"}`);
+  console.log(`🎨 Image Engine:     ${NVIDIA_IMAGE_MODEL} (1024x1024 default + dynamic aspect ratios)`);
   console.log(`🎙️ Voice Pipeline:   ${GEMINI_STT_MODEL} (STT) -> ${DEFAULT_MODEL} [No-Reasoning Fast Mode] -> ${GEMINI_TTS_MODEL} (TTS)`);
   console.log(`====================================================`);
 });
