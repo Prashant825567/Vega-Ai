@@ -1719,12 +1719,12 @@ function sanitizePromptForNvidiaFlux3(rawPrompt = "") {
     p = p.replace(regex, replacement);
   }
 
-  // 3. Translate common Hinglish/Hindi words & strip leftover Hinglish grammar particles
+  // 3. Translate common Hinglish/Hindi words & strip leftover Hinglish grammar particles (used only for fallback when LLM is unreachable)
   p = p
     .replace(/\b(beautifull|beutiful|beatiful|sundar|khubsurat|khoobsurat|pyari|pyaari)\b/gi, "gorgeous")
     .replace(/\b(ladki|udi|kudi)\b/gi, "young Indian woman")
     .replace(/\b(ladka|munda)\b/gi, "handsome young Indian man")
-    .replace(/\b(dulhan)\b/gi, "radiant Indian bride in elegant pastel ethnic attire")
+    .replace(/\b(dulhan)\b/gi, "radiant Indian bride")
     .replace(/\b(aurat|mahila)\b/gi, "graceful Indian woman")
     .replace(/\b(aadmi|purush)\b/gi, "confident Indian man")
     .replace(/\b(baccha|bacha)\b/gi, "cheerful child")
@@ -1734,24 +1734,35 @@ function sanitizePromptForNvidiaFlux3(rawPrompt = "") {
     .replace(/\b(ghoda)\b/gi, "majestic galloping horse")
     .replace(/\b(pahaad|pahad)\b/gi, "majestic snow-capped mountains")
     .replace(/\b(barish|baarish)\b/gi, "cinematic gentle rain")
-    .replace(/\b(ek|ki|ka|ke|ko|se|par|pe|banao|karo|dikhao|nikalo|generate|create)\b/gi, " ");
+    .replace(/\b(ek|ki|ka|ke|ko|banao|karo|dikhao|nikalo)\b/gi, " ");
 
   p = p.replace(/\s+/g, " ").trim();
   if (p.length < 4) {
     p = "A sleek futuristic sports car on a neon-lit highway at sunset";
   }
 
-  // 4. Portrait Quality Enhancer: when the user asks for a girl/woman/boy/man/portrait,
-  //    inject 85mm f/1.4 portrait lighting + symmetrical facial features so flux-3-image-klein never produces distorted or overly-heavy jewelry faces!
-  if (/\b(girl|woman|lady|bride|female|boy|man|male|person|model|portrait|actress|actor)\b/i.test(p)) {
-    if (/\b(indian|desi)\b/i.test(p) && /\b(girl|woman|lady|female)\b/i.test(p)) {
-      p = `A stunning portrait of a ${p}, graceful natural smile, expressive warm dark brown eyes, symmetrical facial features, flawless natural glowing skin texture, long flowing dark wavy hair, wearing a stylish elegant pastel ethnic outfit with delicate earrings, soft golden hour sunlight, dreamy creamy bokeh background, shot on 85mm f/1.4 portrait lens, ultra-detailed 8k photorealistic photography`;
-    } else {
-      p = `A stunning portrait of ${p}, graceful natural expression, expressive eyes, symmetrical facial features, flawless natural glowing skin texture, soft golden hour rim lighting, dreamy creamy bokeh background, shot on 85mm f/1.4 portrait lens, ultra-detailed 8k photorealistic photography`;
-    }
-  }
-
   return p;
+}
+
+/**
+ * Replaces only trademarked brand names that trigger NVIDIA NIM's Cosmos `CONTENT_FILTERED` guardrail
+ * while keeping 100% of `mimo-v2.6-flash-free`'s enhanced English prompt intact.
+ */
+function debrandForNvidiaCosmos(englishPrompt = "") {
+  let p = String(englishPrompt || "").trim();
+  if (!p) return p;
+  return p
+    .replace(
+      /\b(lamborghini|lambo|aventador|huracan|urus|revuelto)\b/gi,
+      "Italian V12 wedge-shaped exotic supercar with scissor doors"
+    )
+    .replace(/\b(ferrari|laferrari|sf90)\b/gi, "glossy crimson Italian mid-engine racing supercar")
+    .replace(/\b(bugatti|chiron|veyron)\b/gi, "two-tone hypercar with horseshoe front grille")
+    .replace(/\b(porsche)\b/gi, "German rear-engine sports coupe with oval LED headlights")
+    .replace(/\b(iron\s*man|ironman)\b/gi, "red and gold titanium-armored cybernetic superhero")
+    .replace(/\b(spider[\s-]*man|spiderman)\b/gi, "red and blue web-patterned superhero")
+    .replace(/\b(batman)\b/gi, "dark armored vigilante hero in matte-black tactical bat-suit")
+    .replace(/\b(superman)\b/gi, "muscular superhero in royal blue suit and crimson cape");
 }
 
 /**
@@ -1760,46 +1771,39 @@ function sanitizePromptForNvidiaFlux3(rawPrompt = "") {
  */
 async function rewritePromptForNvidiaGuardrail(originalPrompt = "", model = DEFAULT_MODEL) {
   const sanitized = sanitizePromptForNvidiaFlux3(originalPrompt);
-  if (OPENCODE_API_KEY) {
-    try {
-      const rewriteTask = (async () => {
-        const msgs = [
-          {
-            role: "system",
-            content:
-              "/no_think You are an expert visual prompt rewriter. Rewrite the user's image prompt into a 100% safe, family-friendly, brand-free, trademark-free English visual scene description (35-55 words). Replace any car brands, product brands, celebrity names, or copyrighted characters with purely visual descriptions of their shape, colors, lighting, and environment. Do NOT output <IMAGE_TASK> tags or any brand names.",
-          },
-          {
-            role: "user",
-            content: `Rewrite this into a pure visual brand-free English image prompt: "${sanitized}"\n/no_think`,
-          },
-        ];
-        const up = await callOpenCodeUpstream({
-          model: model || DEFAULT_MODEL,
-          messages: msgs,
-          disableReasoning: true,
-        });
-        if (up.ok && up.response) {
-          const assembled = await collectSSEStream(up.response, up.model);
-          const cleaned = String(assembled.content || "")
-            .replace(/<IMAGE_TASK[^>]*>([\s\S]*?)<\/IMAGE_TASK>/gi, "$1")
-            .replace(/^["'`]+|["'`]+$/g, "")
-            .replace(/\s+/g, " ")
-            .trim();
-          if (cleaned.length >= 12) return cleaned;
-        }
-        return "";
-      })();
-
-      const rewritten = await Promise.race([
-        rewriteTask,
-        new Promise((resolve) => setTimeout(() => resolve(""), 3800)),
-      ]);
-      if (rewritten) {
-        return sanitizePromptForNvidiaFlux3(rewritten);
+  try {
+    const rewriteTask = (async () => {
+      const msgs = normalizeMessages(
+        {
+          message: `Rewrite this into a 100% brand-free, trademark-free 40-word English visual scene description (describe shapes, colors, and lighting without any brand names): "${sanitized}"`,
+        },
+        DEFAULT_SYSTEM_PROMPT
+      );
+      const up = await callOpenCodeUpstream({
+        model: model || DEFAULT_MODEL,
+        messages: msgs,
+        disableReasoning: true,
+      });
+      if (up.ok && up.response) {
+        const assembled = await collectSSEStream(up.response, up.model);
+        const cleaned = String(assembled.content || "")
+          .replace(/<IMAGE_TASK[^>]*>([\s\S]*?)<\/IMAGE_TASK>/gi, "$1")
+          .replace(/^["'`]+|["'`]+$/g, "")
+          .replace(/\s+/g, " ")
+          .trim();
+        if (cleaned.length >= 12) return cleaned;
       }
-    } catch {}
-  }
+      return "";
+    })();
+
+    const rewritten = await Promise.race([
+      rewriteTask,
+      new Promise((resolve) => setTimeout(() => resolve(""), 4500)),
+    ]);
+    if (rewritten) {
+      return sanitizePromptForNvidiaFlux3(rewritten);
+    }
+  } catch {}
   return `${sanitized}, cinematic lighting, ultra-detailed 8k photography, masterpiece`;
 }
 
@@ -1810,6 +1814,7 @@ async function runMaxImageAgent({
   model = DEFAULT_MODEL,
   onStatus = null,
   preCraftedPrompt = "",
+  preThinking = "",
   preStatusMessage = "",
   preFinalReply = "",
   options = {},
@@ -1823,26 +1828,57 @@ async function runMaxImageAgent({
     (isEdit
       ? "Ruko bhai, aapki photo ko dekh kar aapke hisaab se edit kar raha hoon... ✨"
       : "Ek second bhai, aapke liye shandaar image taiyar kar raha hoon... 🎨");
-  let maxPrompt = String(preCraftedPrompt || userText || "").trim();
+  let maxPrompt = String(preCraftedPrompt || "").trim();
+  let mimoThinking = String(preThinking || "").trim();
   let finalReply =
     preFinalReply ||
     (isEdit
       ? "Yeh lijiye bhai, aapki edited image bilkul taiyar hai! ✨"
       : "Yeh lijiye bhai, aapki image ban kar taiyar hai! 🎨");
 
-  // Step 1: Ultra-fast Vision Inspection for Image Edits (mimo-v2.6-flash-free inspects the uploaded image & writes the 1-sentence English edit instruction for Cloudflare Worker @cf/black-forest-labs/flux-2-klein-9b)
-  if (!isEdit) {
-    const cleanVisualSubject = sanitizePromptForNvidiaFlux3(maxPrompt || userText);
-    maxPrompt = /photorealistic|8k|cinematic lighting/i.test(cleanVisualSubject)
-      ? cleanVisualSubject
-      : `${cleanVisualSubject}, photorealistic, 8k, ultra-detailed, vivid cinematic lighting, sharp focus`;
-  } else if (!preCraftedPrompt) {
-    let visionDesc = "";
-    if (OPENCODE_API_KEY) {
-      const visionTask = (async () => {
+  // Step 1: `mimo-v2.6-flash-free` ALWAYS understands the user's requirement first,
+  // records its live `thinking` (`mimoThinking`), and writes an enhanced, detailed English prompt (`maxPrompt`)!
+  if (!maxPrompt) {
+    const promptCraftTask = (async () => {
+      if (!isEdit) {
+        // Image Generation: mimo-v2.6-flash-free understands user's Hindi/Hinglish/English request & writes an enhanced detailed English prompt
+        const craftMessages = normalizeMessages(
+          {
+            message: `Understand this user requirement: "${userText}". Write ONLY 1 enhanced, detailed 45-65 word English visual scene description for an 8k photorealistic image (include natural appearance, lighting, camera lens, and background; describe any brands visually without trademark names).`,
+          },
+          DEFAULT_SYSTEM_PROMPT
+        );
+        const up = await callOpenCodeUpstream({
+          model: model || DEFAULT_MODEL,
+          messages: craftMessages,
+          disableReasoning: true,
+        });
+        if (up.ok && up.response) {
+          const assembled = await collectSSEStream(up.response, up.model);
+          if (assembled.reasoning && assembled.reasoning.trim()) {
+            mimoThinking = assembled.reasoning.trim();
+          }
+          const tagParsed = parseModelImageFallback(assembled.content, userText, false);
+          if (tagParsed && tagParsed.maxPrompt) {
+            maxPrompt = debrandForNvidiaCosmos(tagParsed.maxPrompt);
+            if (tagParsed.statusMessage && !preStatusMessage) statusMessage = tagParsed.statusMessage;
+            if (tagParsed.finalReply && !preFinalReply) finalReply = tagParsed.finalReply;
+          } else {
+            const cleaned = String(assembled.content || "")
+              .replace(/<IMAGE_TASK[^>]*>([\s\S]*?)<\/IMAGE_TASK>/gi, "$1")
+              .replace(/^["'`]+|["'`]+$/g, "")
+              .replace(/\s+/g, " ")
+              .trim();
+            if (cleaned.length >= 12) {
+              maxPrompt = debrandForNvidiaCosmos(cleaned);
+            }
+          }
+        }
+      } else {
+        // Image Editing: mimo-v2.6-flash-free inspects the uploaded image + user requirement & writes an enhanced English edit prompt
         const visionMessages = normalizeMessages(
           {
-            message: `Look at this image and write ONLY 1 clear English image-edit instruction sentence for this user request: "${userText}". Output only the instruction sentence.`,
+            message: `Look at this image and write ONLY 1 detailed English image-edit instruction sentence for this user requirement: "${userText}". Output only the instruction sentence.`,
             image: imageInput.dataUri,
             mimeType: imageInput.mimeType,
           },
@@ -1855,39 +1891,55 @@ async function runMaxImageAgent({
         });
         if (up.ok && up.response) {
           const assembled = await collectSSEStream(up.response, up.model);
+          if (assembled.reasoning && assembled.reasoning.trim()) {
+            mimoThinking = assembled.reasoning.trim();
+          }
           const cleaned = String(assembled.content || "")
             .replace(/<IMAGE_TASK[^>]*>([\s\S]*?)<\/IMAGE_TASK>/gi, "$1")
             .replace(/^["'`]+|["'`]+$/g, "")
             .replace(/\s+/g, " ")
             .trim();
           if (cleaned.length >= 8) {
-            visionDesc = cleaned;
+            maxPrompt = cleaned;
           } else if (assembled.reasoning && assembled.reasoning.trim().length >= 15) {
-            visionDesc = assembled.reasoning.replace(/\s+/g, " ").trim().slice(0, 220);
+            maxPrompt = assembled.reasoning.replace(/\s+/g, " ").trim().slice(0, 240);
           }
         }
-      })();
+      }
+    })();
 
-      try {
-        await Promise.race([
-          visionTask,
-          new Promise((resolve) => setTimeout(resolve, 6200)),
-        ]);
-      } catch {}
-    }
+    try {
+      await Promise.race([
+        promptCraftTask,
+        new Promise((resolve) => setTimeout(resolve, 6800)),
+      ]);
+    } catch {}
 
-    if (visionDesc) {
-      maxPrompt = visionDesc;
-    } else {
-      maxPrompt = `Edit this image as requested: ${userText}, keeping the subject's identity and composition intact, photorealistic, high detail`;
+    // Fallback if upstream LLM timed out
+    if (!maxPrompt) {
+      if (!isEdit) {
+        const cleanVisualSubject = sanitizePromptForNvidiaFlux3(userText);
+        maxPrompt = `${cleanVisualSubject}, photorealistic, 8k, ultra-detailed, vivid cinematic lighting, sharp focus`;
+      } else {
+        maxPrompt = `Edit this image as requested: ${userText}, keeping the subject's identity and composition intact, photorealistic, high detail`;
+      }
     }
+  } else if (!isEdit) {
+    maxPrompt = debrandForNvidiaCosmos(maxPrompt);
   }
+
+  // Ensure `mimoThinking` always includes both mimo-v2.6-flash-free's thought process AND the enhanced English prompt it wrote
+  const fullThinking = mimoThinking
+    ? `${mimoThinking}\n\nEnhanced English Prompt (${isEdit ? "Edit" : "Generate"}): "${maxPrompt}"`
+    : `Understanding user requirement ("${userText}") and crafting an enhanced detailed English prompt for ${
+        isEdit ? CLOUDFLARE_EDIT_MODEL : NVIDIA_IMAGE_MODEL
+      }.\n\nEnhanced English Prompt: "${maxPrompt}"`;
 
   const outWidth = isEdit ? Number(options.width) || 1024 : width;
   const outHeight = isEdit ? Number(options.height) || 1024 : height;
   const outAspectRatio = isEdit && !options.width && !options.height ? "1:1" : aspectRatio;
 
-  // Notify caller/stream immediately so the app knows an image is being edited/generated and prepares its image UI slot!
+  // Notify caller/stream immediately so the app displays mimo-v2.6-flash-free's live thinking + enhanced prompt while the image is being generated/edited!
   if (typeof onStatus === "function") {
     try {
       await onStatus({
@@ -1901,7 +1953,10 @@ async function runMaxImageAgent({
         height: outHeight,
         aspectRatio: outAspectRatio,
         statusMessage,
+        userPrompt: userText,
         maxPrompt,
+        thinking: fullThinking,
+        reasoning: fullThinking,
       });
     } catch {}
   }
@@ -2088,7 +2143,10 @@ async function runMaxImageAgent({
     height: outHeight,
     aspectRatio: outAspectRatio,
     statusMessage,
+    userPrompt: userText,
     maxPrompt,
+    thinking: fullThinking,
+    reasoning: fullThinking,
     finalReply,
     imageId,
     hostedUrl,
@@ -4289,6 +4347,14 @@ const server = http.createServer(async (req, res) => {
         options: body,
         onStatus: (statusPayload) => {
           if (wantsStream) {
+            if (statusPayload.thinking) {
+              sendSSEEvent(res, "thinking", {
+                type: "thinking",
+                thinking: statusPayload.thinking,
+                reasoning: statusPayload.thinking,
+                maxPrompt: statusPayload.maxPrompt,
+              });
+            }
             sendSSEEvent(res, "image_status", statusPayload);
           }
         },
@@ -4310,7 +4376,10 @@ const server = http.createServer(async (req, res) => {
         height: imgResult.height,
         aspectRatio: imgResult.aspectRatio,
         statusMessage: imgResult.statusMessage,
+        userPrompt: imgResult.userPrompt,
         maxPrompt: imgResult.maxPrompt,
+        thinking: imgResult.thinking,
+        reasoning: imgResult.reasoning,
         reply: imgResult.finalReply,
         image: imgResult.image,
         imageUrl: imgResult.hostedUrl,
@@ -4379,16 +4448,25 @@ const server = http.createServer(async (req, res) => {
           options: body,
           onStatus: (statusPayload) => {
             if (wantsStream) {
+              // 0. Send live thinking event so app shows mimo-v2.6-flash-free's thinking & enhanced English prompt immediately
+              if (statusPayload.thinking) {
+                sendSSEEvent(res, "thinking", {
+                  type: "thinking",
+                  thinking: statusPayload.thinking,
+                  reasoning: statusPayload.thinking,
+                  maxPrompt: statusPayload.maxPrompt,
+                });
+              }
               // 1. Send dedicated SSE event so app immediately prepares its image slot
               sendSSEEvent(res, "image_status", statusPayload);
-              // 2. Also send a streaming chat delta from mimo-v2.6-flash-free so user sees status text immediately
+              // 2. Also send a streaming chat delta from mimo-v2.6-flash-free so user sees status text + thinking immediately
               res.write(
                 `data: ${JSON.stringify({
                   id: `chatcmpl-img-${Date.now()}`,
                   object: "chat.completion.chunk",
                   created: Math.floor(Date.now() / 1000),
                   model: DEFAULT_MODEL,
-                  imageModel: NVIDIA_IMAGE_MODEL,
+                  imageModel: statusPayload.imageModel || NVIDIA_IMAGE_MODEL,
                   isImageTask: true,
                   imageAction: statusPayload.imageAction,
                   imageStatus: "processing",
@@ -4397,13 +4475,23 @@ const server = http.createServer(async (req, res) => {
                   height: statusPayload.height,
                   aspectRatio: statusPayload.aspectRatio,
                   statusMessage: statusPayload.statusMessage,
+                  userPrompt: statusPayload.userPrompt,
                   maxPrompt: statusPayload.maxPrompt,
+                  thinking: statusPayload.thinking || null,
+                  reasoning: statusPayload.thinking || null,
                   choices: [
                     {
                       index: 0,
                       delta: {
                         role: "assistant",
                         content: `${statusPayload.statusMessage}\n\n`,
+                        ...(statusPayload.thinking
+                          ? {
+                              thinking: statusPayload.thinking,
+                              reasoning: statusPayload.thinking,
+                              reasoning_content: statusPayload.thinking,
+                            }
+                          : {}),
                       },
                       finish_reason: null,
                     },
@@ -4430,13 +4518,17 @@ const server = http.createServer(async (req, res) => {
           height: imgResult.height,
           aspectRatio: imgResult.aspectRatio,
           statusMessage: imgResult.statusMessage,
+          userPrompt: imgResult.userPrompt,
           maxPrompt: imgResult.maxPrompt,
           reply: imgResult.finalReply,
           image: imgResult.image,
           imageUrl: imgResult.hostedUrl,
           usedWebSearch: false,
           searchQueries: [],
-          reasoning: null,
+          webSearchSources: [],
+          webSearchResults: null,
+          thinking: imgResult.thinking,
+          reasoning: imgResult.reasoning,
           usage: null,
         };
 
@@ -4516,11 +4608,20 @@ const server = http.createServer(async (req, res) => {
           action: fallbackImgTask.action,
           model: body.model || DEFAULT_MODEL,
           preCraftedPrompt: fallbackImgTask.maxPrompt,
+          preThinking: assembled.reasoning || "",
           preStatusMessage: fallbackImgTask.statusMessage,
           preFinalReply: fallbackImgTask.finalReply,
           options: body,
           onStatus: (statusPayload) => {
             if (wantsStream) {
+              if (statusPayload.thinking) {
+                sendSSEEvent(res, "thinking", {
+                  type: "thinking",
+                  thinking: statusPayload.thinking,
+                  reasoning: statusPayload.thinking,
+                  maxPrompt: statusPayload.maxPrompt,
+                });
+              }
               sendSSEEvent(res, "image_status", statusPayload);
             }
           },
@@ -4539,6 +4640,7 @@ const server = http.createServer(async (req, res) => {
           height: imgResult.height,
           aspectRatio: imgResult.aspectRatio,
           statusMessage: fallbackImgTask.statusMessage || imgResult.statusMessage,
+          userPrompt: imgResult.userPrompt,
           maxPrompt: imgResult.maxPrompt,
           reply: fallbackImgTask.finalReply || imgResult.finalReply,
           image: imgResult.image,
@@ -4547,8 +4649,8 @@ const server = http.createServer(async (req, res) => {
           searchQueries: [],
           webSearchSources: [],
           webSearchResults: null,
-          thinking: assembled.reasoning || null,
-          reasoning: assembled.reasoning || null,
+          thinking: imgResult.thinking || assembled.reasoning || null,
+          reasoning: imgResult.reasoning || assembled.reasoning || null,
           usage: null,
         };
         if (wantsStream) {
@@ -4685,6 +4787,14 @@ const server = http.createServer(async (req, res) => {
           model: body.model || DEFAULT_MODEL,
           onStatus: (statusPayload) => {
             if (wantsStream) {
+              if (statusPayload.thinking) {
+                sendSSEEvent(res, "thinking", {
+                  type: "thinking",
+                  thinking: statusPayload.thinking,
+                  reasoning: statusPayload.thinking,
+                  maxPrompt: statusPayload.maxPrompt,
+                });
+              }
               sendSSEEvent(res, "image_status", statusPayload);
             }
           },
@@ -4702,7 +4812,10 @@ const server = http.createServer(async (req, res) => {
           imageStatus: "completed",
           readyForImage: true,
           statusMessage: imgResult.statusMessage,
+          userPrompt: imgResult.userPrompt,
           maxPrompt: imgResult.maxPrompt,
+          thinking: imgResult.thinking,
+          reasoning: imgResult.reasoning,
           reply: imgResult.finalReply,
           image: imgResult.image,
           imageUrl: imgResult.image.dataUri,
@@ -4712,6 +4825,9 @@ const server = http.createServer(async (req, res) => {
               message: {
                 role: "assistant",
                 content: imgResult.finalReply,
+                thinking: imgResult.thinking,
+                reasoning: imgResult.reasoning,
+                reasoning_content: imgResult.reasoning,
                 image: imgResult.image,
                 imageUrl: imgResult.image.dataUri,
               },
