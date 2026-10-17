@@ -335,16 +335,10 @@ function generateOpencodeRequestId() {
   return `msg_${hex12}${randomBase62(14)}`;
 }
 
-let cachedSessionId = generateOpencodeSessionId();
-let cachedSessionCreatedAt = Date.now();
-const SESSION_TTL_MS = 10 * 60 * 1000;
-
-function getSessionId(forceRefresh = false) {
-  if (forceRefresh || Date.now() - cachedSessionCreatedAt > SESSION_TTL_MS) {
-    cachedSessionId = generateOpencodeSessionId();
-    cachedSessionCreatedAt = Date.now();
-  }
-  return cachedSessionId;
+function getSessionId() {
+  // Always generate a fresh valid 48-bit timestamp session ID per upstream call
+  // so cancelled SSE streams never block or serialize subsequent concurrent/back-to-back calls.
+  return generateOpencodeSessionId();
 }
 
 // ─── Required OpenCode Gateway Tool Stubs ────────────────────────────────────
@@ -1045,7 +1039,7 @@ async function callOpenCodeUpstream(payload) {
   };
 }
 
-async function collectSSEStream(response, fallbackModel) {
+async function collectSSEStream(response, fallbackModel, callbacks = {}) {
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
@@ -1058,6 +1052,38 @@ async function collectSSEStream(response, fallbackModel) {
   let finishReason = "stop";
   let usage = null;
   const toolCallsMap = new Map();
+  const notifiedToolNames = new Set();
+
+  // For normal chat, guard against streaming raw `<IMAGE_TASK>` or `<think>` tags into message content
+  let pendingLeadingBuffer = "";
+  let leadingMode = callbacks.rawContentTokens ? "normal" : "undecided"; // "undecided" | "normal" | "image_tag" | "think_tag"
+
+  const emitThinking = (tokenText) => {
+    if (!tokenText || typeof callbacks.onThinkingToken !== "function") return;
+    try {
+      callbacks.onThinkingToken({
+        token: tokenText,
+        thinking: reasoning,
+        reasoning,
+        id,
+        created,
+        model,
+      });
+    } catch {}
+  };
+
+  const emitContent = (tokenText) => {
+    if (!tokenText || typeof callbacks.onContentToken !== "function") return;
+    try {
+      callbacks.onContentToken({
+        token: tokenText,
+        content,
+        id,
+        created,
+        model,
+      });
+    } catch {}
+  };
 
   let streamDone = false;
   while (!streamDone) {
@@ -1112,11 +1138,55 @@ async function collectSSEStream(response, fallbackModel) {
         const choice = chunk.choices?.[0];
         if (choice) {
           const delta = choice.delta || {};
-          if (typeof delta.content === "string") {
-            content += delta.content;
-          }
-          if (typeof delta.reasoning === "string") {
+          if (typeof delta.reasoning === "string" && delta.reasoning.length > 0) {
             reasoning += delta.reasoning;
+            emitThinking(delta.reasoning);
+          }
+          if (typeof delta.content === "string" && delta.content.length > 0) {
+            content += delta.content;
+            if (leadingMode === "normal") {
+              emitContent(delta.content);
+            } else if (leadingMode === "undecided") {
+              pendingLeadingBuffer += delta.content;
+              const trimmedLead = pendingLeadingBuffer.trimStart();
+              if (trimmedLead.length > 0 && !trimmedLead.startsWith("<")) {
+                leadingMode = "normal";
+                emitContent(pendingLeadingBuffer);
+                pendingLeadingBuffer = "";
+              } else if (trimmedLead.length >= 12) {
+                if (/^<IMAGE_TASK/i.test(trimmedLead)) {
+                  leadingMode = "image_tag";
+                  pendingLeadingBuffer = "";
+                } else if (/^<think>/i.test(trimmedLead)) {
+                  leadingMode = "think_tag";
+                  const inner = trimmedLead.replace(/^<think>/i, "");
+                  if (inner) {
+                    reasoning += inner;
+                    emitThinking(inner);
+                  }
+                  pendingLeadingBuffer = "";
+                } else {
+                  leadingMode = "normal";
+                  emitContent(pendingLeadingBuffer);
+                  pendingLeadingBuffer = "";
+                }
+              }
+            } else if (leadingMode === "think_tag") {
+              if (content.includes("</think>")) {
+                leadingMode = "normal";
+                const afterThink = delta.content.split(/<\/think>/i).pop() || "";
+                if (afterThink) emitContent(afterThink);
+              } else {
+                reasoning += delta.content;
+                emitThinking(delta.content);
+              }
+            } else if (leadingMode === "image_tag") {
+              // Route inner prompt tokens of <IMAGE_TASK> to thinking stream so user sees live progress
+              const cleanToken = delta.content.replace(/<\/?IMAGE_TASK[^>]*>/gi, "");
+              if (cleanToken) {
+                emitThinking(cleanToken);
+              }
+            }
           }
           if (Array.isArray(delta.tool_calls)) {
             for (const tc of delta.tool_calls) {
@@ -1134,6 +1204,21 @@ async function collectSSEStream(response, fallbackModel) {
               if (typeof tc.function?.arguments === "string") {
                 entry.function.arguments += tc.function.arguments;
               }
+              if (typeof callbacks.onToolCallDelta === "function") {
+                const isFirstName =
+                  Boolean(entry.function.name) && !notifiedToolNames.has(idx);
+                if (isFirstName) notifiedToolNames.add(idx);
+                try {
+                  callbacks.onToolCallDelta({
+                    toolCall: entry,
+                    rawDelta: tc,
+                    isToolStart: isFirstName,
+                    id,
+                    created,
+                    model,
+                  });
+                } catch {}
+              }
             }
           }
           if (choice.finish_reason) {
@@ -1149,6 +1234,11 @@ async function collectSSEStream(response, fallbackModel) {
         // Ignore keep-alive comments
       }
     }
+  }
+
+  if (leadingMode === "undecided" && pendingLeadingBuffer) {
+    emitContent(pendingLeadingBuffer);
+    pendingLeadingBuffer = "";
   }
 
   const toolCalls = Array.from(toolCallsMap.values()).filter((tc) => tc.function.name);
@@ -1782,10 +1872,13 @@ function debrandForNvidiaCosmos(englishPrompt = "") {
     .replace(/\b(spider[\s-]*man|spiderman)\b/gi, "red and blue web-patterned superhero")
     .replace(/\b(batman)\b/gi, "dark armored vigilante hero in matte-black tactical bat-suit")
     .replace(/\b(superman)\b/gi, "muscular superhero in royal blue suit and crimson cape")
-    // Also replace words that trigger false-positive CONTENT_FILTERED in NVIDIA Cosmos Guardrail on couple/waterfall scenes
+    // Also replace words that trigger false-positive CONTENT_FILTERED in NVIDIA Cosmos Guardrail on couple/waterfall/sunset scenes
     .replace(/\bwet\s+skin\b/gi, "warm glowing skin")
     .replace(/\bwet\s+(clothes|dress|shirt|hair|body)\b/gi, "flowing $1")
     .replace(/\b(drenched|soaked|clinging|sheer|translucent|see-through)\b/gi, "elegant")
+    .replace(/\b(swimsuits?|swimwear|bikinis?|bathing\s+suits?|shirtless|topless)\b/gi, "stylish summer travel outfit")
+    .replace(/\bembracing\s+in\s+the\s+water\b/gi, "standing together beside the water")
+    .replace(/\b(silhouetted|silhouette|backlit\s+by\s+a\s+molten)\b/gi, "warmly illuminated")
     .replace(/\b(intimately|sensually|passionately|seductively)\b/gi, "warmly")
     .replace(/\b(intimate|sensual|seductive|erotic)\b/gi, "romantic")
     .replace(/\b(barefoot|bare\s+feet|bare\s+skin|bare\s+shoulders)\b/gi, "graceful");
@@ -1796,35 +1889,40 @@ function debrandForNvidiaCosmos(englishPrompt = "") {
  * guardrail-safe visual English description using `mimo-v2.6-flash-free` (with instant local fallback).
  */
 async function rewritePromptForNvidiaGuardrail(originalPrompt = "", model = DEFAULT_MODEL) {
-  const sanitized = sanitizePromptForNvidiaFlux3(originalPrompt);
+  const sanitized = debrandForNvidiaCosmos(sanitizePromptForNvidiaFlux3(originalPrompt));
   try {
     const rewriteTask = (async () => {
-      const msgs = normalizeMessages(
+      const msgs = [
         {
-          message: `Rewrite this into a 100% brand-free, trademark-free 40-word English visual scene description (describe shapes, colors, and lighting without any brand names): "${sanitized}"`,
+          role: "system",
+          content:
+            "/no_think Do not use any tools. Output ONLY a 40-word brand-free, family-friendly English visual photography description.",
         },
-        DEFAULT_SYSTEM_PROMPT
-      );
+        {
+          role: "user",
+          content: `Rewrite into a 40-word English photography description: "${sanitized}"\n/no_think`,
+        },
+      ];
       const up = await callOpenCodeUpstream({
         model: model || DEFAULT_MODEL,
         messages: msgs,
         disableReasoning: true,
       });
       if (up.ok && up.response) {
-        const assembled = await collectSSEStream(up.response, up.model);
+        const assembled = await collectSSEStream(up.response, up.model, { rawContentTokens: true });
         const cleaned = String(assembled.content || "")
           .replace(/<IMAGE_TASK[^>]*>([\s\S]*?)<\/IMAGE_TASK>/gi, "$1")
           .replace(/^["'`]+|["'`]+$/g, "")
           .replace(/\s+/g, " ")
           .trim();
-        if (cleaned.length >= 12) return cleaned;
+        if (cleaned.length >= 12) return debrandForNvidiaCosmos(cleaned);
       }
       return "";
     })();
 
     const rewritten = await Promise.race([
       rewriteTask,
-      new Promise((resolve) => setTimeout(() => resolve(""), 4500)),
+      new Promise((resolve) => setTimeout(() => resolve(""), 5000)),
     ]);
     if (rewritten) {
       return sanitizePromptForNvidiaFlux3(rewritten);
@@ -1848,6 +1946,10 @@ async function runMaxImageAgent({
 }) {
   const isEdit = action === "edit" && Boolean(imageInput && imageInput.dataUri);
   const { width, height, aspectRatio } = resolveFlux3Dimensions(userText, options, imageInput);
+  const outWidth = isEdit ? Number(options.width) || 1024 : width;
+  const outHeight = isEdit ? Number(options.height) || 1024 : height;
+  const outAspectRatio = isEdit && !options.width && !options.height ? "1:1" : aspectRatio;
+  const activeImageModel = isEdit ? CLOUDFLARE_EDIT_MODEL : NVIDIA_IMAGE_MODEL;
 
   let statusMessage =
     preStatusMessage ||
@@ -1862,26 +1964,131 @@ async function runMaxImageAgent({
       ? "Yeh lijiye bhai, aapki edited image bilkul taiyar hai! ✨"
       : "Yeh lijiye bhai, aapki image ban kar taiyar hai! 🎨");
 
+  const formatThinkingAndPrompt = (thinkStr, promptStr) => {
+    const t = String(thinkStr || "").trim();
+    const p = String(promptStr || "").trim();
+    if (t && p) {
+      return `${t}\n\nEnhanced English Prompt (${isEdit ? "Edit" : "Generate"}): "${p}"`;
+    }
+    if (t) return t;
+    if (p) {
+      return `Understanding user requirement ("${userText}") and crafting an enhanced detailed English prompt for ${activeImageModel}.\n\nEnhanced English Prompt: "${p}"`;
+    }
+    return `Understanding user requirement ("${userText}")...`;
+  };
+
+  // Step 0: Immediately emit initial status at 0ms so the app opens the image card & thinking stream right away!
+  if (typeof onStatus === "function") {
+    try {
+      await onStatus({
+        type: "image_status",
+        phase: "starting",
+        isImageTask: true,
+        imageAction: isEdit ? "edit" : "generate",
+        imageModel: activeImageModel,
+        imageStatus: "crafting_prompt",
+        readyForImage: true,
+        width: outWidth,
+        height: outHeight,
+        aspectRatio: outAspectRatio,
+        statusMessage,
+        userPrompt: userText,
+        maxPrompt: maxPrompt || "",
+        thinking: mimoThinking || "",
+        reasoning: mimoThinking || "",
+      });
+    } catch {}
+  }
+
   // Step 1: `mimo-v2.6-flash-free` ALWAYS understands the user's requirement first,
-  // records its live `thinking` (`mimoThinking`), and writes an enhanced, detailed English prompt (`maxPrompt`)!
+  // streams every single token of its `thinking` (`delta.reasoning`) and `maxPrompt` (`delta.content`) LIVE,
+  // and then executes the image generator/editor with `maxPrompt`!
   if (!maxPrompt) {
     let craftTimedOut = false;
-    const strippedSubject = String(userText || "")
-      .replace(
-        /\b(ek|a|an|please|plz|bhai|yar|yaar|zara|jaldi|abhi|image|photo|picture|pic|tasveer|ko|ki|ka|ke|generate|create|make|draw|banao|bana do|bana de|banaiye|dikhao|de do|karo|kar do|kar de|karne|karni|karna|hai|hain|ho)\b/gi,
-        " "
-      )
-      .replace(/\s+/g, " ")
-      .trim() || userText;
+    let livePromptBuffer = "";
+    const strippedSubject =
+      String(userText || "")
+        .replace(
+          /\b(ek|a|an|please|plz|bhai|yar|yaar|zara|jaldi|abhi|image|photo|picture|pic|tasveer|ko|ki|ka|ke|generate|create|make|draw|banao|bana do|bana de|banaiye|dikhao|de do|karo|kar do|kar de|karne|karni|karna|hai|hain|ho)\b/gi,
+          " "
+        )
+        .replace(/\s+/g, " ")
+        .trim() || userText;
+
+    const streamTokenCallbacks = {
+      rawContentTokens: true,
+      onThinkingToken: ({ token, thinking }) => {
+        if (craftTimedOut) return;
+        mimoThinking = thinking;
+        if (typeof onStatus === "function") {
+          try {
+            onStatus({
+              type: "thinking_delta",
+              phase: "thinking",
+              isImageTask: true,
+              imageAction: isEdit ? "edit" : "generate",
+              imageModel: activeImageModel,
+              imageStatus: "crafting_prompt",
+              readyForImage: true,
+              width: outWidth,
+              height: outHeight,
+              aspectRatio: outAspectRatio,
+              statusMessage,
+              userPrompt: userText,
+              token,
+              thinkingDelta: token,
+              reasoningDelta: token,
+              maxPrompt: livePromptBuffer,
+              thinking: formatThinkingAndPrompt(mimoThinking, livePromptBuffer),
+              reasoning: formatThinkingAndPrompt(mimoThinking, livePromptBuffer),
+            });
+          } catch {}
+        }
+      },
+      onContentToken: ({ token, content }) => {
+        if (craftTimedOut) return;
+        const cleanTok = String(token || "").replace(/<\/?IMAGE_TASK[^>]*>/gi, "");
+        if (!cleanTok) return;
+        livePromptBuffer = String(content || "")
+          .replace(/<IMAGE_TASK[^>]*>([\s\S]*?)<\/IMAGE_TASK>/gi, "$1")
+          .replace(/<\/?IMAGE_TASK[^>]*>/gi, "")
+          .replace(/^["'`]+|["'`]+$/g, "")
+          .trim();
+        if (typeof onStatus === "function") {
+          try {
+            onStatus({
+              type: "prompt_delta",
+              phase: "crafting_prompt",
+              isImageTask: true,
+              imageAction: isEdit ? "edit" : "generate",
+              imageModel: activeImageModel,
+              imageStatus: "crafting_prompt",
+              readyForImage: true,
+              width: outWidth,
+              height: outHeight,
+              aspectRatio: outAspectRatio,
+              statusMessage,
+              userPrompt: userText,
+              token: cleanTok,
+              promptDelta: cleanTok,
+              thinkingDelta: cleanTok,
+              reasoningDelta: cleanTok,
+              maxPrompt: livePromptBuffer,
+              thinking: formatThinkingAndPrompt(mimoThinking, livePromptBuffer),
+              reasoning: formatThinkingAndPrompt(mimoThinking, livePromptBuffer),
+            });
+          } catch {}
+        }
+      },
+    };
 
     const promptCraftTask = (async () => {
       if (!isEdit) {
-        // Image Generation: mimo-v2.6-flash-free understands user's Hindi/Hinglish/English requirement & writes an enhanced detailed English prompt
         const craftMessages = [
           {
             role: "system",
             content:
-              "/no_think Do not use any tools. You are Max v1.0, an expert AI visual director. Understand the user's requirement and output ONLY 1 enhanced, detailed 45-60 word English image prompt for an 8k photorealistic masterpiece (enhance lighting, composition, camera lens, and rich visual details based strictly on the user's requirement; describe any car/character brands visually without trademark names; avoid words like drenched or wet skin).",
+              "/no_think Do not use any tools. You are Max v1.0, an expert AI visual director. Understand the user's requirement and output ONLY 1 enhanced, detailed 45-60 word English image prompt for an 8k photorealistic masterpiece (enhance lighting, composition, camera lens, and rich visual details based strictly on the user's requirement; describe any car/character brands visually without trademark names; avoid words like drenched, swimsuit, or wet skin).",
           },
           {
             role: "user",
@@ -1894,7 +2101,7 @@ async function runMaxImageAgent({
           disableReasoning: true,
         });
         if (up.ok && up.response && !craftTimedOut) {
-          const assembled = await collectSSEStream(up.response, up.model);
+          const assembled = await collectSSEStream(up.response, up.model, streamTokenCallbacks);
           if (craftTimedOut) return;
           if (assembled.reasoning && assembled.reasoning.trim()) {
             mimoThinking = assembled.reasoning.trim();
@@ -1916,7 +2123,6 @@ async function runMaxImageAgent({
           }
         }
       } else {
-        // Image Editing: mimo-v2.6-flash-free inspects the uploaded image + user requirement & writes an enhanced English edit prompt
         const visionMessages = [
           {
             role: "system",
@@ -1943,7 +2149,7 @@ async function runMaxImageAgent({
           disableReasoning: true,
         });
         if (up.ok && up.response && !craftTimedOut) {
-          const assembled = await collectSSEStream(up.response, up.model);
+          const assembled = await collectSSEStream(up.response, up.model, streamTokenCallbacks);
           if (craftTimedOut) return;
           if (assembled.reasoning && assembled.reasoning.trim()) {
             mimoThinking = assembled.reasoning.trim();
@@ -1987,27 +2193,20 @@ async function runMaxImageAgent({
     maxPrompt = debrandForNvidiaCosmos(maxPrompt);
   }
 
-  const buildThinkingSummary = () =>
-    mimoThinking
-      ? `${mimoThinking}\n\nEnhanced English Prompt (${isEdit ? "Edit" : "Generate"}): "${maxPrompt}"`
-      : `Understanding user requirement ("${userText}") and crafting an enhanced detailed English prompt for ${
-          isEdit ? CLOUDFLARE_EDIT_MODEL : NVIDIA_IMAGE_MODEL
-        }.\n\nEnhanced English Prompt: "${maxPrompt}"`;
-
+  const buildThinkingSummary = () => formatThinkingAndPrompt(mimoThinking, maxPrompt);
   const fullThinking = buildThinkingSummary();
 
-  const outWidth = isEdit ? Number(options.width) || 1024 : width;
-  const outHeight = isEdit ? Number(options.height) || 1024 : height;
-  const outAspectRatio = isEdit && !options.width && !options.height ? "1:1" : aspectRatio;
-
-  // Notify caller/stream immediately so the app displays mimo-v2.6-flash-free's live thinking + enhanced prompt while the image is being generated/edited!
+  // Step 2: Notify caller/stream that `mimo-v2.6-flash-free` finished writing `maxPrompt` and is now executing the Image Tool!
   if (typeof onStatus === "function") {
     try {
       await onStatus({
-        type: "image_status",
+        type: "tool_execution",
+        phase: isEdit ? "editing_image" : "generating_image",
+        tool: isEdit ? CLOUDFLARE_EDIT_MODEL : NVIDIA_IMAGE_MODEL,
+        toolStatus: "running",
         isImageTask: true,
         imageAction: isEdit ? "edit" : "generate",
-        imageModel: isEdit ? CLOUDFLARE_EDIT_MODEL : NVIDIA_IMAGE_MODEL,
+        imageModel: activeImageModel,
         imageStatus: "processing",
         readyForImage: true,
         width: outWidth,
@@ -2136,9 +2335,10 @@ async function runMaxImageAgent({
               imgBuffer = Buffer.from(b64, "base64");
             } else if (finishReason === "CONTENT_FILTERED") {
               lastNvidiaErr = `NVIDIA NIM CONTENT_FILTERED on attempt ${attempt + 1}`;
+              nvidiaPayload.seed = (Number(nvidiaPayload.seed) || 0) + 7;
               // Automatically rewrite the prompt to remove any trademark/brand/sensitive words that triggered Cosmos guardrail
               if (attempt === 0) {
-                const rewritten = await rewritePromptForNvidiaGuardrail(userText || maxPrompt, model);
+                const rewritten = await rewritePromptForNvidiaGuardrail(maxPrompt || userText, model);
                 maxPrompt = rewritten;
                 nvidiaPayload.prompt = rewritten.slice(0, 1950);
                 continue;
@@ -2269,13 +2469,21 @@ function extractWebSearchSources(rawText = "") {
  * web search pre-fetching whenever a query needs live web research.
  * Captures and returns both `thinking` (`reasoning`) and full `webSearchSources` / `webSearchResults`.
  */
-async function runOpenCodeAgentWithTools(payload, onWebSearchStart = null) {
+async function runOpenCodeAgentWithTools(payload, streamOptions = null) {
+  const callbacks =
+    typeof streamOptions === "function"
+      ? { onWebSearchStart: streamOptions }
+      : streamOptions && typeof streamOptions === "object"
+      ? streamOptions
+      : {};
+
   const workingMessages = Array.isArray(payload.messages) ? [...payload.messages] : [];
   let usedWebSearch = false;
   const searchQueries = [];
   const searchResultChunks = [];
   let webSearchSources = [];
   const reasoningSteps = [];
+  let accumulatedContent = "";
   let lastAssembled = null;
   const noThinkSuffix = payload.disableReasoning === true ? " /no_think" : "";
 
@@ -2292,9 +2500,21 @@ async function runOpenCodeAgentWithTools(payload, onWebSearchStart = null) {
     try {
       usedWebSearch = true;
       searchQueries.push(latestUserText);
-      if (typeof onWebSearchStart === "function") {
+      if (typeof callbacks.onWebSearchStart === "function") {
         try {
-          await onWebSearchStart([latestUserText]);
+          await callbacks.onWebSearchStart([latestUserText]);
+        } catch {}
+      }
+      if (typeof callbacks.onToolExecution === "function") {
+        try {
+          callbacks.onToolExecution({
+            type: "tool_execution",
+            tool: "websearch",
+            toolStatus: "running",
+            usedWebSearch: true,
+            searchQueries: [...searchQueries],
+            statusMessage: `Searching the web for "${latestUserText}"... 🔍`,
+          });
         } catch {}
       }
       const preSearchResults = await executeOpenCodeWebSearch({
@@ -2304,6 +2524,30 @@ async function runOpenCodeAgentWithTools(payload, onWebSearchStart = null) {
       if (preSearchResults && !preSearchResults.startsWith("No search results")) {
         searchResultChunks.push(preSearchResults);
         webSearchSources = extractWebSearchSources(preSearchResults);
+        if (typeof callbacks.onWebSearchDone === "function") {
+          try {
+            callbacks.onWebSearchDone({
+              usedWebSearch: true,
+              searchQueries: [...searchQueries],
+              webSearchSources,
+              webSearchResults: searchResultChunks.join("\n\n") || null,
+            });
+          } catch {}
+        }
+        if (typeof callbacks.onToolExecution === "function") {
+          try {
+            callbacks.onToolExecution({
+              type: "websearch",
+              tool: "websearch",
+              toolStatus: "completed",
+              usedWebSearch: true,
+              searchQueries: [...searchQueries],
+              webSearchSources,
+              webSearchResults: searchResultChunks.join("\n\n") || null,
+              statusMessage: `Found ${webSearchSources.length} live web sources ✅`,
+            });
+          } catch {}
+        }
         for (let i = workingMessages.length - 1; i >= 0; i--) {
           if (workingMessages[i] && workingMessages[i].role === "user") {
             const orig = workingMessages[i].content;
@@ -2342,7 +2586,54 @@ async function runOpenCodeAgentWithTools(payload, onWebSearchStart = null) {
       };
     }
 
-    const assembled = await collectSSEStream(upstream.response, upstream.model);
+    const assembled = await collectSSEStream(upstream.response, upstream.model, {
+      onThinkingToken: ({ token, thinking, id, created, model }) => {
+        if (typeof callbacks.onThinkingToken === "function") {
+          const fullReasoningSoFar = [...reasoningSteps, thinking].filter(Boolean).join("\n\n");
+          callbacks.onThinkingToken({
+            token,
+            thinking: fullReasoningSoFar,
+            reasoning: fullReasoningSoFar,
+            id,
+            created,
+            model,
+          });
+        }
+      },
+      onContentToken: ({ token, content, id, created, model }) => {
+        accumulatedContent += token;
+        if (typeof callbacks.onContentToken === "function") {
+          callbacks.onContentToken({
+            token,
+            content: accumulatedContent,
+            turnContent: content,
+            id,
+            created,
+            model,
+          });
+        }
+      },
+      onToolCallDelta: (tcEvt) => {
+        if (typeof callbacks.onToolCallDelta === "function") {
+          callbacks.onToolCallDelta(tcEvt);
+        }
+        if (
+          tcEvt.isToolStart &&
+          typeof callbacks.onToolExecution === "function" &&
+          (tcEvt.toolCall?.function?.name === "websearch" ||
+            tcEvt.toolCall?.function?.name === "webfetch")
+        ) {
+          callbacks.onToolExecution({
+            type: "tool_execution",
+            tool: tcEvt.toolCall.function.name,
+            toolStatus: "running",
+            usedWebSearch: true,
+            searchQueries: [...searchQueries],
+            statusMessage: `Running ${tcEvt.toolCall.function.name}... 🔍`,
+          });
+        }
+      },
+    });
     if (assembled.reasoning && assembled.reasoning.trim()) {
       reasoningSteps.push(assembled.reasoning.trim());
     }
@@ -2408,9 +2699,21 @@ async function runOpenCodeAgentWithTools(payload, onWebSearchStart = null) {
       } catch {}
     }
 
-    if (typeof onWebSearchStart === "function") {
+    if (typeof callbacks.onWebSearchStart === "function") {
       try {
-        await onWebSearchStart(turnQueries);
+        await callbacks.onWebSearchStart(turnQueries);
+      } catch {}
+    }
+    if (typeof callbacks.onToolExecution === "function") {
+      try {
+        callbacks.onToolExecution({
+          type: "tool_execution",
+          tool: "websearch",
+          toolStatus: "running",
+          usedWebSearch: true,
+          searchQueries: [...searchQueries],
+          statusMessage: `Searching the web for "${turnQueries.join(", ") || latestUserText}"... 🔍`,
+        });
       } catch {}
     }
 
@@ -2437,6 +2740,20 @@ async function runOpenCodeAgentWithTools(payload, onWebSearchStart = null) {
             if (parsedSources.length > 0) {
               webSearchSources = [...webSearchSources, ...parsedSources];
             }
+          }
+          if (typeof callbacks.onToolExecution === "function") {
+            try {
+              callbacks.onToolExecution({
+                type: "websearch",
+                tool: "websearch",
+                toolStatus: "completed",
+                usedWebSearch: true,
+                searchQueries: [...searchQueries],
+                webSearchSources,
+                webSearchResults: searchResultChunks.join("\n\n") || null,
+                statusMessage: `Found ${webSearchSources.length} live web sources ✅`,
+              });
+            } catch {}
           }
           return {
             tool_call_id: tc.id,
@@ -3736,6 +4053,262 @@ function sendSSEEvent(res, eventName, dataObj) {
   res.write(`event: ${eventName}\ndata: ${JSON.stringify(dataObj)}\n\n`);
 }
 
+function isStreamRequest(req, body = {}, url = null) {
+  if (body && (body.stream === true || body.stream === "true" || body.streaming === true)) {
+    return true;
+  }
+  if (
+    url &&
+    (url.searchParams.get("stream") === "true" || url.searchParams.get("stream") === "1")
+  ) {
+    return true;
+  }
+  const accept = String((req && req.headers && req.headers["accept"]) || "").toLowerCase();
+  if (accept.includes("text/event-stream")) {
+    return true;
+  }
+  return false;
+}
+
+function initSSEStream(res) {
+  if (!res.headersSent) {
+    setCorsHeaders(res);
+    res.writeHead(200, {
+      "Content-Type": "text/event-stream; charset=utf-8",
+      "Cache-Control": "no-cache, no-transform",
+      Connection: "keep-alive",
+      "X-Accel-Buffering": "no",
+    });
+    if (typeof res.flushHeaders === "function") {
+      try {
+        res.flushHeaders();
+      } catch {}
+    }
+  }
+}
+
+function createLiveStreamEmitter(res, defaultModel = DEFAULT_MODEL) {
+  initSSEStream(res);
+  const streamId = `chatcmpl-${Date.now()}`;
+  const streamCreated = Math.floor(Date.now() / 1000);
+  let sentRole = false;
+  let contentTokensEmitted = 0;
+  let thinkingTokensEmitted = 0;
+
+  return {
+    get contentTokensEmitted() {
+      return contentTokensEmitted;
+    },
+    get thinkingTokensEmitted() {
+      return thinkingTokensEmitted;
+    },
+    onImageStatus(statusPayload) {
+      if (res.writableEnded) return;
+      const pType = statusPayload.type || "image_status";
+      if (pType === "thinking_delta" || pType === "prompt_delta") {
+        thinkingTokensEmitted++;
+        const tok = statusPayload.token || "";
+        const chunk = {
+          id: streamId,
+          object: "chat.completion.chunk",
+          created: streamCreated,
+          model: defaultModel,
+          ...statusPayload,
+          choices: [
+            {
+              index: 0,
+              delta: {
+                thinking: tok,
+                reasoning: tok,
+                reasoning_content: tok,
+                ...(pType === "prompt_delta" ? { maxPromptDelta: tok } : {}),
+              },
+              finish_reason: null,
+            },
+          ],
+        };
+        sendSSEEvent(res, "thinking", chunk);
+        return;
+      }
+
+      const evtName = pType === "tool_execution" ? "tool_call" : "image_status";
+      const isInitialStart = statusPayload.phase === "starting" && !sentRole;
+      if (isInitialStart) sentRole = true;
+      const chunk = {
+        id: streamId,
+        object: "chat.completion.chunk",
+        created: streamCreated,
+        model: defaultModel,
+        ...statusPayload,
+        choices: [
+          {
+            index: 0,
+            delta: {
+              ...(isInitialStart
+                ? {
+                    role: "assistant",
+                    content: statusPayload.statusMessage
+                      ? `${statusPayload.statusMessage}\n\n`
+                      : "",
+                  }
+                : {}),
+              ...(statusPayload.thinking && thinkingTokensEmitted === 0
+                ? {
+                    thinking: statusPayload.thinking,
+                    reasoning: statusPayload.thinking,
+                    reasoning_content: statusPayload.thinking,
+                  }
+                : {}),
+            },
+            finish_reason: null,
+          },
+        ],
+      };
+      sendSSEEvent(res, evtName, chunk);
+    },
+    onToolExecution(toolPayload) {
+      if (res.writableEnded) return;
+      const evtName = toolPayload.type === "websearch" ? "websearch" : "tool_call";
+      const chunk = {
+        id: streamId,
+        object: "chat.completion.chunk",
+        created: streamCreated,
+        model: defaultModel,
+        ...toolPayload,
+        choices: [
+          {
+            index: 0,
+            delta: {
+              tool_call: {
+                name: toolPayload.tool || "websearch",
+                status: toolPayload.toolStatus || "running",
+                queries: toolPayload.searchQueries || [],
+              },
+            },
+            finish_reason: null,
+          },
+        ],
+      };
+      sendSSEEvent(res, evtName, chunk);
+    },
+    onThinkingToken({ token, thinking, reasoning, id, created, model }) {
+      if (res.writableEnded || !token) return;
+      thinkingTokensEmitted++;
+      const chunk = {
+        id: id || streamId,
+        object: "chat.completion.chunk",
+        created: created || streamCreated,
+        model: model || defaultModel,
+        type: "thinking_delta",
+        token,
+        thinkingDelta: token,
+        reasoningDelta: token,
+        thinking,
+        reasoning,
+        choices: [
+          {
+            index: 0,
+            delta: {
+              thinking: token,
+              reasoning: token,
+              reasoning_content: token,
+            },
+            finish_reason: null,
+          },
+        ],
+      };
+      sendSSEEvent(res, "thinking", chunk);
+    },
+    onContentToken({ token, content, id, created, model }) {
+      if (res.writableEnded || !token) return;
+      contentTokensEmitted++;
+      const chunk = {
+        id: id || streamId,
+        object: "chat.completion.chunk",
+        created: created || streamCreated,
+        model: model || defaultModel,
+        type: "content_delta",
+        token,
+        delta: token,
+        replyDelta: token,
+        reply: content,
+        choices: [
+          {
+            index: 0,
+            delta: {
+              ...(sentRole ? {} : { role: "assistant" }),
+              content: token,
+            },
+            finish_reason: null,
+          },
+        ],
+      };
+      sentRole = true;
+      res.write(`data: ${JSON.stringify(chunk)}\n\n`);
+    },
+    finishImage(finalPayload) {
+      if (res.writableEnded) return;
+      sendSSEEvent(res, "image_ready", finalPayload);
+      res.write(
+        `data: ${JSON.stringify({
+          id: streamId,
+          object: "chat.completion.chunk",
+          created: streamCreated,
+          model: defaultModel,
+          ...finalPayload,
+          choices: [
+            {
+              index: 0,
+              delta: {
+                ...(sentRole ? {} : { role: "assistant" }),
+                content: finalPayload.reply || "",
+                image: finalPayload.image,
+                imageUrl: finalPayload.imageUrl || finalPayload.image?.url,
+              },
+              finish_reason: "stop",
+            },
+          ],
+        })}\n\n`
+      );
+      res.write("data: [DONE]\n\n");
+      res.end();
+    },
+    finishChat(finalPayload, assembled) {
+      if (res.writableEnded) return;
+      const chunkPayload = {
+        id: (assembled && assembled.id) || streamId,
+        object: "chat.completion.chunk",
+        created: (assembled && assembled.created) || streamCreated,
+        model: (assembled && assembled.model) || defaultModel,
+        ...finalPayload,
+        choices: [
+          {
+            index: 0,
+            delta:
+              contentTokensEmitted > 0
+                ? {}
+                : {
+                    role: "assistant",
+                    content: finalPayload.reply || (assembled && assembled.content) || "",
+                    ...(thinkingTokensEmitted === 0 && finalPayload.thinking
+                      ? {
+                          thinking: finalPayload.thinking,
+                          reasoning: finalPayload.thinking,
+                          reasoning_content: finalPayload.thinking,
+                        }
+                      : {}),
+                  },
+            finish_reason: (assembled && assembled.finishReason) || "stop",
+          },
+        ],
+      };
+      res.write(`data: ${JSON.stringify(chunkPayload)}\n\n`);
+      res.write("data: [DONE]\n\n");
+      res.end();
+    },
+  };
+}
+
 function readJsonBody(req, maxBytes = 25 * 1024 * 1024) {
   return new Promise((resolve, reject) => {
     let raw = "";
@@ -4393,15 +4966,10 @@ const server = http.createServer(async (req, res) => {
     }
 
     try {
-      const wantsStream = body.stream === true;
-      if (wantsStream) {
-        setCorsHeaders(res);
-        res.writeHead(200, {
-          "Content-Type": "text/event-stream; charset=utf-8",
-          "Cache-Control": "no-cache",
-          Connection: "keep-alive",
-        });
-      }
+      const wantsStream = isStreamRequest(req, body, url);
+      const liveStream = wantsStream
+        ? createLiveStreamEmitter(res, body.model || DEFAULT_MODEL)
+        : null;
 
       const imgResult = await runMaxImageAgent({
         userText: userText || "Enhance and beautify this image",
@@ -4410,16 +4978,8 @@ const server = http.createServer(async (req, res) => {
         model: body.model || DEFAULT_MODEL,
         options: body,
         onStatus: (statusPayload) => {
-          if (wantsStream) {
-            if (statusPayload.thinking) {
-              sendSSEEvent(res, "thinking", {
-                type: "thinking",
-                thinking: statusPayload.thinking,
-                reasoning: statusPayload.thinking,
-                maxPrompt: statusPayload.maxPrompt,
-              });
-            }
-            sendSSEEvent(res, "image_status", statusPayload);
+          if (liveStream) {
+            liveStream.onImageStatus(statusPayload);
           }
         },
       });
@@ -4449,14 +5009,20 @@ const server = http.createServer(async (req, res) => {
         imageUrl: imgResult.hostedUrl,
       };
 
-      if (wantsStream) {
-        sendSSEEvent(res, "image_ready", responsePayload);
-        res.write("data: [DONE]\n\n");
-        return res.end();
+      if (liveStream) {
+        liveStream.finishImage(responsePayload);
+        return;
       }
 
       return sendJson(res, 200, responsePayload);
     } catch (err) {
+      if (res.headersSent) {
+        sendSSEEvent(res, "error", {
+          success: false,
+          error: err.message || "Image generation/editing failed",
+        });
+        return res.end();
+      }
       return sendJson(res, 500, {
         success: false,
         error: err.message || "Image generation/editing failed",
@@ -4487,6 +5053,11 @@ const server = http.createServer(async (req, res) => {
       });
     }
 
+    const wantsStream = isStreamRequest(req, body, url);
+    const liveStream = wantsStream
+      ? createLiveStreamEmitter(res, body.model || DEFAULT_MODEL)
+      : null;
+
     try {
       // Check if the user is asking Max v1.0 to EDIT an uploaded image or GENERATE a new image
       const imageInput = extractLatestImageInput(body, messages);
@@ -4494,16 +5065,6 @@ const server = http.createServer(async (req, res) => {
       const imageTaskAction = detectImageTaskIntent(latestUserText, imageInput, body);
 
       if (imageTaskAction) {
-        const wantsStream = body.stream === true;
-        if (wantsStream) {
-          setCorsHeaders(res);
-          res.writeHead(200, {
-            "Content-Type": "text/event-stream; charset=utf-8",
-            "Cache-Control": "no-cache",
-            Connection: "keep-alive",
-          });
-        }
-
         const imgResult = await runMaxImageAgent({
           userText: latestUserText || "Edit and enhance this image",
           imageInput,
@@ -4511,57 +5072,8 @@ const server = http.createServer(async (req, res) => {
           model: body.model || DEFAULT_MODEL,
           options: body,
           onStatus: (statusPayload) => {
-            if (wantsStream) {
-              // 0. Send live thinking event so app shows mimo-v2.6-flash-free's thinking & enhanced English prompt immediately
-              if (statusPayload.thinking) {
-                sendSSEEvent(res, "thinking", {
-                  type: "thinking",
-                  thinking: statusPayload.thinking,
-                  reasoning: statusPayload.thinking,
-                  maxPrompt: statusPayload.maxPrompt,
-                });
-              }
-              // 1. Send dedicated SSE event so app immediately prepares its image slot
-              sendSSEEvent(res, "image_status", statusPayload);
-              // 2. Also send a streaming chat delta from mimo-v2.6-flash-free so user sees status text + thinking immediately
-              res.write(
-                `data: ${JSON.stringify({
-                  id: `chatcmpl-img-${Date.now()}`,
-                  object: "chat.completion.chunk",
-                  created: Math.floor(Date.now() / 1000),
-                  model: DEFAULT_MODEL,
-                  imageModel: statusPayload.imageModel || NVIDIA_IMAGE_MODEL,
-                  isImageTask: true,
-                  imageAction: statusPayload.imageAction,
-                  imageStatus: "processing",
-                  readyForImage: true,
-                  width: statusPayload.width,
-                  height: statusPayload.height,
-                  aspectRatio: statusPayload.aspectRatio,
-                  statusMessage: statusPayload.statusMessage,
-                  userPrompt: statusPayload.userPrompt,
-                  maxPrompt: statusPayload.maxPrompt,
-                  thinking: statusPayload.thinking || null,
-                  reasoning: statusPayload.thinking || null,
-                  choices: [
-                    {
-                      index: 0,
-                      delta: {
-                        role: "assistant",
-                        content: `${statusPayload.statusMessage}\n\n`,
-                        ...(statusPayload.thinking
-                          ? {
-                              thinking: statusPayload.thinking,
-                              reasoning: statusPayload.thinking,
-                              reasoning_content: statusPayload.thinking,
-                            }
-                          : {}),
-                      },
-                      finish_reason: null,
-                    },
-                  ],
-                })}\n\n`
-              );
+            if (liveStream) {
+              liveStream.onImageStatus(statusPayload);
             }
           },
         });
@@ -4596,30 +5108,9 @@ const server = http.createServer(async (req, res) => {
           usage: null,
         };
 
-        if (wantsStream) {
-          sendSSEEvent(res, "image_ready", finalPayload);
-          res.write(
-            `data: ${JSON.stringify({
-              id: `chatcmpl-img-${Date.now()}`,
-              object: "chat.completion.chunk",
-              created: Math.floor(Date.now() / 1000),
-              model: DEFAULT_MODEL,
-              ...finalPayload,
-              choices: [
-                {
-                  index: 0,
-                  delta: {
-                    content: imgResult.finalReply,
-                    image: imgResult.image,
-                    imageUrl: imgResult.image.dataUri,
-                  },
-                  finish_reason: "stop",
-                },
-              ],
-            })}\n\n`
-          );
-          res.write("data: [DONE]\n\n");
-          return res.end();
+        if (liveStream) {
+          liveStream.finishImage(finalPayload);
+          return;
         }
 
         return sendJson(res, 200, finalPayload);
@@ -4630,17 +5121,34 @@ const server = http.createServer(async (req, res) => {
       const allowWebSearch = body.webSearch !== false && body.allowWebSearch !== false;
       const forceWebSearch = body.webSearch === true || body.search === true;
 
-      const agentResult = await runOpenCodeAgentWithTools({
-        model: body.model || DEFAULT_MODEL,
-        messages,
-        temperature: body.temperature,
-        max_tokens: body.max_tokens,
-        disableReasoning,
-        allowWebSearch,
-        webSearch: forceWebSearch,
-      });
+      const agentResult = await runOpenCodeAgentWithTools(
+        {
+          model: body.model || DEFAULT_MODEL,
+          messages,
+          temperature: body.temperature,
+          max_tokens: body.max_tokens,
+          disableReasoning,
+          allowWebSearch,
+          webSearch: forceWebSearch,
+        },
+        liveStream
+          ? {
+              onToolExecution: (evt) => liveStream.onToolExecution(evt),
+              onThinkingToken: (evt) => liveStream.onThinkingToken(evt),
+              onContentToken: (evt) => liveStream.onContentToken(evt),
+            }
+          : null
+      );
 
       if (!agentResult.ok) {
+        if (res.headersSent) {
+          sendSSEEvent(res, "error", {
+            success: false,
+            error: "Upstream OpenCode API error",
+            details: agentResult.errorText,
+          });
+          return res.end();
+        }
         return sendJson(res, agentResult.status || 502, {
           success: false,
           error: "Upstream OpenCode API error",
@@ -4657,15 +5165,6 @@ const server = http.createServer(async (req, res) => {
         Boolean(imageInput && imageInput.isCurrentTurnImage)
       );
       if (fallbackImgTask) {
-        const wantsStream = body.stream === true;
-        if (wantsStream) {
-          setCorsHeaders(res);
-          res.writeHead(200, {
-            "Content-Type": "text/event-stream; charset=utf-8",
-            "Cache-Control": "no-cache",
-            Connection: "keep-alive",
-          });
-        }
         const imgResult = await runMaxImageAgent({
           userText: latestUserText,
           imageInput,
@@ -4677,16 +5176,8 @@ const server = http.createServer(async (req, res) => {
           preFinalReply: fallbackImgTask.finalReply,
           options: body,
           onStatus: (statusPayload) => {
-            if (wantsStream) {
-              if (statusPayload.thinking) {
-                sendSSEEvent(res, "thinking", {
-                  type: "thinking",
-                  thinking: statusPayload.thinking,
-                  reasoning: statusPayload.thinking,
-                  maxPrompt: statusPayload.maxPrompt,
-                });
-              }
-              sendSSEEvent(res, "image_status", statusPayload);
+            if (liveStream) {
+              liveStream.onImageStatus(statusPayload);
             }
           },
         });
@@ -4717,76 +5208,14 @@ const server = http.createServer(async (req, res) => {
           reasoning: imgResult.reasoning || assembled.reasoning || null,
           usage: null,
         };
-        if (wantsStream) {
-          sendSSEEvent(res, "image_ready", finalPayload);
-          res.write("data: [DONE]\n\n");
-          return res.end();
+        if (liveStream) {
+          liveStream.finishImage(finalPayload);
+          return;
         }
         return sendJson(res, 200, finalPayload);
       }
 
-      if (body.stream === true) {
-        setCorsHeaders(res);
-        res.writeHead(200, {
-          "Content-Type": "text/event-stream; charset=utf-8",
-          "Cache-Control": "no-cache",
-          Connection: "keep-alive",
-        });
-        if (agentResult.usedWebSearch) {
-          res.write(
-            `event: websearch\ndata: ${JSON.stringify({
-              type: "websearch",
-              usedWebSearch: true,
-              searchQueries: agentResult.searchQueries,
-              webSearchSources: agentResult.webSearchSources || [],
-              webSearchResults: agentResult.webSearchResults || null,
-            })}\n\n`
-          );
-        }
-        if (assembled.reasoning) {
-          res.write(
-            `event: thinking\ndata: ${JSON.stringify({
-              type: "thinking",
-              thinking: assembled.reasoning,
-              reasoning: assembled.reasoning,
-            })}\n\n`
-          );
-        }
-        const chunkPayload = {
-          id: assembled.id,
-          object: "chat.completion.chunk",
-          created: assembled.created,
-          model: assembled.model,
-          usedWebSearch: agentResult.usedWebSearch,
-          searchQueries: agentResult.searchQueries,
-          webSearchSources: agentResult.webSearchSources || [],
-          webSearchResults: agentResult.webSearchResults || null,
-          thinking: assembled.reasoning || null,
-          reasoning: assembled.reasoning || null,
-          choices: [
-            {
-              index: 0,
-              delta: {
-                role: "assistant",
-                content: assembled.content,
-                ...(assembled.reasoning
-                  ? {
-                      thinking: assembled.reasoning,
-                      reasoning: assembled.reasoning,
-                      reasoning_content: assembled.reasoning,
-                    }
-                  : {}),
-              },
-              finish_reason: "stop",
-            },
-          ],
-        };
-        res.write(`data: ${JSON.stringify(chunkPayload)}\n\n`);
-        res.write("data: [DONE]\n\n");
-        return res.end();
-      }
-
-      return sendJson(res, 200, {
+      const chatPayload = {
         success: true,
         ai: AI_NAME,
         app: APP_NAME,
@@ -4799,8 +5228,22 @@ const server = http.createServer(async (req, res) => {
         reasoning: assembled.reasoning || null,
         reply: assembled.content,
         usage: assembled.usage,
-      });
+      };
+
+      if (liveStream) {
+        liveStream.finishChat(chatPayload, assembled);
+        return;
+      }
+
+      return sendJson(res, 200, chatPayload);
     } catch (err) {
+      if (res.headersSent) {
+        sendSSEEvent(res, "error", {
+          success: false,
+          error: err.message || "Internal server error",
+        });
+        return res.end();
+      }
       return sendJson(res, 500, {
         success: false,
         error: err.message || "Internal server error",
@@ -4824,7 +5267,10 @@ const server = http.createServer(async (req, res) => {
     }
 
     const messages = normalizeMessages(body, DEFAULT_SYSTEM_PROMPT);
-    const wantsStream = body.stream === true;
+    const wantsStream = isStreamRequest(req, body, url);
+    const liveStream = wantsStream
+      ? createLiveStreamEmitter(res, body.model || DEFAULT_MODEL)
+      : null;
     const disableReasoning =
       body.deepThinking === true || body.noThink === false ? false : true;
     const allowWebSearch = body.webSearch !== false && body.allowWebSearch !== false;
@@ -4836,30 +5282,15 @@ const server = http.createServer(async (req, res) => {
       const imageTaskAction = detectImageTaskIntent(latestUserText, imageInput, body);
 
       if (imageTaskAction) {
-        if (wantsStream) {
-          setCorsHeaders(res);
-          res.writeHead(200, {
-            "Content-Type": "text/event-stream; charset=utf-8",
-            "Cache-Control": "no-cache",
-            Connection: "keep-alive",
-          });
-        }
         const imgResult = await runMaxImageAgent({
           userText: latestUserText || "Generate or edit image",
           imageInput,
           action: imageTaskAction,
           model: body.model || DEFAULT_MODEL,
+          options: body,
           onStatus: (statusPayload) => {
-            if (wantsStream) {
-              if (statusPayload.thinking) {
-                sendSSEEvent(res, "thinking", {
-                  type: "thinking",
-                  thinking: statusPayload.thinking,
-                  reasoning: statusPayload.thinking,
-                  maxPrompt: statusPayload.maxPrompt,
-                });
-              }
-              sendSSEEvent(res, "image_status", statusPayload);
+            if (liveStream) {
+              liveStream.onImageStatus(statusPayload);
             }
           },
         });
@@ -4871,10 +5302,14 @@ const server = http.createServer(async (req, res) => {
           success: true,
           ai: AI_NAME,
           app: APP_NAME,
+          imageModel: imgResult.imageModel,
           isImageTask: true,
           imageAction: imgResult.action,
           imageStatus: "completed",
           readyForImage: true,
+          width: imgResult.width,
+          height: imgResult.height,
+          aspectRatio: imgResult.aspectRatio,
           statusMessage: imgResult.statusMessage,
           userPrompt: imgResult.userPrompt,
           maxPrompt: imgResult.maxPrompt,
@@ -4882,7 +5317,7 @@ const server = http.createServer(async (req, res) => {
           reasoning: imgResult.reasoning,
           reply: imgResult.finalReply,
           image: imgResult.image,
-          imageUrl: imgResult.image.dataUri,
+          imageUrl: imgResult.hostedUrl,
           choices: [
             {
               index: 0,
@@ -4893,33 +5328,50 @@ const server = http.createServer(async (req, res) => {
                 reasoning: imgResult.reasoning,
                 reasoning_content: imgResult.reasoning,
                 image: imgResult.image,
-                imageUrl: imgResult.image.dataUri,
+                imageUrl: imgResult.hostedUrl,
               },
               finish_reason: "stop",
             },
           ],
         };
-        if (wantsStream) {
-          res.write(`data: ${JSON.stringify(finalPayload)}\n\n`);
-          res.write("data: [DONE]\n\n");
-          return res.end();
+        if (liveStream) {
+          liveStream.finishImage(finalPayload);
+          return;
         }
         return sendJson(res, 200, finalPayload);
       }
 
-      const agentResult = await runOpenCodeAgentWithTools({
-        model: body.model || DEFAULT_MODEL,
-        messages,
-        tools: body.tools,
-        tool_choice: body.tool_choice,
-        temperature: body.temperature,
-        max_tokens: body.max_tokens,
-        disableReasoning,
-        allowWebSearch,
-        webSearch: forceWebSearch,
-      });
+      const agentResult = await runOpenCodeAgentWithTools(
+        {
+          model: body.model || DEFAULT_MODEL,
+          messages,
+          tools: body.tools,
+          tool_choice: body.tool_choice,
+          temperature: body.temperature,
+          max_tokens: body.max_tokens,
+          disableReasoning,
+          allowWebSearch,
+          webSearch: forceWebSearch,
+        },
+        liveStream
+          ? {
+              onToolExecution: (evt) => liveStream.onToolExecution(evt),
+              onThinkingToken: (evt) => liveStream.onThinkingToken(evt),
+              onContentToken: (evt) => liveStream.onContentToken(evt),
+            }
+          : null
+      );
 
       if (!agentResult.ok) {
+        if (res.headersSent) {
+          sendSSEEvent(res, "error", {
+            error: {
+              message: agentResult.errorText,
+              type: "upstream_error",
+            },
+          });
+          return res.end();
+        }
         return sendJson(res, agentResult.status || 502, {
           error: {
             message: agentResult.errorText,
@@ -4942,8 +5394,15 @@ const server = http.createServer(async (req, res) => {
           action: fallbackImgTask.action,
           model: body.model || DEFAULT_MODEL,
           preCraftedPrompt: fallbackImgTask.maxPrompt,
+          preThinking: assembled.reasoning || "",
           preStatusMessage: fallbackImgTask.statusMessage,
           preFinalReply: fallbackImgTask.finalReply,
+          options: body,
+          onStatus: (statusPayload) => {
+            if (liveStream) {
+              liveStream.onImageStatus(statusPayload);
+            }
+          },
         });
         const finalPayload = {
           id: `chatcmpl-img-${Date.now()}`,
@@ -4953,101 +5412,58 @@ const server = http.createServer(async (req, res) => {
           success: true,
           ai: AI_NAME,
           app: APP_NAME,
+          imageModel: imgResult.imageModel,
           isImageTask: true,
           imageAction: imgResult.action,
           imageStatus: "completed",
           readyForImage: true,
+          width: imgResult.width,
+          height: imgResult.height,
+          aspectRatio: imgResult.aspectRatio,
           statusMessage: fallbackImgTask.statusMessage || imgResult.statusMessage,
+          userPrompt: imgResult.userPrompt,
           maxPrompt: imgResult.maxPrompt,
+          thinking: imgResult.thinking || assembled.reasoning || null,
+          reasoning: imgResult.reasoning || assembled.reasoning || null,
           reply: fallbackImgTask.finalReply || imgResult.finalReply,
           image: imgResult.image,
-          imageUrl: imgResult.image.dataUri,
+          imageUrl: imgResult.hostedUrl,
           choices: [
             {
               index: 0,
               message: {
                 role: "assistant",
                 content: fallbackImgTask.finalReply || imgResult.finalReply,
+                thinking: imgResult.thinking || assembled.reasoning || null,
+                reasoning: imgResult.reasoning || assembled.reasoning || null,
                 image: imgResult.image,
-                imageUrl: imgResult.image.dataUri,
+                imageUrl: imgResult.hostedUrl,
               },
               finish_reason: "stop",
             },
           ],
         };
-        if (wantsStream) {
-          setCorsHeaders(res);
-          res.writeHead(200, {
-            "Content-Type": "text/event-stream; charset=utf-8",
-            "Cache-Control": "no-cache",
-            Connection: "keep-alive",
-          });
-          res.write(`data: ${JSON.stringify(finalPayload)}\n\n`);
-          res.write("data: [DONE]\n\n");
-          return res.end();
+        if (liveStream) {
+          liveStream.finishImage(finalPayload);
+          return;
         }
         return sendJson(res, 200, finalPayload);
       }
 
-      if (wantsStream) {
-        setCorsHeaders(res);
-        res.writeHead(200, {
-          "Content-Type": "text/event-stream; charset=utf-8",
-          "Cache-Control": "no-cache",
-          Connection: "keep-alive",
-        });
-        if (agentResult.usedWebSearch) {
-          res.write(
-            `event: websearch\ndata: ${JSON.stringify({
-              type: "websearch",
-              usedWebSearch: true,
-              searchQueries: agentResult.searchQueries,
-              webSearchSources: agentResult.webSearchSources || [],
-              webSearchResults: agentResult.webSearchResults || null,
-            })}\n\n`
-          );
-        }
-        if (assembled.reasoning) {
-          res.write(
-            `event: thinking\ndata: ${JSON.stringify({
-              type: "thinking",
-              thinking: assembled.reasoning,
-              reasoning: assembled.reasoning,
-            })}\n\n`
-          );
-        }
-        const chunkPayload = {
-          id: assembled.id,
-          object: "chat.completion.chunk",
-          created: assembled.created,
-          model: assembled.model,
-          usedWebSearch: agentResult.usedWebSearch,
-          searchQueries: agentResult.searchQueries,
-          webSearchSources: agentResult.webSearchSources || [],
-          webSearchResults: agentResult.webSearchResults || null,
-          thinking: assembled.reasoning || null,
-          reasoning: assembled.reasoning || null,
-          choices: [
-            {
-              index: 0,
-              delta: {
-                role: "assistant",
-                content: assembled.content,
-                ...(assembled.reasoning
-                  ? {
-                      thinking: assembled.reasoning,
-                      reasoning: assembled.reasoning,
-                      reasoning_content: assembled.reasoning,
-                    }
-                  : {}),
-              },
-              finish_reason: "stop",
-            },
-          ],
-        };
-        res.write(`data: ${JSON.stringify(chunkPayload)}\n\n`);
-        res.write("data: [DONE]\n\n");
-        return res.end();
+      if (liveStream) {
+        liveStream.finishChat(
+          {
+            reply: assembled.content,
+            usedWebSearch: agentResult.usedWebSearch,
+            searchQueries: agentResult.searchQueries,
+            webSearchSources: agentResult.webSearchSources || [],
+            webSearchResults: agentResult.webSearchResults || null,
+            thinking: assembled.reasoning || null,
+            reasoning: assembled.reasoning || null,
+          },
+          assembled
+        );
+        return;
       }
 
       return sendJson(res, 200, {
