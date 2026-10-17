@@ -1546,9 +1546,9 @@ async function runMaxImageAgent({
     }
   }
 
-  const outWidth = width;
-  const outHeight = height;
-  const outAspectRatio = aspectRatio;
+  const outWidth = isEdit ? Number(options.width) || 1024 : width;
+  const outHeight = isEdit ? Number(options.height) || 1024 : height;
+  const outAspectRatio = isEdit && !options.width && !options.height ? "1:1" : aspectRatio;
 
   // Notify caller/stream immediately so the app knows an image is being edited/generated and prepares its image UI slot!
   if (typeof onStatus === "function") {
