@@ -1546,9 +1546,9 @@ async function runMaxImageAgent({
     }
   }
 
-  const outWidth = isEdit ? 512 : width;
-  const outHeight = isEdit ? 512 : height;
-  const outAspectRatio = isEdit ? "1:1" : aspectRatio;
+  const outWidth = width;
+  const outHeight = height;
+  const outAspectRatio = aspectRatio;
 
   // Notify caller/stream immediately so the app knows an image is being edited/generated and prepares its image UI slot!
   if (typeof onStatus === "function") {
@@ -1574,7 +1574,7 @@ async function runMaxImageAgent({
   const workerEndpoint = isEdit ? `${IMAGE_API_URL}/edit` : NVIDIA_IMAGE_API_URL;
 
   if (isEdit) {
-    // ── Image Editing (`action === "edit"`): Use Cloudflare Worker (`@cf/black-forest-labs/flux-2-klein-4b`) ──
+    // ── Image Editing (`action === "edit"`): Use Cloudflare Worker (`@cf/black-forest-labs/flux-2-klein-4b` / `9b` / `dev`) at full 1024x1024 (or matched aspect ratio) ──
     let normMime = String((imageInput && imageInput.mimeType) || "image/png").toLowerCase();
     if (normMime === "image/jpg") normMime = "image/jpeg";
     if (!["image/png", "image/jpeg", "image/webp"].includes(normMime)) {
@@ -1585,8 +1585,8 @@ async function runMaxImageAgent({
       mode: "edit",
       prompt: maxPrompt,
       image: workerImageField,
-      width: 512,
-      height: 512,
+      width: outWidth,
+      height: outHeight,
     };
 
     let lastWorkerErr = "";
