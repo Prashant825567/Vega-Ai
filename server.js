@@ -1719,10 +1719,38 @@ function sanitizePromptForNvidiaFlux3(rawPrompt = "") {
     p = p.replace(regex, replacement);
   }
 
+  // 3. Translate common Hinglish/Hindi words & strip leftover Hinglish grammar particles
+  p = p
+    .replace(/\b(beautifull|beutiful|beatiful|sundar|khubsurat|khoobsurat|pyari|pyaari)\b/gi, "gorgeous")
+    .replace(/\b(ladki|udi|kudi)\b/gi, "young Indian woman")
+    .replace(/\b(ladka|munda)\b/gi, "handsome young Indian man")
+    .replace(/\b(dulhan)\b/gi, "radiant Indian bride in elegant pastel ethnic attire")
+    .replace(/\b(aurat|mahila)\b/gi, "graceful Indian woman")
+    .replace(/\b(aadmi|purush)\b/gi, "confident Indian man")
+    .replace(/\b(baccha|bacha)\b/gi, "cheerful child")
+    .replace(/\b(sher|shair)\b/gi, "majestic lion")
+    .replace(/\b(billi)\b/gi, "cute fluffy cat")
+    .replace(/\b(kutta)\b/gi, "loyal golden retriever dog")
+    .replace(/\b(ghoda)\b/gi, "majestic galloping horse")
+    .replace(/\b(pahaad|pahad)\b/gi, "majestic snow-capped mountains")
+    .replace(/\b(barish|baarish)\b/gi, "cinematic gentle rain")
+    .replace(/\b(ek|ki|ka|ke|ko|se|par|pe|banao|karo|dikhao|nikalo|generate|create)\b/gi, " ");
+
   p = p.replace(/\s+/g, " ").trim();
   if (p.length < 4) {
     p = "A sleek futuristic sports car on a neon-lit highway at sunset";
   }
+
+  // 4. Portrait Quality Enhancer: when the user asks for a girl/woman/boy/man/portrait,
+  //    inject 85mm f/1.4 portrait lighting + symmetrical facial features so flux-3-image-klein never produces distorted or overly-heavy jewelry faces!
+  if (/\b(girl|woman|lady|bride|female|boy|man|male|person|model|portrait|actress|actor)\b/i.test(p)) {
+    if (/\b(indian|desi)\b/i.test(p) && /\b(girl|woman|lady|female)\b/i.test(p)) {
+      p = `A stunning portrait of a ${p}, graceful natural smile, expressive warm dark brown eyes, symmetrical facial features, flawless natural glowing skin texture, long flowing dark wavy hair, wearing a stylish elegant pastel ethnic outfit with delicate earrings, soft golden hour sunlight, dreamy creamy bokeh background, shot on 85mm f/1.4 portrait lens, ultra-detailed 8k photorealistic photography`;
+    } else {
+      p = `A stunning portrait of ${p}, graceful natural expression, expressive eyes, symmetrical facial features, flawless natural glowing skin texture, soft golden hour rim lighting, dreamy creamy bokeh background, shot on 85mm f/1.4 portrait lens, ultra-detailed 8k photorealistic photography`;
+    }
+  }
+
   return p;
 }
 
