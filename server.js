@@ -243,8 +243,9 @@ function getNvidiaApiKey() {
   return (process.env.NVIDIA_API_KEY || process.env.NVAPI_KEY || "").trim();
 }
 
-// 2) Image Editing Engine: Cloudflare Worker (`@cf/black-forest-labs/flux-2-klein-4b`)
-const CLOUDFLARE_EDIT_MODEL = "@cf/black-forest-labs/flux-2-klein-4b";
+// 2) Image Editing Engine: Cloudflare Worker (`@cf/black-forest-labs/flux-2-klein-9b`)
+const CLOUDFLARE_EDIT_MODEL =
+  process.env.CLOUDFLARE_EDIT_MODEL || "@cf/black-forest-labs/flux-2-klein-9b";
 const IMAGE_API_URL = (
   process.env.IMAGE_API_URL || "https://image-api.pr3095079.workers.dev"
 ).replace(/\/+$/, "");
@@ -1751,19 +1752,62 @@ async function runMaxImageAgent({
 }
 
 /**
+ * Parses formatted OpenCode websearch output into structured `{ title, url, snippet }[]` items
+ * so the frontend can display clickable web search sources & snippets alongside thinking.
+ */
+function extractWebSearchSources(rawText = "") {
+  const sources = [];
+  const text = String(rawText || "").trim();
+  if (!text || text.startsWith("No search results")) return sources;
+
+  // Format 1: Parallel MCP compact format: `- Title (date) [https://...]\n  snippet`
+  const blockRegex = /^-\s+(.+?)\s+\[(https?:\/\/[^\]]+)\]\s*\n\s*([\s\S]*?)(?=\n-\s+|\n*$)/gm;
+  let match;
+  while ((match = blockRegex.exec(text)) !== null) {
+    sources.push({
+      title: match[1].trim(),
+      url: match[2].trim(),
+      snippet: match[3].replace(/\s+/g, " ").trim(),
+    });
+  }
+  if (sources.length > 0) return sources;
+
+  // Format 2: Exa MCP format (`Title: ...\nURL: ...\nText: ...`)
+  const chunks = text.split(/\n(?=Title:\s)/i);
+  for (const ch of chunks) {
+    const tMatch = ch.match(/Title:\s*(.+)/i);
+    const uMatch = ch.match(/URL:\s*(https?:\/\/\S+)/i);
+    const sMatch = ch.match(/(?:Text|Highlights|Summary):\s*([\s\S]+)/i);
+    if (uMatch) {
+      sources.push({
+        title: tMatch ? tMatch[1].trim() : uMatch[1].trim(),
+        url: uMatch[1].trim(),
+        snippet: sMatch ? sMatch[1].replace(/\s+/g, " ").trim().slice(0, 320) : "",
+      });
+    }
+  }
+  return sources;
+}
+
+/**
  * Runs OpenCode `mimo-v2.6-flash-free` with automatic execution of OpenCode's
  * built-in `websearch` and `webfetch` tools (up to 3 turns) + proactive OpenCode
  * web search pre-fetching whenever a query needs live web research.
+ * Captures and returns both `thinking` (`reasoning`) and full `webSearchSources` / `webSearchResults`.
  */
 async function runOpenCodeAgentWithTools(payload, onWebSearchStart = null) {
   const workingMessages = Array.isArray(payload.messages) ? [...payload.messages] : [];
   let usedWebSearch = false;
   const searchQueries = [];
+  const searchResultChunks = [];
+  let webSearchSources = [];
+  const reasoningSteps = [];
   let lastAssembled = null;
+  const noThinkSuffix = payload.disableReasoning === true ? " /no_think" : "";
 
   // Proactive OpenCode Web Search: when the user's question asks for live/current info
   // or web research, pre-fetch OpenCode websearch (`search.parallel.ai/mcp` / `mcp.exa.ai/mcp`)
-  // so `mimo-v2.6-flash-free` has verified real-time web facts even when `/no_think` is active.
+  // so `mimo-v2.6-flash-free` has verified real-time web facts.
   const latestUserText = extractLatestUserText(workingMessages);
   const shouldPreSearch =
     payload.allowWebSearch !== false &&
@@ -1784,6 +1828,8 @@ async function runOpenCodeAgentWithTools(payload, onWebSearchStart = null) {
         numResults: 6,
       });
       if (preSearchResults && !preSearchResults.startsWith("No search results")) {
+        searchResultChunks.push(preSearchResults);
+        webSearchSources = extractWebSearchSources(preSearchResults);
         for (let i = workingMessages.length - 1; i >= 0; i--) {
           if (workingMessages[i] && workingMessages[i].role === "user") {
             const orig = workingMessages[i].content;
@@ -1794,7 +1840,7 @@ async function runOpenCodeAgentWithTools(payload, onWebSearchStart = null) {
                   `${orig}\n\n` +
                   `[Live OpenCode Web Search Results (Date: ${new Date().toISOString().slice(0, 10)})]:\n` +
                   `${String(preSearchResults).slice(0, 3200)}\n\n` +
-                  `IMPORTANT: The live OpenCode web search has ALREADY been executed above. Answer the user's question directly, accurately, and naturally using these live facts. Do NOT call the 'websearch' tool again. /no_think`,
+                  `IMPORTANT: The live OpenCode web search has ALREADY been executed above. Answer the user's question directly, accurately, and naturally using these live facts. Do NOT call the 'websearch' tool again.${noThinkSuffix}`,
               };
             }
             break;
@@ -1817,10 +1863,16 @@ async function runOpenCodeAgentWithTools(payload, onWebSearchStart = null) {
         errorText: upstream.errorText,
         usedWebSearch,
         searchQueries,
+        webSearchSources,
+        webSearchResults: searchResultChunks.join("\n\n") || null,
       };
     }
 
     const assembled = await collectSSEStream(upstream.response, upstream.model);
+    if (assembled.reasoning && assembled.reasoning.trim()) {
+      reasoningSteps.push(assembled.reasoning.trim());
+    }
+    assembled.reasoning = reasoningSteps.join("\n\n") || "";
     lastAssembled = assembled;
 
     // If model did not request any tool calls, or already produced final answer with no web tools, return!
@@ -1830,6 +1882,8 @@ async function runOpenCodeAgentWithTools(payload, onWebSearchStart = null) {
         assembled,
         usedWebSearch,
         searchQueries,
+        webSearchSources,
+        webSearchResults: searchResultChunks.join("\n\n") || null,
       };
     }
 
@@ -1847,6 +1901,8 @@ async function runOpenCodeAgentWithTools(payload, onWebSearchStart = null) {
           assembled,
           usedWebSearch,
           searchQueries,
+          webSearchSources,
+          webSearchResults: searchResultChunks.join("\n\n") || null,
         };
       }
       // Model attempted to call a placeholder/disabled tool; instruct it to reply in text directly
@@ -1901,11 +1957,18 @@ async function runOpenCodeAgentWithTools(payload, onWebSearchStart = null) {
 
         if (tc.function.name === "websearch") {
           const resultText = await executeOpenCodeWebSearch(args, upstream.sessionId);
+          if (resultText && !resultText.startsWith("No search results")) {
+            searchResultChunks.push(resultText);
+            const parsedSources = extractWebSearchSources(resultText);
+            if (parsedSources.length > 0) {
+              webSearchSources = [...webSearchSources, ...parsedSources];
+            }
+          }
           return {
             tool_call_id: tc.id,
             content:
               `${resultText}\n\n` +
-              `IMPORTANT: Live OpenCode web search results are provided above. Answer the user directly and completely using these facts without calling 'websearch' again. /no_think`,
+              `IMPORTANT: Live OpenCode web search results are provided above. Answer the user directly and completely using these facts without calling 'websearch' again.${noThinkSuffix}`,
           };
         }
         if (tc.function.name === "webfetch") {
@@ -1933,6 +1996,8 @@ async function runOpenCodeAgentWithTools(payload, onWebSearchStart = null) {
     assembled: lastAssembled,
     usedWebSearch,
     searchQueries,
+    webSearchSources,
+    webSearchResults: searchResultChunks.join("\n\n") || null,
   };
 }
 
@@ -4052,7 +4117,10 @@ const server = http.createServer(async (req, res) => {
         return sendJson(res, 200, finalPayload);
       }
 
-      const disableReasoning = body.reasoning === true ? false : true;
+      const disableReasoning =
+        body.reasoning === false || body.thinking === false || body.noThink === true
+          ? true
+          : false;
       const allowWebSearch = body.webSearch !== false && body.allowWebSearch !== false;
       const forceWebSearch = body.webSearch === true || body.search === true;
 
@@ -4127,7 +4195,10 @@ const server = http.createServer(async (req, res) => {
           imageUrl: imgResult.hostedUrl,
           usedWebSearch: false,
           searchQueries: [],
-          reasoning: null,
+          webSearchSources: [],
+          webSearchResults: null,
+          thinking: assembled.reasoning || null,
+          reasoning: assembled.reasoning || null,
           usage: null,
         };
         if (wantsStream) {
@@ -4151,6 +4222,17 @@ const server = http.createServer(async (req, res) => {
               type: "websearch",
               usedWebSearch: true,
               searchQueries: agentResult.searchQueries,
+              webSearchSources: agentResult.webSearchSources || [],
+              webSearchResults: agentResult.webSearchResults || null,
+            })}\n\n`
+          );
+        }
+        if (assembled.reasoning) {
+          res.write(
+            `event: thinking\ndata: ${JSON.stringify({
+              type: "thinking",
+              thinking: assembled.reasoning,
+              reasoning: assembled.reasoning,
             })}\n\n`
           );
         }
@@ -4161,12 +4243,23 @@ const server = http.createServer(async (req, res) => {
           model: assembled.model,
           usedWebSearch: agentResult.usedWebSearch,
           searchQueries: agentResult.searchQueries,
+          webSearchSources: agentResult.webSearchSources || [],
+          webSearchResults: agentResult.webSearchResults || null,
+          thinking: assembled.reasoning || null,
+          reasoning: assembled.reasoning || null,
           choices: [
             {
               index: 0,
               delta: {
                 role: "assistant",
                 content: assembled.content,
+                ...(assembled.reasoning
+                  ? {
+                      thinking: assembled.reasoning,
+                      reasoning: assembled.reasoning,
+                      reasoning_content: assembled.reasoning,
+                    }
+                  : {}),
               },
               finish_reason: "stop",
             },
@@ -4184,8 +4277,11 @@ const server = http.createServer(async (req, res) => {
         model: assembled.model,
         usedWebSearch: agentResult.usedWebSearch,
         searchQueries: agentResult.searchQueries,
-        reply: assembled.content,
+        webSearchSources: agentResult.webSearchSources || [],
+        webSearchResults: agentResult.webSearchResults || null,
+        thinking: assembled.reasoning || null,
         reasoning: assembled.reasoning || null,
+        reply: assembled.content,
         usage: assembled.usage,
       });
     } catch (err) {
@@ -4213,7 +4309,10 @@ const server = http.createServer(async (req, res) => {
 
     const messages = normalizeMessages(body, DEFAULT_SYSTEM_PROMPT);
     const wantsStream = body.stream === true;
-    const disableReasoning = body.reasoning === true ? false : true;
+    const disableReasoning =
+      body.reasoning === false || body.thinking === false || body.noThink === true
+        ? true
+        : false;
     const allowWebSearch = body.webSearch !== false && body.allowWebSearch !== false;
     const forceWebSearch = body.webSearch === true || body.search === true;
 
@@ -4369,6 +4468,26 @@ const server = http.createServer(async (req, res) => {
           "Cache-Control": "no-cache",
           Connection: "keep-alive",
         });
+        if (agentResult.usedWebSearch) {
+          res.write(
+            `event: websearch\ndata: ${JSON.stringify({
+              type: "websearch",
+              usedWebSearch: true,
+              searchQueries: agentResult.searchQueries,
+              webSearchSources: agentResult.webSearchSources || [],
+              webSearchResults: agentResult.webSearchResults || null,
+            })}\n\n`
+          );
+        }
+        if (assembled.reasoning) {
+          res.write(
+            `event: thinking\ndata: ${JSON.stringify({
+              type: "thinking",
+              thinking: assembled.reasoning,
+              reasoning: assembled.reasoning,
+            })}\n\n`
+          );
+        }
         const chunkPayload = {
           id: assembled.id,
           object: "chat.completion.chunk",
@@ -4376,12 +4495,23 @@ const server = http.createServer(async (req, res) => {
           model: assembled.model,
           usedWebSearch: agentResult.usedWebSearch,
           searchQueries: agentResult.searchQueries,
+          webSearchSources: agentResult.webSearchSources || [],
+          webSearchResults: agentResult.webSearchResults || null,
+          thinking: assembled.reasoning || null,
+          reasoning: assembled.reasoning || null,
           choices: [
             {
               index: 0,
               delta: {
                 role: "assistant",
                 content: assembled.content,
+                ...(assembled.reasoning
+                  ? {
+                      thinking: assembled.reasoning,
+                      reasoning: assembled.reasoning,
+                      reasoning_content: assembled.reasoning,
+                    }
+                  : {}),
               },
               finish_reason: "stop",
             },
@@ -4399,13 +4529,23 @@ const server = http.createServer(async (req, res) => {
         model: assembled.model,
         usedWebSearch: agentResult.usedWebSearch,
         searchQueries: agentResult.searchQueries,
+        webSearchSources: agentResult.webSearchSources || [],
+        webSearchResults: agentResult.webSearchResults || null,
+        thinking: assembled.reasoning || null,
+        reasoning: assembled.reasoning || null,
         choices: [
           {
             index: 0,
             message: {
               role: "assistant",
               content: assembled.content,
-              ...(assembled.reasoning ? { reasoning: assembled.reasoning } : {}),
+              ...(assembled.reasoning
+                ? {
+                    thinking: assembled.reasoning,
+                    reasoning: assembled.reasoning,
+                    reasoning_content: assembled.reasoning,
+                  }
+                : {}),
             },
             finish_reason: assembled.finishReason || "stop",
           },
