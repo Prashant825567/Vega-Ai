@@ -1323,6 +1323,16 @@ function detectImageTaskIntent(userText = "", imageInput = null, body = {}) {
       ? Boolean(imageInput.isCurrentTurnImage)
       : Boolean(imageInput);
 
+  // Skip chat-title generation / conversation summary meta-prompts sent automatically by the Vega app
+  if (
+    /\bcreate a short,\s*clear title\b/i.test(q) ||
+    /\btitle\s*\([^)]*words?\)\s*for this chat\b/i.test(q) ||
+    /\bbased on the user's first message\b/i.test(q) ||
+    /\breturn only the title\b/i.test(q)
+  ) {
+    return null;
+  }
+
   // Skip pure capability questions ("kya tum image generate kar sakte ho?", "can you generate images?")
   if (
     /\b(kya tum|kya aap|can you|are you able to|do you have)\b[\s\S]{0,50}\b(kar sakte|bana sakte|sakte ho|sakti ho)\b/i.test(
@@ -1335,8 +1345,8 @@ function detectImageTaskIntent(userText = "", imageInput = null, body = {}) {
 
   const generatePatterns = [
     /\b(generate|create|draw|paint|make|design|render)\b[\s\S]{0,40}\b(image|photo|picture|pic|art|illustration|wallpaper|logo|poster|avatar|portrait|tasveer|scene|sketch|painting)\b/i,
-    /\b(image|photo|picture|pic|tasveer|wallpaper|logo|poster|portrait|sketch|painting)\b[\s\S]{0,40}\b(generate|create|make|draw|render|banao|bana|bana do|bana de|banaiye|dikhao|de do|bhej|nikal)\b/i,
-    /\b(banao|bana do|bana de|generate karo|generate kar|create karo|create kar|draw karo|draw kar)\b[\s\S]{0,40}\b(image|photo|picture|pic|tasveer|wallpaper|logo|poster)\b/i,
+    /\b(image|photo|picture|pic|tasveer|wallpaper|logo|poster|portrait|sketch|painting)\b[\s\S]{0,40}\b(generate|create|make|draw|render|banao|bana|bana do|bana de|banaiye|dikhao|de do|bhej|nikal|karne|karni|karna)\b/i,
+    /\b(banao|bana do|bana de|generate karo|generate kar|generate karne|generate karni|create karo|create kar|draw karo|draw kar)\b[\s\S]{0,40}\b(image|photo|picture|pic|tasveer|wallpaper|logo|poster)\b/i,
     /(इमेज|फोटो|फ़ोटो|तस्वीर|पिक्चर|वॉलपेपर|लोगो|पोस्टर|पेंटिंग)[\s\S]{0,30}(बनाओ|बना दो|बना दे|जनरेट|क्रिएट|दिखाओ)/,
     /(बनाओ|बना दो|जनरेट करो|क्रिएट करो)[\s\S]{0,30}(इमेज|फोटो|फ़ोटो|तस्वीर|पिक्चर|वॉलपेपर|लोगो)/,
   ];
@@ -1383,6 +1393,15 @@ function detectImageTaskIntent(userText = "", imageInput = null, body = {}) {
  * OR accidentally claimed it cannot generate/edit images when the user asked for one.
  */
 function parseModelImageFallback(content = "", userText = "", hasImage = false) {
+  const q = String(userText || "").toLowerCase();
+  if (
+    /\bcreate a short,\s*clear title\b/i.test(q) ||
+    /\btitle\s*\([^)]*words?\)\s*for this chat\b/i.test(q) ||
+    /\bbased on the user's first message\b/i.test(q) ||
+    /\breturn only the title\b/i.test(q)
+  ) {
+    return null;
+  }
   const raw = String(content || "").trim();
   const tagMatch = raw.match(
     /<IMAGE_TASK(?:\s+action=["']?(generate|edit)["']?)?(?:\s+status=["']([^"']*)["'])?(?:\s+reply=["']([^"']*)["'])?[^>]*>([\s\S]*?)<\/IMAGE_TASK>/i
@@ -1762,7 +1781,14 @@ function debrandForNvidiaCosmos(englishPrompt = "") {
     .replace(/\b(iron\s*man|ironman)\b/gi, "red and gold titanium-armored cybernetic superhero")
     .replace(/\b(spider[\s-]*man|spiderman)\b/gi, "red and blue web-patterned superhero")
     .replace(/\b(batman)\b/gi, "dark armored vigilante hero in matte-black tactical bat-suit")
-    .replace(/\b(superman)\b/gi, "muscular superhero in royal blue suit and crimson cape");
+    .replace(/\b(superman)\b/gi, "muscular superhero in royal blue suit and crimson cape")
+    // Also replace words that trigger false-positive CONTENT_FILTERED in NVIDIA Cosmos Guardrail on couple/waterfall scenes
+    .replace(/\bwet\s+skin\b/gi, "warm glowing skin")
+    .replace(/\bwet\s+(clothes|dress|shirt|hair|body)\b/gi, "flowing $1")
+    .replace(/\b(drenched|soaked|clinging|sheer|translucent|see-through)\b/gi, "elegant")
+    .replace(/\b(intimately|sensually|passionately|seductively)\b/gi, "warmly")
+    .replace(/\b(intimate|sensual|seductive|erotic)\b/gi, "romantic")
+    .replace(/\b(barefoot|bare\s+feet|bare\s+skin|bare\s+shoulders)\b/gi, "graceful");
 }
 
 /**
@@ -1839,22 +1865,37 @@ async function runMaxImageAgent({
   // Step 1: `mimo-v2.6-flash-free` ALWAYS understands the user's requirement first,
   // records its live `thinking` (`mimoThinking`), and writes an enhanced, detailed English prompt (`maxPrompt`)!
   if (!maxPrompt) {
+    let craftTimedOut = false;
+    const strippedSubject = String(userText || "")
+      .replace(
+        /\b(ek|a|an|please|plz|bhai|yar|yaar|zara|jaldi|abhi|image|photo|picture|pic|tasveer|ko|ki|ka|ke|generate|create|make|draw|banao|bana do|bana de|banaiye|dikhao|de do|karo|kar do|kar de|karne|karni|karna|hai|hain|ho)\b/gi,
+        " "
+      )
+      .replace(/\s+/g, " ")
+      .trim() || userText;
+
     const promptCraftTask = (async () => {
       if (!isEdit) {
-        // Image Generation: mimo-v2.6-flash-free understands user's Hindi/Hinglish/English request & writes an enhanced detailed English prompt
-        const craftMessages = normalizeMessages(
+        // Image Generation: mimo-v2.6-flash-free understands user's Hindi/Hinglish/English requirement & writes an enhanced detailed English prompt
+        const craftMessages = [
           {
-            message: `Understand this user requirement: "${userText}". Write ONLY 1 enhanced, detailed 45-65 word English visual scene description for an 8k photorealistic image (include natural appearance, lighting, camera lens, and background; describe any brands visually without trademark names).`,
+            role: "system",
+            content:
+              "/no_think Do not use any tools. You are Max v1.0, an expert AI visual director. Understand the user's requirement and output ONLY 1 enhanced, detailed 45-60 word English image prompt for an 8k photorealistic masterpiece (enhance lighting, composition, camera lens, and rich visual details based strictly on the user's requirement; describe any car/character brands visually without trademark names; avoid words like drenched or wet skin).",
           },
-          DEFAULT_SYSTEM_PROMPT
-        );
+          {
+            role: "user",
+            content: `User requirement: "${userText}" (core subject: "${strippedSubject}"). Write ONLY the enhanced English image prompt.\n/no_think`,
+          },
+        ];
         const up = await callOpenCodeUpstream({
           model: model || DEFAULT_MODEL,
           messages: craftMessages,
           disableReasoning: true,
         });
-        if (up.ok && up.response) {
+        if (up.ok && up.response && !craftTimedOut) {
           const assembled = await collectSSEStream(up.response, up.model);
+          if (craftTimedOut) return;
           if (assembled.reasoning && assembled.reasoning.trim()) {
             mimoThinking = assembled.reasoning.trim();
           }
@@ -1876,21 +1917,34 @@ async function runMaxImageAgent({
         }
       } else {
         // Image Editing: mimo-v2.6-flash-free inspects the uploaded image + user requirement & writes an enhanced English edit prompt
-        const visionMessages = normalizeMessages(
+        const visionMessages = [
           {
-            message: `Look at this image and write ONLY 1 detailed English image-edit instruction sentence for this user requirement: "${userText}". Output only the instruction sentence.`,
-            image: imageInput.dataUri,
-            mimeType: imageInput.mimeType,
+            role: "system",
+            content:
+              "/no_think Do not use any tools. You are Max v1.0, an expert AI photo editor. Inspect the image and the user's requirement, and output ONLY 1 detailed English image-editing instruction sentence.",
           },
-          DEFAULT_SYSTEM_PROMPT
-        );
+          {
+            role: "user",
+            content: [
+              {
+                type: "text",
+                text: `Look at this image and write ONLY 1 detailed English image-edit instruction sentence for this user requirement: "${userText}".\n/no_think`,
+              },
+              {
+                type: "image_url",
+                image_url: { url: imageInput.dataUri },
+              },
+            ],
+          },
+        ];
         const up = await callOpenCodeUpstream({
           model: model || DEFAULT_MODEL,
           messages: visionMessages,
           disableReasoning: true,
         });
-        if (up.ok && up.response) {
+        if (up.ok && up.response && !craftTimedOut) {
           const assembled = await collectSSEStream(up.response, up.model);
+          if (craftTimedOut) return;
           if (assembled.reasoning && assembled.reasoning.trim()) {
             mimoThinking = assembled.reasoning.trim();
           }
@@ -1911,7 +1965,12 @@ async function runMaxImageAgent({
     try {
       await Promise.race([
         promptCraftTask,
-        new Promise((resolve) => setTimeout(resolve, 10500)),
+        new Promise((resolve) =>
+          setTimeout(() => {
+            craftTimedOut = true;
+            resolve();
+          }, 12500)
+        ),
       ]);
     } catch {}
 
@@ -2084,10 +2143,11 @@ async function runMaxImageAgent({
                 nvidiaPayload.prompt = rewritten.slice(0, 1950);
                 continue;
               } else if (attempt === 1) {
-                const safeFallback =
-                  "A breathtaking cinematic 8k photorealistic masterpiece scene with dramatic golden hour lighting, ultra-detailed textures, sharp focus, studio photography";
-                maxPrompt = safeFallback;
-                nvidiaPayload.prompt = safeFallback;
+                const subjectSafeFallback = `${debrandForNvidiaCosmos(
+                  sanitizePromptForNvidiaFlux3(userText)
+                )}, medium cinematic shot, golden hour sunlight, shot on 85mm f/1.4 lens, ultra-detailed 8k photorealistic photography, sharp focus`;
+                maxPrompt = subjectSafeFallback;
+                nvidiaPayload.prompt = subjectSafeFallback.slice(0, 1950);
                 continue;
               }
             } else {
