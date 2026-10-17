@@ -232,22 +232,23 @@ const AI_NAME = process.env.AI_NAME || "Max v1.0";
 const APP_NAME = process.env.APP_NAME || "Vega";
 const BACKEND_API_KEY = (process.env.BACKEND_API_KEY || "").trim();
 
-// NVIDIA NIM FLUX.3 Klein Image Generation & Vision-Guided Editing Configuration
+// 1) Image Generation Engine: NVIDIA NIM FLUX.3 Klein (`black-forest-labs/flux-3-image-klein`)
 const NVIDIA_IMAGE_MODEL = "black-forest-labs/flux-3-image-klein";
 const NVIDIA_IMAGE_API_URL = (
   process.env.NVIDIA_IMAGE_API_URL ||
-  process.env.IMAGE_API_URL ||
   "https://ai.api.nvidia.com/v1/genai/black-forest-labs/flux-3-image-klein"
 ).replace(/\/+$/, "");
 
 function getNvidiaApiKey() {
-  return (
-    process.env.NVIDIA_API_KEY ||
-    process.env.NVAPI_KEY ||
-    process.env.IMAGE_API_KEY ||
-    ""
-  ).trim();
+  return (process.env.NVIDIA_API_KEY || process.env.NVAPI_KEY || "").trim();
 }
+
+// 2) Image Editing Engine: Cloudflare Worker (`@cf/black-forest-labs/flux-2-klein-4b`)
+const CLOUDFLARE_EDIT_MODEL = "@cf/black-forest-labs/flux-2-klein-4b";
+const IMAGE_API_URL = (
+  process.env.IMAGE_API_URL || "https://image-api.pr3095079.workers.dev"
+).replace(/\/+$/, "");
+const IMAGE_API_KEY = (process.env.IMAGE_API_KEY || "noida123").trim();
 
 const DEFAULT_FILLER_TEXT =
   process.env.VOICE_FILLER_TEXT || "Ek second, abhi batata hoon.";
@@ -1493,7 +1494,7 @@ async function runMaxImageAgent({
       ? "Yeh lijiye bhai, aapki edited image bilkul taiyar hai! ✨"
       : "Yeh lijiye bhai, aapki image ban kar taiyar hai! 🎨");
 
-  // Step 1: Ultra-fast Vision Inspection for Image Edits (mimo-v2.6-flash-free inspects the uploaded image & writes a complete visual reconstruction prompt with the requested edit applied)
+  // Step 1: Ultra-fast Vision Inspection for Image Edits (mimo-v2.6-flash-free inspects the uploaded image & writes the 1-sentence English edit instruction for Cloudflare Worker @cf/black-forest-labs/flux-2-klein-4b)
   if (!preCraftedPrompt) {
     if (!isEdit) {
       maxPrompt = `${userText}, photorealistic, 8k, ultra-detailed, vivid cinematic lighting, sharp focus`;
@@ -1503,7 +1504,7 @@ async function runMaxImageAgent({
         const visionTask = (async () => {
           const visionMessages = normalizeMessages(
             {
-              message: `Describe this scene in 35 English words, applying this change: ${userText}. Output only the English scene description.`,
+              message: `Look at this image and write ONLY 1 clear English image-edit instruction sentence for this user request: "${userText}". Output only the instruction sentence.`,
               image: imageInput.dataUri,
               mimeType: imageInput.mimeType,
             },
@@ -1521,10 +1522,10 @@ async function runMaxImageAgent({
               .replace(/^["'`]+|["'`]+$/g, "")
               .replace(/\s+/g, " ")
               .trim();
-            if (cleaned.length >= 12) {
+            if (cleaned.length >= 8) {
               visionDesc = cleaned;
             } else if (assembled.reasoning && assembled.reasoning.trim().length >= 15) {
-              visionDesc = assembled.reasoning.replace(/\s+/g, " ").trim().slice(0, 260);
+              visionDesc = assembled.reasoning.replace(/\s+/g, " ").trim().slice(0, 220);
             }
           }
         })();
@@ -1532,18 +1533,22 @@ async function runMaxImageAgent({
         try {
           await Promise.race([
             visionTask,
-            new Promise((resolve) => setTimeout(resolve, 6500)),
+            new Promise((resolve) => setTimeout(resolve, 6200)),
           ]);
         } catch {}
       }
 
       if (visionDesc) {
-        maxPrompt = `${visionDesc}, photorealistic, 8k, ultra-detailed, sharp focus`;
+        maxPrompt = visionDesc;
       } else {
-        maxPrompt = `${userText}, photorealistic, 8k, ultra-detailed, vivid cinematic lighting, sharp focus`;
+        maxPrompt = `Edit this image as requested: ${userText}, keeping the subject's identity and composition intact, photorealistic, high detail`;
       }
     }
   }
+
+  const outWidth = isEdit ? 512 : width;
+  const outHeight = isEdit ? 512 : height;
+  const outAspectRatio = isEdit ? "1:1" : aspectRatio;
 
   // Notify caller/stream immediately so the app knows an image is being edited/generated and prepares its image UI slot!
   if (typeof onStatus === "function") {
@@ -1552,67 +1557,53 @@ async function runMaxImageAgent({
         type: "image_status",
         isImageTask: true,
         imageAction: isEdit ? "edit" : "generate",
+        imageModel: isEdit ? CLOUDFLARE_EDIT_MODEL : NVIDIA_IMAGE_MODEL,
         imageStatus: "processing",
         readyForImage: true,
-        width,
-        height,
-        aspectRatio,
+        width: outWidth,
+        height: outHeight,
+        aspectRatio: outAspectRatio,
         statusMessage,
         maxPrompt,
       });
     } catch {}
   }
 
-  // Step 2: Generate via NVIDIA NIM `black-forest-labs/flux-3-image-klein`
-  const nvidiaApiKey = getNvidiaApiKey();
-  if (!nvidiaApiKey) {
-    throw new Error(
-      "Missing NVIDIA_API_KEY in environment variables. Please set NVIDIA_API_KEY in Render Environment settings."
-    );
-  }
-
   let imgBuffer = null;
   let contentType = "image/jpeg";
-  const nvidiaPayload = {
-    prompt: maxPrompt.slice(0, 1950),
-    width,
-    height,
-    steps: Number(options.steps) > 0 && Number(options.steps) <= 50 ? Number(options.steps) : 28,
-    seed: Number.isInteger(Number(options.seed)) && Number(options.seed) >= 0 ? Number(options.seed) : 0,
-  };
+  const workerEndpoint = isEdit ? `${IMAGE_API_URL}/edit` : NVIDIA_IMAGE_API_URL;
 
-  let lastNvidiaErr = "";
-  for (let attempt = 0; attempt < 2; attempt++) {
-    try {
-      const nvRes = await fetch(NVIDIA_IMAGE_API_URL, {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${nvidiaApiKey}`,
-          Accept: "application/json",
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify(nvidiaPayload),
-      });
+  if (isEdit) {
+    // ── Image Editing (`action === "edit"`): Use Cloudflare Worker (`@cf/black-forest-labs/flux-2-klein-4b`) ──
+    let normMime = String((imageInput && imageInput.mimeType) || "image/png").toLowerCase();
+    if (normMime === "image/jpg") normMime = "image/jpeg";
+    if (!["image/png", "image/jpeg", "image/webp"].includes(normMime)) {
+      normMime = "image/png";
+    }
+    const workerImageField = `data:${normMime};base64,${imageInput.rawBase64}`;
+    const workerBody = {
+      mode: "edit",
+      prompt: maxPrompt,
+      image: workerImageField,
+      width: 512,
+      height: 512,
+    };
 
-      if (nvRes.ok) {
-        const ct = (nvRes.headers.get("content-type") || "").toLowerCase();
-        if (ct.startsWith("image/")) {
-          imgBuffer = Buffer.from(await nvRes.arrayBuffer());
-        } else {
-          const data = await nvRes.json();
-          const b64 =
-            data?.artifacts?.[0]?.base64 ||
-            data?.image ||
-            data?.data?.[0]?.b64_json ||
-            "";
-          if (b64) {
-            imgBuffer = Buffer.from(b64, "base64");
-          } else {
-            lastNvidiaErr = `NVIDIA NIM returned 200 without base64 artifact: ${JSON.stringify(data).slice(0, 200)}`;
-          }
-        }
+    let lastWorkerErr = "";
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        const workerRes = await fetch(`${IMAGE_API_URL}/edit`, {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${IMAGE_API_KEY}`,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify(workerBody),
+        });
 
-        if (imgBuffer && imgBuffer.length > 0) {
+        const ct = (workerRes.headers.get("content-type") || "").toLowerCase();
+        if (workerRes.ok && ct.startsWith("image/")) {
+          imgBuffer = Buffer.from(await workerRes.arrayBuffer());
           if (
             imgBuffer.length >= 3 &&
             imgBuffer[0] === 0xff &&
@@ -1628,23 +1619,106 @@ async function runMaxImageAgent({
             imgBuffer[3] === 0x47
           ) {
             contentType = "image/png";
+          } else {
+            contentType = ct.split(";")[0] || "image/jpeg";
           }
           break;
         }
-      } else {
-        const errText = await nvRes.text().catch(() => "");
-        lastNvidiaErr = `NVIDIA NIM API error (${nvRes.status}): ${errText.slice(0, 240)}`;
+        const errText = await workerRes.text().catch(() => "");
+        lastWorkerErr = `Image Edit Worker error (${workerRes.status}): ${errText.slice(0, 240)}`;
+      } catch (e) {
+        lastWorkerErr = e.message || "Worker fetch failed";
       }
-    } catch (e) {
-      lastNvidiaErr = e.message || "NVIDIA NIM fetch failed";
+      if (attempt === 0) {
+        await new Promise((r) => setTimeout(r, 600));
+      }
     }
-    if (attempt === 0) {
-      await new Promise((r) => setTimeout(r, 500));
-    }
-  }
 
-  if (!imgBuffer) {
-    throw new Error(lastNvidiaErr || "Image generation failed on NVIDIA NIM flux-3-image-klein");
+    if (!imgBuffer) {
+      throw new Error(lastWorkerErr || "Image editing failed on Cloudflare worker");
+    }
+  } else {
+    // ── Image Generation (`action === "generate"`): Use NVIDIA NIM `black-forest-labs/flux-3-image-klein` (1024x1024 default + dynamic aspect ratio) ──
+    const nvidiaApiKey = getNvidiaApiKey();
+    if (!nvidiaApiKey) {
+      throw new Error(
+        "Missing NVIDIA_API_KEY in environment variables. Please set NVIDIA_API_KEY in Render Environment settings."
+      );
+    }
+
+    const nvidiaPayload = {
+      prompt: maxPrompt.slice(0, 1950),
+      width,
+      height,
+      steps: Number(options.steps) > 0 && Number(options.steps) <= 50 ? Number(options.steps) : 28,
+      seed: Number.isInteger(Number(options.seed)) && Number(options.seed) >= 0 ? Number(options.seed) : 0,
+    };
+
+    let lastNvidiaErr = "";
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        const nvRes = await fetch(NVIDIA_IMAGE_API_URL, {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${nvidiaApiKey}`,
+            Accept: "application/json",
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify(nvidiaPayload),
+        });
+
+        if (nvRes.ok) {
+          const ct = (nvRes.headers.get("content-type") || "").toLowerCase();
+          if (ct.startsWith("image/")) {
+            imgBuffer = Buffer.from(await nvRes.arrayBuffer());
+          } else {
+            const data = await nvRes.json();
+            const b64 =
+              data?.artifacts?.[0]?.base64 ||
+              data?.image ||
+              data?.data?.[0]?.b64_json ||
+              "";
+            if (b64) {
+              imgBuffer = Buffer.from(b64, "base64");
+            } else {
+              lastNvidiaErr = `NVIDIA NIM returned 200 without base64 artifact: ${JSON.stringify(data).slice(0, 200)}`;
+            }
+          }
+
+          if (imgBuffer && imgBuffer.length > 0) {
+            if (
+              imgBuffer.length >= 3 &&
+              imgBuffer[0] === 0xff &&
+              imgBuffer[1] === 0xd8 &&
+              imgBuffer[2] === 0xff
+            ) {
+              contentType = "image/jpeg";
+            } else if (
+              imgBuffer.length >= 4 &&
+              imgBuffer[0] === 0x89 &&
+              imgBuffer[1] === 0x50 &&
+              imgBuffer[2] === 0x4e &&
+              imgBuffer[3] === 0x47
+            ) {
+              contentType = "image/png";
+            }
+            break;
+          }
+        } else {
+          const errText = await nvRes.text().catch(() => "");
+          lastNvidiaErr = `NVIDIA NIM API error (${nvRes.status}): ${errText.slice(0, 240)}`;
+        }
+      } catch (e) {
+        lastNvidiaErr = e.message || "NVIDIA NIM fetch failed";
+      }
+      if (attempt === 0) {
+        await new Promise((r) => setTimeout(r, 500));
+      }
+    }
+
+    if (!imgBuffer) {
+      throw new Error(lastNvidiaErr || "Image generation failed on NVIDIA NIM flux-3-image-klein");
+    }
   }
 
   const imageId = saveGeneratedImageBuffer(imgBuffer, contentType);
@@ -1654,10 +1728,12 @@ async function runMaxImageAgent({
 
   return {
     action: isEdit ? "edit" : "generate",
-    imageModel: NVIDIA_IMAGE_MODEL,
-    width,
-    height,
-    aspectRatio,
+    imageModel: isEdit ? CLOUDFLARE_EDIT_MODEL : NVIDIA_IMAGE_MODEL,
+    sentImageToWorker: Boolean(isEdit && imageInput && imageInput.rawBase64),
+    workerEndpoint,
+    width: outWidth,
+    height: outHeight,
+    aspectRatio: outAspectRatio,
     statusMessage,
     maxPrompt,
     finalReply,
@@ -1665,9 +1741,9 @@ async function runMaxImageAgent({
     hostedUrl,
     image: {
       mimeType: contentType,
-      width,
-      height,
-      aspectRatio,
+      width: outWidth,
+      height: outHeight,
+      aspectRatio: outAspectRatio,
       url: hostedUrl,
       dataUri: outDataUri,
     },
@@ -3178,7 +3254,8 @@ const server = http.createServer(async (req, res) => {
         stt: GEMINI_VOICE_MODEL,
         llm: GEMINI_VOICE_MODEL,
         chatLlm: DEFAULT_MODEL,
-        image: NVIDIA_IMAGE_MODEL,
+        imageGeneration: NVIDIA_IMAGE_MODEL,
+        imageEditing: CLOUDFLARE_EDIT_MODEL,
         tts: GEMINI_VOICE_MODEL,
         ttsDefaultVoice: GEMINI_TTS_VOICE,
       },
@@ -3193,6 +3270,7 @@ const server = http.createServer(async (req, res) => {
         OPENCODE_API_KEY: Boolean(OPENCODE_API_KEY),
         GEMINI_API_KEY: GEMINI_API_KEYS.length > 0,
         NVIDIA_API_KEY: Boolean(getNvidiaApiKey()),
+        IMAGE_API_KEY: Boolean(IMAGE_API_KEY),
       },
       endpoints: {
         prompt: "GET /api/prompt",
@@ -3809,6 +3887,8 @@ const server = http.createServer(async (req, res) => {
         imageAction: imgResult.action,
         imageStatus: "completed",
         readyForImage: true,
+        sentImageToWorker: imgResult.sentImageToWorker,
+        workerEndpoint: imgResult.workerEndpoint,
         width: imgResult.width,
         height: imgResult.height,
         aspectRatio: imgResult.aspectRatio,
@@ -3927,6 +4007,8 @@ const server = http.createServer(async (req, res) => {
           imageAction: imgResult.action,
           imageStatus: "completed",
           readyForImage: true,
+          sentImageToWorker: imgResult.sentImageToWorker,
+          workerEndpoint: imgResult.workerEndpoint,
           width: imgResult.width,
           height: imgResult.height,
           aspectRatio: imgResult.aspectRatio,
