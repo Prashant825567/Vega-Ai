@@ -1868,6 +1868,10 @@ function debrandForNvidiaCosmos(englishPrompt = "") {
     .replace(/\b(ferrari|laferrari|sf90)\b/gi, "glossy crimson Italian mid-engine racing supercar")
     .replace(/\b(bugatti|chiron|veyron)\b/gi, "two-tone hypercar with horseshoe front grille")
     .replace(/\b(porsche)\b/gi, "German rear-engine sports coupe with oval LED headlights")
+    .replace(
+      /\b(bmw\s*m5|bmw|m5)\b/gi,
+      "German performance luxury sports sedan with twin kidney front grille and quad exhausts"
+    )
     .replace(/\b(iron\s*man|ironman)\b/gi, "red and gold titanium-armored cybernetic superhero")
     .replace(/\b(spider[\s-]*man|spiderman)\b/gi, "red and blue web-patterned superhero")
     .replace(/\b(batman)\b/gi, "dark armored vigilante hero in matte-black tactical bat-suit")
@@ -2087,12 +2091,24 @@ async function runMaxImageAgent({
         const craftMessages = [
           {
             role: "system",
-            content:
-              "/no_think Do not use any tools. You are Max v1.0, an expert AI visual director. Understand the user's requirement and output ONLY 1 enhanced, detailed 45-60 word English image prompt for an 8k photorealistic masterpiece (enhance lighting, composition, camera lens, and rich visual details based strictly on the user's requirement; describe any car/character brands visually without trademark names; avoid words like drenched, swimsuit, or wet skin).",
+            content: `/no_think You are Max v1.0, an expert AI visual director who writes prompts for the FLUX image model. Do not use any tools.
+
+Turn the user's requirement into ONE enhanced English image prompt of 80-110 words.
+
+Rules:
+- Stay strictly faithful to the user's requirement and core subject. Never drop or change the subject, count, gender, colors or setting.
+- Write flowing, natural descriptive sentences, not a keyword list.
+- Cover: (1) main subject with precise details like pose, expression, clothing, materials; (2) camera angle and framing, making sure every person mentioned is clearly visible; (3) environment and background; (4) lighting direction, quality and color temperature; (5) real lens in mm, aperture, depth of field; (6) color palette and mood.
+- For any car, bike or gadget, describe the design visually: shape, color, grille, headlights, wheels, exhaust, body lines. Never use brand or trademark names.
+- Style: photorealistic, natural skin and material textures, cinematic realism.
+- If the requirement is in Hindi or Hinglish, understand the intent and write the prompt in English.
+- Never use the words: drenched, swimsuit, wet skin, masterpiece, 8k.
+- No negative prompts, no brackets, no emojis, no tags.
+- Output ONLY the final prompt text. No thinking, no preface, no quotes, no explanation.`,
           },
           {
             role: "user",
-            content: `User requirement: "${userText}" (core subject: "${strippedSubject}"). Write ONLY the enhanced English image prompt.\n/no_think`,
+            content: `User requirement: "${userText}"\n\nCore subject: "${strippedSubject}"\n\nWrite ONLY the enhanced English image prompt.\n/no_think`,
           },
         ];
         const up = await callOpenCodeUpstream({
@@ -2175,7 +2191,7 @@ async function runMaxImageAgent({
           setTimeout(() => {
             craftTimedOut = true;
             resolve();
-          }, 12500)
+          }, 16000)
         ),
       ]);
     } catch {}
@@ -2184,7 +2200,7 @@ async function runMaxImageAgent({
     if (!maxPrompt) {
       if (!isEdit) {
         const cleanVisualSubject = sanitizePromptForNvidiaFlux3(userText);
-        maxPrompt = `${cleanVisualSubject}, photorealistic, 8k, ultra-detailed, vivid cinematic lighting, sharp focus`;
+        maxPrompt = `${cleanVisualSubject}, photorealistic, natural skin and material textures, vivid cinematic lighting, sharp focus`;
       } else {
         maxPrompt = `Edit this image as requested: ${userText}, keeping the subject's identity and composition intact, photorealistic, high detail`;
       }
