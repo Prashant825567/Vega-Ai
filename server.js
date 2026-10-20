@@ -6,7 +6,7 @@
  * 1. STT (Speech-to-Text):
  *    - Model: Google AI Studio `gemini-2.5-flash` (audio input -> text transcript)
  * 2. Middle LLM (Brain):
- *    - Model: OpenCode `mimo-v2.6-flash-free` (Persona: Max v1.0 for Vega App)
+ *    - Model: OpenCode `deepseek-v4.1-flash-free` (Persona: Max v1.0 for Vega App)
  *    - Fast Voice Mode: Disables internal reasoning (`reasoning_tokens: 0`) for instant replies.
  *    - Smart Thinking/Research Mode: Detects when a question requires deep thinking/research,
  *      provides instant "Ek second, abhi batata hoon..." filler speech + full answer.
@@ -81,7 +81,11 @@ const UPSTREAM_URLS = [
   "https://opencode.ai/zen/v1/chat/completions",
 ];
 
-const DEFAULT_MODEL = process.env.DEFAULT_MODEL || "mimo-v2.6-flash-free";
+const rawEnvModel = (process.env.DEFAULT_MODEL || "").trim();
+const DEFAULT_MODEL =
+  !rawEnvModel || rawEnvModel === "mimo-v2.6-flash-free"
+    ? "deepseek-v4.1-flash-free"
+    : rawEnvModel;
 const GEMINI_VOICE_MODEL = "gemini-3.1-flash-live-preview";
 const GEMINI_STT_MODEL = "gemini-3.1-flash-live-preview";
 const GEMINI_TTS_MODEL = "gemini-3.1-flash-live-preview";
@@ -749,14 +753,16 @@ function buildOpenCodeHeaders(sessionId) {
 
 function resolveModel(requestedModel) {
   if (!requestedModel) return DEFAULT_MODEL;
-  const m = String(requestedModel).trim().toLowerCase();
+  const m = String(requestedModel).trim().toLowerCase().replace(/^opencode\//i, "");
   if (
     m === "max" ||
     m === "max-v1" ||
     m === "max-v1.0" ||
     m === "max v1.0" ||
     m === "vega" ||
-    m === "default"
+    m === "default" ||
+    m === "mimo" ||
+    m === "mimo-v2.6-flash-free"
   ) {
     return DEFAULT_MODEL;
   }
@@ -926,7 +932,7 @@ function normalizeMessages(body, defaultSystem = DEFAULT_SYSTEM_PROMPT) {
   return messages;
 }
 
-// ─── Step 2 (LLM): OpenCode Upstream Call (`mimo-v2.6-flash-free`) ──────────
+// ─── Step 2 (LLM): OpenCode Upstream Call (`deepseek-v4.1-flash-free`) ──────────
 async function callOpenCodeUpstream(payload) {
   const existingTools = Array.isArray(payload.tools) ? payload.tools : [];
   const existingNames = new Set(
@@ -960,7 +966,7 @@ async function callOpenCodeUpstream(payload) {
           }
           return m;
         }
-        // Also append /no_think to multimodal array messages (image + text) so mimo-v2.6-flash-free doesn't spend 14s thinking!
+        // Also append /no_think to multimodal array messages (image + text) so deepseek-v4.1-flash-free doesn't spend 14s thinking!
         if (idx === lastIdx && Array.isArray(m.content)) {
           return {
             ...m,
@@ -1138,9 +1144,15 @@ async function collectSSEStream(response, fallbackModel, callbacks = {}) {
         const choice = chunk.choices?.[0];
         if (choice) {
           const delta = choice.delta || {};
-          if (typeof delta.reasoning === "string" && delta.reasoning.length > 0) {
-            reasoning += delta.reasoning;
-            emitThinking(delta.reasoning);
+          const reasoningPiece =
+            typeof delta.reasoning === "string" && delta.reasoning.length > 0
+              ? delta.reasoning
+              : typeof delta.reasoning_content === "string" && delta.reasoning_content.length > 0
+              ? delta.reasoning_content
+              : "";
+          if (reasoningPiece) {
+            reasoning += reasoningPiece;
+            emitThinking(reasoningPiece);
           }
           if (typeof delta.content === "string" && delta.content.length > 0) {
             content += delta.content;
@@ -1479,7 +1491,7 @@ function detectImageTaskIntent(userText = "", imageInput = null, body = {}) {
 }
 
 /**
- * Checks if `mimo-v2.6-flash-free` emitted an `<IMAGE_TASK ...>prompt</IMAGE_TASK>` tag
+ * Checks if `deepseek-v4.1-flash-free` emitted an `<IMAGE_TASK ...>prompt</IMAGE_TASK>` tag
  * OR accidentally claimed it cannot generate/edit images when the user asked for one.
  */
 function parseModelImageFallback(content = "", userText = "", hasImage = false) {
@@ -1679,10 +1691,10 @@ function resolveFlux3Dimensions(userText = "", options = {}, imageInput = null) 
 }
 
 /**
- * Max v1.0 (`mimo-v2.6-flash-free` + NVIDIA NIM `black-forest-labs/flux-3-image-klein`)
+ * Max v1.0 (`deepseek-v4.1-flash-free` + NVIDIA NIM `black-forest-labs/flux-3-image-klein`)
  * Image Generation & Vision-Guided Image Editing Pipeline:
  * 1. Resolves output dimensions (`1024 × 1024` default, or dynamic `9:16` `768×1344`, `16:9` `1344×768`, etc. based on user requirement).
- * 2. For `edit`: `mimo-v2.6-flash-free` inspects the uploaded image via Multimodal Vision + user's edit request, crafts:
+ * 2. For `edit`: `deepseek-v4.1-flash-free` inspects the uploaded image via Multimodal Vision + user's edit request, crafts:
  *    - `statusMessage`: immediate message so the user & app know the image is being edited right now
  *    - `maxPrompt`: detailed English visual scene prompt describing the uploaded image WITH the user's requested edit applied
  *    - `finalReply`: presentation message for the finished image
@@ -1855,7 +1867,7 @@ function sanitizePromptForNvidiaFlux3(rawPrompt = "") {
 
 /**
  * Replaces only trademarked brand names that trigger NVIDIA NIM's Cosmos `CONTENT_FILTERED` guardrail
- * while keeping 100% of `mimo-v2.6-flash-free`'s enhanced English prompt intact.
+ * while keeping 100% of `deepseek-v4.1-flash-free`'s enhanced English prompt intact.
  */
 function debrandForNvidiaCosmos(englishPrompt = "") {
   let p = String(englishPrompt || "").trim();
@@ -1890,7 +1902,7 @@ function debrandForNvidiaCosmos(englishPrompt = "") {
 
 /**
  * Rewrites a prompt that triggered NVIDIA NIM's `CONTENT_FILTERED` guardrail into a 100% brand-free,
- * guardrail-safe visual English description using `mimo-v2.6-flash-free` (with instant local fallback).
+ * guardrail-safe visual English description using `deepseek-v4.1-flash-free` (with instant local fallback).
  */
 async function rewritePromptForNvidiaGuardrail(originalPrompt = "", model = DEFAULT_MODEL) {
   const sanitized = debrandForNvidiaCosmos(sanitizePromptForNvidiaFlux3(originalPrompt));
@@ -2004,7 +2016,7 @@ async function runMaxImageAgent({
     } catch {}
   }
 
-  // Step 1: `mimo-v2.6-flash-free` ALWAYS understands the user's requirement first,
+  // Step 1: `deepseek-v4.1-flash-free` ALWAYS understands the user's requirement first,
   // streams every single token of its `thinking` (`delta.reasoning`) and `maxPrompt` (`delta.content`) LIVE,
   // and then executes the image generator/editor with `maxPrompt`!
   if (!maxPrompt) {
@@ -2212,7 +2224,7 @@ Rules:
   const buildThinkingSummary = () => formatThinkingAndPrompt(mimoThinking, maxPrompt);
   const fullThinking = buildThinkingSummary();
 
-  // Step 2: Notify caller/stream that `mimo-v2.6-flash-free` finished writing `maxPrompt` and is now executing the Image Tool!
+  // Step 2: Notify caller/stream that `deepseek-v4.1-flash-free` finished writing `maxPrompt` and is now executing the Image Tool!
   if (typeof onStatus === "function") {
     try {
       await onStatus({
@@ -2480,7 +2492,7 @@ function extractWebSearchSources(rawText = "") {
 }
 
 /**
- * Runs OpenCode `mimo-v2.6-flash-free` with automatic execution of OpenCode's
+ * Runs OpenCode `deepseek-v4.1-flash-free` with automatic execution of OpenCode's
  * built-in `websearch` and `webfetch` tools (up to 3 turns) + proactive OpenCode
  * web search pre-fetching whenever a query needs live web research.
  * Captures and returns both `thinking` (`reasoning`) and full `webSearchSources` / `webSearchResults`.
@@ -2505,7 +2517,7 @@ async function runOpenCodeAgentWithTools(payload, streamOptions = null) {
 
   // Proactive OpenCode Web Search: when the user's question asks for live/current info
   // or web research, pre-fetch OpenCode websearch (`search.parallel.ai/mcp` / `mcp.exa.ai/mcp`)
-  // so `mimo-v2.6-flash-free` has verified real-time web facts.
+  // so `deepseek-v4.1-flash-free` has verified real-time web facts.
   const latestUserText = extractLatestUserText(workingMessages);
   const shouldPreSearch =
     payload.allowWebSearch !== false &&
@@ -4468,7 +4480,7 @@ const server = http.createServer(async (req, res) => {
 
     const appBuilderMasterPrompt =
       `Connect my existing Vega App (Max v1.0 AI) UI to our live backend at https://vega-ai-6m2k.onrender.com without modifying any existing UI design, styles, or Support Chat.\n` +
-      `1. Text Agent (mimo-v2.6-flash-free + Live OpenCode Web Search): POST https://vega-ai-6m2k.onrender.com/api/chat with JSON { "message": "<text>", "history": [...], "image": "<optional_base64>" } -> render data.reply.\n` +
+      `1. Text Agent (deepseek-v4.1-flash-free + Live OpenCode Web Search): POST https://vega-ai-6m2k.onrender.com/api/chat with JSON { "message": "<text>", "history": [...], "image": "<optional_base64>" } -> render data.reply.\n` +
       `2. Voice Agent (gemini-2.5-flash-native-audio-preview-12-2025, Aoede voice + Live OpenCode Web Search): POST https://vega-ai-6m2k.onrender.com/api/voice with JSON { "audio": "<base64_wav_or_webm>", "mimeType": "audio/wav", "voice": "Aoede", "history": [...] } -> show data.transcript, data.reply, and auto-play data.audio.dataUri.\n` +
       `3. Per-User Chat History (ai_chats & ai_messages): GET /api/history/chats?user=<email>, GET /api/history/chats/<chatId>?user=<email>, POST /api/history/turns, PATCH /api/history/chats/<chatId>, DELETE /api/history/chats/<chatId>.`;
 
@@ -5174,7 +5186,7 @@ const server = http.createServer(async (req, res) => {
 
       const assembled = agentResult.assembled;
 
-      // Fallback check: if mimo-v2.6-flash-free emitted <IMAGE_TASK> or accidentally refused image gen
+      // Fallback check: if deepseek-v4.1-flash-free emitted <IMAGE_TASK> or accidentally refused image gen
       const fallbackImgTask = parseModelImageFallback(
         assembled.content,
         latestUserText,

@@ -4,7 +4,7 @@ Render-ready pure Node.js backend API server for **Vega App's AI & Voice Agent (
 
 ## 🧠 Voice Agent Architecture (`POST /api/voice`)
 1. **🎙️ STT (Speech-to-Text):** `gemini-2.5-flash` (Google AI Studio audio input -> Text transcript)
-2. **🤖 Middle LLM (Brain):** `mimo-v2.6-flash-free` via OpenCode Zen Gateway (Persona: **Max v1.0**)
+2. **🤖 Middle LLM (Brain):** `deepseek-v4.1-flash-free` via OpenCode Zen Gateway (Persona: **Max v1.0**)
    - **Fast No-Reasoning Mode (`reasoning_tokens: 0`):** Disables internal thinking tokens (`reasoning_effort: "none"`, `thinking: { type: "disabled" }`) so voice responses come back fast!
    - **Smart "Ek second, abhi batata hoon..." Filler:** When a question requires research, calculation, or detailed explanation, Max v1.0 naturally starts with *"Ek second, abhi batata hoon..."* and the server also provides instant cached filler audio (`fillerAudio` / `GET /api/voice/filler`).
 3. **🔊 TTS (Text-to-Speech):** `gemini-2.5-flash-preview-tts` (Converts Max v1.0's reply to a playable 24kHz `.wav` Base64 & Data URI for direct playback in the Vega App)
@@ -21,7 +21,7 @@ No API keys are hardcoded in the code. Add these in Render **Environment Variabl
 | `GEMINI_API_KEY` | Your Google AI Studio API Key (`AIzaSy...`) *(Also accepts `GOOGLE_API_KEY` or `GOOGLE_AI_STUDIO_API_KEY`)* |
 | `AI_NAME` | `Max v1.0` |
 | `APP_NAME` | `Vega` |
-| `DEFAULT_MODEL` | `mimo-v2.6-flash-free` |
+| `DEFAULT_MODEL` | `deepseek-v4.1-flash-free` |
 | `GEMINI_STT_MODEL` | `gemini-2.5-flash` |
 | `GEMINI_TTS_MODEL` | `gemini-2.5-flash-preview-tts` |
 | `GEMINI_TTS_VOICE` | `Aoede` *(or `Puck`, `Charon`, `Kore`, `Fenrir`)* |
@@ -48,7 +48,7 @@ const data = await response.json();
 // 1. User's transcribed speech (from gemini-2.5-flash):
 console.log("User said:", data.transcript);
 
-// 2. Max v1.0's fast reply (from mimo-v2.6-flash-free with reasoning disabled):
+// 2. Max v1.0's fast reply (from deepseek-v4.1-flash-free with reasoning disabled):
 console.log("Max v1.0 reply:", data.reply);
 
 // 3. Playable WAV audio in Vega App (from gemini-2.5-flash-preview-tts):

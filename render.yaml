@@ -14,7 +14,7 @@ services:
       - key: APP_NAME
         value: Vega
       - key: DEFAULT_MODEL
-        value: mimo-v2.6-flash-free
+        value: deepseek-v4.1-flash-free
       - key: GEMINI_VOICE_MODEL
         value: gemini-3.1-flash-live-preview
       - key: GEMINI_STT_MODEL
