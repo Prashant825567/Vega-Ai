@@ -944,11 +944,33 @@ async function callOpenCodeUpstream(payload) {
     (s) => !existingNames.has(s.function.name)
   );
 
-  const disableReasoning = payload.disableReasoning === true;
+  const resolvedTargetModel = resolveModel(payload.model);
+  const isDeepSeek = resolvedTargetModel.toLowerCase().includes("deepseek");
+  const disableReasoning = payload.disableReasoning === true && !isDeepSeek;
   const lastIdx = Array.isArray(payload.messages) ? payload.messages.length - 1 : -1;
   const preparedMessages = Array.isArray(payload.messages)
     ? payload.messages.map((m, idx) => {
-        if (!disableReasoning || !m) return m;
+        if (!m) return m;
+        if (isDeepSeek) {
+          if (typeof m.content === "string") {
+            return {
+              ...m,
+              content: m.content.replace(/^\/no_think\s*/i, "").replace(/\s*\/no_think\s*$/i, ""),
+            };
+          }
+          if (Array.isArray(m.content)) {
+            return {
+              ...m,
+              content: m.content.map((part) =>
+                part && part.type === "text" && typeof part.text === "string"
+                  ? { ...part, text: part.text.replace(/\s*\/no_think\s*$/i, "") }
+                  : part
+              ),
+            };
+          }
+          return m;
+        }
+        if (!disableReasoning) return m;
         if (typeof m.content === "string") {
           if (
             idx === 0 &&
@@ -966,7 +988,6 @@ async function callOpenCodeUpstream(payload) {
           }
           return m;
         }
-        // Also append /no_think to multimodal array messages (image + text) so deepseek-v4.1-flash-free doesn't spend 14s thinking!
         if (idx === lastIdx && Array.isArray(m.content)) {
           return {
             ...m,
@@ -988,7 +1009,7 @@ async function callOpenCodeUpstream(payload) {
     : [];
 
   const upstreamBody = {
-    model: resolveModel(payload.model),
+    model: resolvedTargetModel,
     messages: preparedMessages,
     stream: true,
     tools: [...existingTools, ...missingStubs],
