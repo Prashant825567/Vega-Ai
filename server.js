@@ -1551,17 +1551,508 @@ function parseModelImageFallback(content = "", userText = "", hasImage = false) 
   return null;
 }
 
-// In-memory store for recent generated/edited images so they can also be served via fast HTTPS URLs (`/api/image/view/:id.jpg`)
+// In-memory + /tmp disk + Vega Storage (`https://vega-storage.onrender.com/v1/files`) store for generated/edited images
 const generatedImagesStore = new Map();
-function saveGeneratedImageBuffer(buffer, mimeType = "image/jpeg") {
+const TMP_IMAGE_DIR = "/tmp/vega_generated_images";
+try {
+  fs.mkdirSync(TMP_IMAGE_DIR, { recursive: true });
+} catch {}
+
+function saveGeneratedImageBuffer(buffer, mimeType = "image/jpeg", customFileId = "") {
   const ext = mimeType.includes("png") ? "png" : "jpg";
-  const id = `img_${Date.now()}_${crypto.randomBytes(4).toString("hex")}.${ext}`;
-  generatedImagesStore.set(id, { buffer, mimeType, createdAt: Date.now() });
-  if (generatedImagesStore.size > 25) {
+  const cleanFileId = String(customFileId || "")
+    .trim()
+    .replace(/[^A-Za-z0-9_-]/g, "");
+  const id = cleanFileId
+    ? `img_${cleanFileId}.${ext}`
+    : `img_${Date.now()}_${crypto.randomBytes(4).toString("hex")}.${ext}`;
+
+  generatedImagesStore.set(id, {
+    buffer,
+    mimeType,
+    fileId: cleanFileId || null,
+    createdAt: Date.now(),
+  });
+  if (generatedImagesStore.size > 60) {
     const oldestKey = generatedImagesStore.keys().next().value;
     if (oldestKey) generatedImagesStore.delete(oldestKey);
   }
+  try {
+    fs.writeFileSync(path.join(TMP_IMAGE_DIR, id), buffer);
+  } catch {}
   return id;
+}
+
+/**
+ * Uploads a generated/edited image buffer to Vega Storage (`POST https://vega-storage.onrender.com/v1/files`)
+ * under the user's email (`X-Owner`) and chat (`X-Parent-Id`) so the user's images are permanently stored in Vega Vault.
+ */
+async function uploadBufferToVegaStorage({
+  buffer,
+  mimeType = "image/jpeg",
+  filename = "",
+  owner = "",
+  parentId = "",
+  ztKey = "",
+} = {}) {
+  const resolvedKey = String(
+    ztKey || process.env.ZENTRAGRID_API_KEY || process.env.STORAGE_API_KEY || ""
+  ).trim();
+  if (!resolvedKey || !Buffer.isBuffer(buffer) || buffer.length === 0) {
+    return null;
+  }
+  const ztBase = (
+    process.env.ZENTRAGRID_BASE_URL || "https://vega-storage.onrender.com"
+  ).replace(/\/+$/, "");
+  const ext = mimeType.includes("png") ? "png" : "jpg";
+  const safeName = filename || `vega_image_${Date.now()}.${ext}`;
+  const boundary = `----VegaStorageBoundary${crypto.randomBytes(12).toString("hex")}`;
+
+  const headerPart = Buffer.from(
+    `--${boundary}\r\n` +
+      `Content-Disposition: form-data; name="file"; filename="${safeName}"\r\n` +
+      `Content-Type: ${mimeType}\r\n\r\n`,
+    "utf8"
+  );
+  const footerPart = Buffer.from(`\r\n--${boundary}--\r\n`, "utf8");
+  const multipartBody = Buffer.concat([headerPart, buffer, footerPart]);
+
+  const headers = {
+    Authorization: `Bearer ${resolvedKey}`,
+    "Content-Type": `multipart/form-data; boundary=${boundary}`,
+    "Content-Length": String(multipartBody.length),
+  };
+  if (owner) headers["X-Owner"] = String(owner).trim().toLowerCase();
+  if (parentId) headers["X-Parent-Id"] = String(parentId).trim();
+
+  try {
+    const res = await Promise.race([
+      fetch(`${ztBase}/v1/files`, {
+        method: "POST",
+        headers,
+        body: multipartBody,
+      }),
+      new Promise((_, rej) => setTimeout(() => rej(new Error("Storage upload timeout")), 8000)),
+    ]);
+    if (!res.ok) return null;
+    const json = await res.json().catch(() => null);
+    const data = json?.data || json || {};
+    const fileId = data.id || json?.id || "";
+    if (!fileId) return null;
+    return {
+      fileId: String(fileId),
+      record: data,
+    };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Resolves a stored image buffer by `imgId` (e.g. `img_<fileId>.jpg` or `<fileId>`):
+ * 1) Checks in-memory `generatedImagesStore`
+ * 2) Checks `/tmp/vega_generated_images/<imgId>`
+ * 3) Downloads from Vega Storage `GET https://vega-storage.onrender.com/v1/files/<fileId>/download`
+ */
+async function resolveStoredImageBuffer(imgId = "", ztKey = "") {
+  const cleanId = String(imgId || "").trim();
+  if (!cleanId) return null;
+
+  // 1) In-memory Map
+  const memItem = generatedImagesStore.get(cleanId);
+  if (memItem && Buffer.isBuffer(memItem.buffer) && memItem.buffer.length > 0) {
+    return memItem;
+  }
+
+  // 2) Local /tmp disk cache
+  const diskPath = path.join(TMP_IMAGE_DIR, path.basename(cleanId));
+  try {
+    if (fs.existsSync(diskPath)) {
+      const buf = fs.readFileSync(diskPath);
+      if (buf && buf.length > 0) {
+        const mimeType = cleanId.toLowerCase().endsWith(".png") ? "image/png" : "image/jpeg";
+        const entry = { buffer: buf, mimeType, createdAt: Date.now() };
+        generatedImagesStore.set(cleanId, entry);
+        return entry;
+      }
+    }
+  } catch {}
+
+  // 3) Vega Storage `/v1/files/:fileId/download`
+  const resolvedKey = String(
+    ztKey || process.env.ZENTRAGRID_API_KEY || process.env.STORAGE_API_KEY || ""
+  ).trim();
+  if (!resolvedKey) return null;
+
+  // Extract fileId from `img_<fileId>.jpg`, `img_<timestamp>_<hex>.jpg`, or `<fileId>`
+  let candidateFileId = cleanId.replace(/\.(jpg|jpeg|png|webp)$/i, "");
+  if (candidateFileId.startsWith("img_")) {
+    candidateFileId = candidateFileId.slice(4);
+  }
+  if (!candidateFileId || /^\d{13}_[0-9a-f]{8}$/i.test(candidateFileId)) {
+    return null;
+  }
+
+  const ztBase = (
+    process.env.ZENTRAGRID_BASE_URL || "https://vega-storage.onrender.com"
+  ).replace(/\/+$/, "");
+
+  try {
+    const dlRes = await Promise.race([
+      fetch(`${ztBase}/v1/files/${encodeURIComponent(candidateFileId)}/download`, {
+        method: "GET",
+        headers: {
+          Authorization: `Bearer ${resolvedKey}`,
+        },
+      }),
+      new Promise((_, rej) => setTimeout(() => rej(new Error("Storage download timeout")), 8000)),
+    ]);
+    if (!dlRes.ok) return null;
+    const arrBuf = await dlRes.arrayBuffer();
+    const buf = Buffer.from(arrBuf);
+    if (!buf || buf.length === 0) return null;
+    const mimeType =
+      dlRes.headers.get("content-type") ||
+      (cleanId.toLowerCase().endsWith(".png") ? "image/png" : "image/jpeg");
+    const entry = {
+      buffer: buf,
+      mimeType,
+      fileId: candidateFileId,
+      createdAt: Date.now(),
+    };
+    generatedImagesStore.set(cleanId, entry);
+    try {
+      fs.writeFileSync(diskPath, buf);
+    } catch {}
+    return entry;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Persists a generated/edited image turn into `ai_chats` + `ai_messages` on Vega Storage
+ * using the deterministic `ai_chat_<slug>_<ms>` and `ai_msg_<chatId>_<seq>` IDs.
+ */
+async function persistImageTurnToHistory({
+  userEmail = "",
+  chatId = "",
+  device = "android",
+  userPrompt = "",
+  finalReply = "",
+  fileId = "",
+  imageId = "",
+  imageUrl = "",
+  maxPrompt = "",
+  action = "generate",
+  width = 1024,
+  height = 1024,
+  thinking = "",
+  ztKey = "",
+} = {}) {
+  const email = String(userEmail || "").trim().toLowerCase();
+  const resolvedKey = String(
+    ztKey || process.env.ZENTRAGRID_API_KEY || process.env.STORAGE_API_KEY || ""
+  ).trim();
+  if (!email || !resolvedKey) return null;
+
+  const ztBase = (
+    process.env.ZENTRAGRID_BASE_URL || "https://vega-storage.onrender.com"
+  ).replace(/\/+$/, "");
+  const slug =
+    email
+      .replace(/[^a-z0-9]+/g, "_")
+      .replace(/^_+|_+$/g, "")
+      .slice(0, 64) || "user";
+  const nowMs = Date.now();
+  const nowIso = new Date(nowMs).toISOString();
+  const targetChatId = String(chatId || "").trim() || `ai_chat_${slug}_${nowMs}`;
+
+  const ztJson = async (relPath, method = "GET", bodyObj = null) => {
+    const r = await fetch(`${ztBase}${relPath}`, {
+      method,
+      headers: {
+        Authorization: `Bearer ${resolvedKey}`,
+        ...(bodyObj ? { "Content-Type": "application/json" } : {}),
+      },
+      body: bodyObj ? JSON.stringify(bodyObj) : undefined,
+    });
+    const txt = await r.text().catch(() => "");
+    let parsed = null;
+    try {
+      parsed = txt ? JSON.parse(txt) : null;
+    } catch {}
+    return { ok: r.ok, status: r.status, json: parsed };
+  };
+
+  try {
+    const existingRes = await ztJson(
+      `/v1/data/ai_chats?where=id:eq:${encodeURIComponent(targetChatId)}&limit=1`
+    );
+    let chatData = (existingRes.json?.documents || [])[0]?.data || null;
+    if (!chatData) {
+      const titleText = String(userPrompt || "Generated Image").trim().slice(0, 60) || "New chat";
+      chatData = {
+        id: targetChatId,
+        user: email,
+        title: titleText,
+        created_at: nowIso,
+        updated_at: nowIso,
+        turns: 0,
+        last_text: String(finalReply || userPrompt || "").trim().slice(0, 120),
+        device: device === "ios" || device === "web" ? device : "android",
+      };
+      await ztJson("/v1/data/ai_chats", "POST", { id: targetChatId, data: chatData });
+    }
+
+    const baseTurns = Number(chatData.turns) || 0;
+    const userSeq = baseTurns + 1;
+    const aiSeq = baseTurns + 2;
+    const userMsgId = `ai_msg_${targetChatId}_${String(userSeq).padStart(4, "0")}`;
+    const aiMsgId = `ai_msg_${targetChatId}_${String(aiSeq).padStart(4, "0")}`;
+    const aiIso = new Date(nowMs + 1).toISOString();
+
+    const userMsgData = {
+      id: userMsgId,
+      chat_id: targetChatId,
+      user: email,
+      role: "user",
+      text: String(userPrompt || ""),
+      at: nowIso,
+      kind: "image",
+    };
+
+    const aiMsgData = {
+      id: aiMsgId,
+      chat_id: targetChatId,
+      user: email,
+      role: "ai",
+      text: String(finalReply || ""),
+      at: aiIso,
+      kind: "image",
+      ...(fileId ? { file_id: String(fileId) } : {}),
+      ...(imageId ? { image_id: String(imageId) } : {}),
+      ...(imageUrl ? { image_url: String(imageUrl) } : {}),
+      ...(maxPrompt ? { max_prompt: String(maxPrompt) } : {}),
+      ...(thinking ? { thinking: String(thinking).slice(0, 4000) } : {}),
+      image_action: action === "edit" ? "edit" : "generate",
+      width: Number(width) || 1024,
+      height: Number(height) || 1024,
+    };
+
+    await ztJson("/v1/data/ai_messages", "POST", { id: userMsgId, data: userMsgData });
+    await ztJson("/v1/data/ai_messages", "POST", { id: aiMsgId, data: aiMsgData });
+
+    const patchFields = {
+      updated_at: aiIso,
+      turns: aiSeq,
+      last_text: String(finalReply || userPrompt || "").trim().slice(0, 120),
+    };
+    await ztJson(`/v1/data/ai_chats/${encodeURIComponent(targetChatId)}`, "PATCH", {
+      data: patchFields,
+    });
+
+    return {
+      chatId: targetChatId,
+      userMessage: userMsgData,
+      aiMessage: aiMsgData,
+    };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Lists stored generated/edited images for a user across:
+ * 1) Local in-memory / `/tmp/vega_generated_images/*.json` store
+ * 2) Vega Storage `GET /v1/files?owner=<email>` + `GET /v1/data/ai_messages?where=user:eq:<email>`
+ */
+async function listStoredUserImages({
+  userEmail = "",
+  chatId = "",
+  limit = 50,
+  ztKey = "",
+  publicBaseUrl = "https://vega-ai-6m2k.onrender.com",
+} = {}) {
+  const email = String(userEmail || "").trim().toLowerCase();
+  const filterChatId = String(chatId || "").trim();
+  const maxItems = Math.min(Math.max(Number(limit) || 50, 1), 200);
+  const baseUrl = publicBaseUrl.replace(/\/+$/, "");
+  const byKey = new Map();
+
+  // 1) Local in-memory + /tmp sidecar metadata
+  for (const [imgId, entry] of generatedImagesStore.entries()) {
+    if (email && entry.user && String(entry.user).toLowerCase() !== email) continue;
+    if (filterChatId && entry.chatId && String(entry.chatId) !== filterChatId) continue;
+    const key = entry.fileId || imgId;
+    byKey.set(key, {
+      imageId: imgId,
+      fileId: entry.fileId || null,
+      user: entry.user || email || null,
+      chatId: entry.chatId || null,
+      action: entry.action || "generate",
+      imageModel: entry.imageModel || NVIDIA_IMAGE_MODEL,
+      mimeType: entry.mimeType || "image/jpeg",
+      width: entry.width || 1024,
+      height: entry.height || 1024,
+      aspectRatio: entry.aspectRatio || "1:1",
+      userPrompt: entry.userPrompt || null,
+      maxPrompt: entry.maxPrompt || null,
+      reply: entry.finalReply || null,
+      imageUrl: entry.imageUrl || `${baseUrl}/api/image/view/${imgId}`,
+      createdAt:
+        typeof entry.createdAt === "string"
+          ? entry.createdAt
+          : new Date(entry.createdAt || Date.now()).toISOString(),
+    });
+  }
+
+  try {
+    const files = fs.readdirSync(TMP_IMAGE_DIR).filter((f) => f.endsWith(".json"));
+    for (const f of files) {
+      try {
+        const meta = JSON.parse(fs.readFileSync(path.join(TMP_IMAGE_DIR, f), "utf8"));
+        if (!meta || !meta.imageId) continue;
+        if (email && meta.user && String(meta.user).toLowerCase() !== email) continue;
+        if (filterChatId && meta.chatId && String(meta.chatId) !== filterChatId) continue;
+        const key = meta.fileId || meta.imageId;
+        if (!byKey.has(key)) {
+          byKey.set(key, {
+            ...meta,
+            imageUrl: meta.imageUrl || `${baseUrl}/api/image/view/${meta.imageId}`,
+          });
+        }
+      } catch {}
+    }
+  } catch {}
+
+  // 2) Vega Storage `/v1/files` + `ai_messages` when ztKey is available
+  const resolvedKey = String(
+    ztKey || process.env.ZENTRAGRID_API_KEY || process.env.STORAGE_API_KEY || ""
+  ).trim();
+  if (resolvedKey) {
+    const ztBase = (
+      process.env.ZENTRAGRID_BASE_URL || "https://vega-storage.onrender.com"
+    ).replace(/\/+$/, "");
+
+    // 2a) Query `/v1/files` by owner
+    try {
+      const qs = new URLSearchParams();
+      if (email) qs.set("owner", email);
+      if (filterChatId) qs.set("parent_id", filterChatId);
+      const fRes = await fetch(
+        `${ztBase}/v1/files${qs.toString() ? `?${qs.toString()}` : ""}`,
+        {
+          headers: { Authorization: `Bearer ${resolvedKey}` },
+        }
+      );
+      if (fRes.ok) {
+        const fJson = await fRes.json().catch(() => null);
+        const fileList = fJson?.files || fJson?.data?.files || [];
+        for (const fDoc of fileList) {
+          const mime = String(fDoc.mime || "");
+          if (!mime.startsWith("image/") && !/\.(jpg|jpeg|png|webp)$/i.test(String(fDoc.name || ""))) {
+            continue;
+          }
+          const ext = mime.includes("png") ? "png" : "jpg";
+          const fId = String(fDoc.id || "");
+          if (!fId) continue;
+          const imgId = `img_${fId}.${ext}`;
+          if (!byKey.has(fId)) {
+            byKey.set(fId, {
+              imageId: imgId,
+              fileId: fId,
+              user: fDoc.owner || email || null,
+              chatId: fDoc.parent_id && fDoc.parent_id !== "vega_ai_images" ? fDoc.parent_id : null,
+              action: String(fDoc.name || "").includes("_edit_") ? "edit" : "generate",
+              mimeType: mime || "image/jpeg",
+              size: fDoc.size || null,
+              imageUrl: `${baseUrl}/api/image/view/${imgId}`,
+              downloadUrl: `${baseUrl}/v1/files/${fId}/download`,
+              createdAt: fDoc.created_at || new Date().toISOString(),
+            });
+          }
+        }
+      }
+    } catch {}
+
+    // 2b) Enrich with `ai_messages` image turns for this user/chat
+    if (email || filterChatId) {
+      try {
+        const whereClause = filterChatId
+          ? `chat_id:eq:${encodeURIComponent(filterChatId)}`
+          : `user:eq:${encodeURIComponent(email)}`;
+        const mRes = await fetch(
+          `${ztBase}/v1/data/ai_messages?where=${whereClause}&order_by=at:desc&limit=200`,
+          {
+            headers: { Authorization: `Bearer ${resolvedKey}` },
+          }
+        );
+        if (mRes.ok) {
+          const mJson = await mRes.json().catch(() => null);
+          for (const doc of mJson?.documents || []) {
+            const d = doc.data || {};
+            if (d.role !== "ai" && d.role !== "assistant") continue;
+            if (d.kind !== "image" && !d.image_url && !d.file_id) continue;
+            const fId = d.file_id || null;
+            const imgId = d.image_id || (fId ? `img_${fId}.jpg` : doc.id);
+            const key = fId || imgId;
+            const existing = byKey.get(key) || {};
+            byKey.set(key, {
+              ...existing,
+              imageId: imgId,
+              fileId: fId || existing.fileId || null,
+              user: d.user || existing.user || email || null,
+              chatId: d.chat_id || existing.chatId || null,
+              action: d.image_action || existing.action || "generate",
+              width: d.width || existing.width || 1024,
+              height: d.height || existing.height || 1024,
+              maxPrompt: d.max_prompt || existing.maxPrompt || null,
+              reply: d.text || d.content || existing.reply || null,
+              imageUrl: d.image_url || existing.imageUrl || `${baseUrl}/api/image/view/${imgId}`,
+              createdAt: d.at || d.created_at || existing.createdAt || new Date().toISOString(),
+            });
+          }
+        }
+      } catch {}
+    }
+  }
+
+  const allItems = Array.from(byKey.values());
+  allItems.sort((a, b) => String(b.createdAt || "").localeCompare(String(a.createdAt || "")));
+  return allItems.slice(0, maxItems);
+}
+
+/**
+ * Enriches image agent options with user email, chatId, and storage API key from HTTP headers or query params.
+ */
+function enrichImageOptionsFromReq(req, url, body = {}) {
+  const userFromHeader =
+    req.headers["x-user-email"] ||
+    req.headers["x-owner"] ||
+    req.headers["x-user"] ||
+    url?.searchParams?.get("user") ||
+    url?.searchParams?.get("email") ||
+    "";
+  const chatFromHeader =
+    req.headers["x-chat-id"] ||
+    req.headers["x-parent-id"] ||
+    url?.searchParams?.get("chatId") ||
+    url?.searchParams?.get("chat_id") ||
+    "";
+  const ztKeyFromHeader =
+    req.headers["x-zentragrid-key"] ||
+    req.headers["x-storage-key"] ||
+    req.headers["x-api-key"] ||
+    "";
+
+  return {
+    ...body,
+    user: body.user || body.email || body.userId || userFromHeader || "",
+    chatId: body.chatId || body.chat_id || chatFromHeader || "",
+    zentragridApiKey:
+      body.zentragridApiKey || body.storageApiKey || ztKeyFromHeader || "",
+  };
 }
 
 /**
@@ -2440,12 +2931,87 @@ Rules:
     }
   }
 
-  const imageId = saveGeneratedImageBuffer(imgBuffer, contentType);
+  const userEmail = String(options.user || options.email || options.userId || "")
+    .trim()
+    .toLowerCase();
+  const chatId = String(options.chatId || options.chat_id || "").trim();
+  const ztKey = String(
+    options.zentragridApiKey ||
+      options.storageApiKey ||
+      process.env.ZENTRAGRID_API_KEY ||
+      process.env.STORAGE_API_KEY ||
+      ""
+  ).trim();
+  const ext = contentType.includes("png") ? "png" : "jpg";
+
+  // Upload generated/edited image to Vega Storage (`POST /v1/files`) for permanent per-user persistence
+  const vaultUpload = await uploadBufferToVegaStorage({
+    buffer: imgBuffer,
+    mimeType: contentType,
+    filename: `vega_${isEdit ? "edit" : "gen"}_${Date.now()}.${ext}`,
+    owner: userEmail || "vega_ai",
+    parentId: chatId || "vega_ai_images",
+    ztKey,
+  });
+
+  const fileId = vaultUpload?.fileId || null;
+  const imageId = saveGeneratedImageBuffer(imgBuffer, contentType, fileId || "");
   const hostedUrl = `${publicBaseUrl.replace(/\/+$/, "")}/api/image/view/${imageId}`;
   const outBase64 = imgBuffer.toString("base64");
   const outDataUri = `data:${contentType};base64,${outBase64}`;
 
+  // Attach user & prompt metadata to the stored image entry (+ disk metadata sidecar)
+  const storedEntry = generatedImagesStore.get(imageId);
+  const imageMeta = {
+    imageId,
+    fileId,
+    user: userEmail || null,
+    chatId: chatId || null,
+    action: isEdit ? "edit" : "generate",
+    imageModel: isEdit ? CLOUDFLARE_EDIT_MODEL : NVIDIA_IMAGE_MODEL,
+    mimeType: contentType,
+    width: outWidth,
+    height: outHeight,
+    aspectRatio: outAspectRatio,
+    userPrompt: userText,
+    maxPrompt,
+    finalReply,
+    imageUrl: hostedUrl,
+    createdAt: new Date().toISOString(),
+  };
+  if (storedEntry) {
+    Object.assign(storedEntry, imageMeta);
+  }
+  try {
+    fs.writeFileSync(
+      path.join(TMP_IMAGE_DIR, `${imageId}.json`),
+      JSON.stringify(imageMeta),
+      "utf8"
+    );
+  } catch {}
+
   const finalThinking = buildThinkingSummary();
+
+  // If userEmail and ztKey are provided (and saveToHistory !== false),
+  // persist the image turn in `ai_chats` + `ai_messages` on Vega Storage automatically.
+  if (userEmail && ztKey && options.saveToHistory !== false && (chatId || options.saveToHistory === true)) {
+    persistImageTurnToHistory({
+      userEmail,
+      chatId,
+      device: options.device || "android",
+      userPrompt: userText,
+      finalReply,
+      fileId: fileId || "",
+      imageId,
+      imageUrl: hostedUrl,
+      maxPrompt,
+      action: isEdit ? "edit" : "generate",
+      width: outWidth,
+      height: outHeight,
+      thinking: finalThinking || "",
+      ztKey,
+    }).catch(() => {});
+  }
 
   return {
     action: isEdit ? "edit" : "generate",
@@ -2462,8 +3028,14 @@ Rules:
     reasoning: finalThinking,
     finalReply,
     imageId,
+    fileId,
+    storedInVault: Boolean(fileId),
+    user: userEmail || null,
+    chatId: chatId || null,
     hostedUrl,
     image: {
+      id: imageId,
+      fileId,
       mimeType: contentType,
       width: outWidth,
       height: outHeight,
@@ -4958,21 +5530,79 @@ const server = http.createServer(async (req, res) => {
     }
   }
 
-  // 6c-0. Serve Cached Generated/Edited PNG Images: GET /api/image/view/:id
+  // 6c-0. Serve Stored Generated/Edited Images: GET /api/image/view/:id
+  //       Checks RAM -> /tmp disk -> Vega Storage (`https://vega-storage.onrender.com/v1/files/:fileId/download`)
   const imgViewMatch = pathname.match(/^\/api\/image\/view\/([^/]+)$/);
   if (req.method === "GET" && imgViewMatch) {
     const imgId = decodeURIComponent(imgViewMatch[1]);
-    const item = generatedImagesStore.get(imgId);
-    if (!item) {
+    const ztKey = (
+      process.env.ZENTRAGRID_API_KEY ||
+      process.env.STORAGE_API_KEY ||
+      (req.headers["authorization"] || "").replace(/^Bearer\s+/i, "") ||
+      req.headers["x-api-key"] ||
+      url.searchParams.get("key") ||
+      ""
+    ).trim();
+    const item = await resolveStoredImageBuffer(imgId, ztKey);
+    if (!item || !Buffer.isBuffer(item.buffer)) {
       return sendJson(res, 404, { success: false, error: "Image not found or expired" });
     }
     setCorsHeaders(res);
     res.writeHead(200, {
-      "Content-Type": item.mimeType || "image/png",
+      "Content-Type": item.mimeType || "image/jpeg",
       "Content-Length": item.buffer.length,
-      "Cache-Control": "public, max-age=3600",
+      "Cache-Control": "public, max-age=31536000, immutable",
     });
     return res.end(item.buffer);
+  }
+
+  // 6c-0b. List Stored Generated/Edited Images for a User:
+  //        GET /api/images?user=<email>&chat_id=<id>&limit=50 (or GET /api/image/list, GET /api/history/images)
+  if (
+    req.method === "GET" &&
+    (pathname === "/api/images" ||
+      pathname === "/api/image/list" ||
+      pathname === "/api/history/images")
+  ) {
+    const userEmail = String(
+      url.searchParams.get("user") ||
+        url.searchParams.get("email") ||
+        req.headers["x-user-email"] ||
+        req.headers["x-owner"] ||
+        ""
+    )
+      .trim()
+      .toLowerCase();
+    const chatId = String(
+      url.searchParams.get("chatId") ||
+        url.searchParams.get("chat_id") ||
+        req.headers["x-chat-id"] ||
+        ""
+    ).trim();
+    const limit = Math.min(Math.max(Number(url.searchParams.get("limit")) || 50, 1), 200);
+    const ztKey = (
+      process.env.ZENTRAGRID_API_KEY ||
+      process.env.STORAGE_API_KEY ||
+      (req.headers["authorization"] || "").replace(/^Bearer\s+/i, "") ||
+      req.headers["x-api-key"] ||
+      req.headers["x-zentragrid-key"] ||
+      ""
+    ).trim();
+
+    const images = await listStoredUserImages({
+      userEmail,
+      chatId,
+      limit,
+      ztKey,
+    });
+
+    return sendJson(res, 200, {
+      success: true,
+      user: userEmail || null,
+      chatId: chatId || null,
+      count: images.length,
+      images,
+    });
   }
 
   // 6c. Dedicated Image Generate & Vision Image Edit Endpoints:
@@ -5025,7 +5655,7 @@ const server = http.createServer(async (req, res) => {
         imageInput,
         action: forcedAction,
         model: body.model || DEFAULT_MODEL,
-        options: body,
+        options: enrichImageOptionsFromReq(req, url, body),
         onStatus: (statusPayload) => {
           if (liveStream) {
             liveStream.onImageStatus(statusPayload);
@@ -5054,6 +5684,11 @@ const server = http.createServer(async (req, res) => {
         thinking: imgResult.thinking,
         reasoning: imgResult.reasoning,
         reply: imgResult.finalReply,
+        imageId: imgResult.imageId,
+        fileId: imgResult.fileId,
+        storedInVault: imgResult.storedInVault,
+        user: imgResult.user,
+        chatId: imgResult.chatId,
         image: imgResult.image,
         imageUrl: imgResult.hostedUrl,
       };
@@ -5119,7 +5754,7 @@ const server = http.createServer(async (req, res) => {
           imageInput,
           action: imageTaskAction,
           model: body.model || DEFAULT_MODEL,
-          options: body,
+          options: enrichImageOptionsFromReq(req, url, body),
           onStatus: (statusPayload) => {
             if (liveStream) {
               liveStream.onImageStatus(statusPayload);
@@ -5146,6 +5781,11 @@ const server = http.createServer(async (req, res) => {
           userPrompt: imgResult.userPrompt,
           maxPrompt: imgResult.maxPrompt,
           reply: imgResult.finalReply,
+          imageId: imgResult.imageId,
+          fileId: imgResult.fileId,
+          storedInVault: imgResult.storedInVault,
+          user: imgResult.user,
+          chatId: imgResult.chatId,
           image: imgResult.image,
           imageUrl: imgResult.hostedUrl,
           usedWebSearch: false,
@@ -5223,7 +5863,7 @@ const server = http.createServer(async (req, res) => {
           preThinking: assembled.reasoning || "",
           preStatusMessage: fallbackImgTask.statusMessage,
           preFinalReply: fallbackImgTask.finalReply,
-          options: body,
+          options: enrichImageOptionsFromReq(req, url, body),
           onStatus: (statusPayload) => {
             if (liveStream) {
               liveStream.onImageStatus(statusPayload);
@@ -5247,6 +5887,11 @@ const server = http.createServer(async (req, res) => {
           userPrompt: imgResult.userPrompt,
           maxPrompt: imgResult.maxPrompt,
           reply: fallbackImgTask.finalReply || imgResult.finalReply,
+          imageId: imgResult.imageId,
+          fileId: imgResult.fileId,
+          storedInVault: imgResult.storedInVault,
+          user: imgResult.user,
+          chatId: imgResult.chatId,
           image: imgResult.image,
           imageUrl: imgResult.hostedUrl,
           usedWebSearch: false,
@@ -5336,7 +5981,7 @@ const server = http.createServer(async (req, res) => {
           imageInput,
           action: imageTaskAction,
           model: body.model || DEFAULT_MODEL,
-          options: body,
+          options: enrichImageOptionsFromReq(req, url, body),
           onStatus: (statusPayload) => {
             if (liveStream) {
               liveStream.onImageStatus(statusPayload);
@@ -5365,6 +6010,11 @@ const server = http.createServer(async (req, res) => {
           thinking: imgResult.thinking,
           reasoning: imgResult.reasoning,
           reply: imgResult.finalReply,
+          imageId: imgResult.imageId,
+          fileId: imgResult.fileId,
+          storedInVault: imgResult.storedInVault,
+          user: imgResult.user,
+          chatId: imgResult.chatId,
           image: imgResult.image,
           imageUrl: imgResult.hostedUrl,
           choices: [
@@ -5376,6 +6026,8 @@ const server = http.createServer(async (req, res) => {
                 thinking: imgResult.thinking,
                 reasoning: imgResult.reasoning,
                 reasoning_content: imgResult.reasoning,
+                imageId: imgResult.imageId,
+                fileId: imgResult.fileId,
                 image: imgResult.image,
                 imageUrl: imgResult.hostedUrl,
               },
@@ -5446,7 +6098,7 @@ const server = http.createServer(async (req, res) => {
           preThinking: assembled.reasoning || "",
           preStatusMessage: fallbackImgTask.statusMessage,
           preFinalReply: fallbackImgTask.finalReply,
-          options: body,
+          options: enrichImageOptionsFromReq(req, url, body),
           onStatus: (statusPayload) => {
             if (liveStream) {
               liveStream.onImageStatus(statusPayload);
@@ -5475,6 +6127,11 @@ const server = http.createServer(async (req, res) => {
           thinking: imgResult.thinking || assembled.reasoning || null,
           reasoning: imgResult.reasoning || assembled.reasoning || null,
           reply: fallbackImgTask.finalReply || imgResult.finalReply,
+          imageId: imgResult.imageId,
+          fileId: imgResult.fileId,
+          storedInVault: imgResult.storedInVault,
+          user: imgResult.user,
+          chatId: imgResult.chatId,
           image: imgResult.image,
           imageUrl: imgResult.hostedUrl,
           choices: [
@@ -5485,6 +6142,8 @@ const server = http.createServer(async (req, res) => {
                 content: fallbackImgTask.finalReply || imgResult.finalReply,
                 thinking: imgResult.thinking || assembled.reasoning || null,
                 reasoning: imgResult.reasoning || assembled.reasoning || null,
+                imageId: imgResult.imageId,
+                fileId: imgResult.fileId,
                 image: imgResult.image,
                 imageUrl: imgResult.hostedUrl,
               },
@@ -5720,8 +6379,20 @@ const server = http.createServer(async (req, res) => {
         items.push({
           role: body.role || "user",
           text: body.text || body.message || body.reply || "",
-          kind: body.kind || "text",
-          file_id: body.file_id,
+          kind:
+            body.kind ||
+            (body.image_url || body.imageUrl || body.image || body.max_prompt || body.maxPrompt
+              ? "image"
+              : "text"),
+          file_id: body.file_id || body.fileId,
+          image_id: body.image_id || body.imageId,
+          image_url: body.image_url || body.imageUrl,
+          image: body.image,
+          max_prompt: body.max_prompt || body.maxPrompt,
+          image_action: body.image_action || body.imageAction,
+          width: body.width,
+          height: body.height,
+          thinking: body.thinking || body.reasoning,
           duration_ms: body.duration_ms,
           seq: body.seq,
           at: body.at,
@@ -5761,18 +6432,86 @@ const server = http.createServer(async (req, res) => {
         const seqStr = String(seqNum).padStart(4, "0");
         const msgId = `ai_msg_${chatId}_${seqStr}`;
         const msgAt = item.at || new Date().toISOString();
+
+        let resolvedKind =
+          item.kind === "voice"
+            ? "voice"
+            : item.kind === "image" ||
+              item.image_url ||
+              item.imageUrl ||
+              item.image ||
+              item.max_prompt ||
+              item.maxPrompt
+            ? "image"
+            : "text";
+
+        let resolvedFileId = item.file_id || item.fileId || "";
+        let resolvedImageId = item.image_id || item.imageId || "";
+        let resolvedImageUrl = item.image_url || item.imageUrl || "";
+
+        // If raw base64/dataUri image was provided without a file_id, upload it to `/v1/files` first
+        if (resolvedKind === "image" && !resolvedFileId && item.image) {
+          const rawStr =
+            typeof item.image === "string"
+              ? item.image
+              : item.image?.dataUri || item.image?.base64 || "";
+          if (rawStr && !/^https?:\/\//i.test(rawStr)) {
+            const cleanedB64 = rawStr.replace(/^data:[^;]+;base64,/i, "").trim();
+            const mimeMatch = rawStr.match(/^data:([^;]+);base64,/i);
+            const mimeType = mimeMatch ? mimeMatch[1] : "image/jpeg";
+            const imgBuf = Buffer.from(cleanedB64, "base64");
+            if (imgBuf.length > 0) {
+              const up = await uploadBufferToVegaStorage({
+                buffer: imgBuf,
+                mimeType,
+                owner: userEmail,
+                parentId: chatId,
+                ztKey,
+              });
+              if (up?.fileId) {
+                resolvedFileId = up.fileId;
+                resolvedImageId = saveGeneratedImageBuffer(imgBuf, mimeType, resolvedFileId);
+                resolvedImageUrl =
+                  resolvedImageUrl ||
+                  `https://vega-ai-6m2k.onrender.com/api/image/view/${resolvedImageId}`;
+              }
+            }
+          } else if (typeof rawStr === "string" && /^https?:\/\//i.test(rawStr)) {
+            resolvedImageUrl = resolvedImageUrl || rawStr;
+          }
+        }
+
+        if (resolvedKind === "image" && resolvedFileId && !resolvedImageUrl) {
+          const imgId = resolvedImageId || `img_${resolvedFileId}.jpg`;
+          resolvedImageId = imgId;
+          resolvedImageUrl = `https://vega-ai-6m2k.onrender.com/api/image/view/${imgId}`;
+        }
+
         const msgData = {
           id: msgId,
           chat_id: chatId,
           user: userEmail,
-          role: item.role === "ai" ? "ai" : "user",
+          role: item.role === "ai" || item.role === "assistant" ? "ai" : "user",
           text: String(item.text || ""),
           at: msgAt,
-          kind: item.kind === "voice" ? "voice" : "text",
-          ...(item.kind === "voice" && item.file_id ? { file_id: item.file_id } : {}),
-          ...(item.kind === "voice" && typeof item.duration_ms === "number"
+          kind: resolvedKind,
+          ...((resolvedKind === "voice" || resolvedKind === "image") && resolvedFileId
+            ? { file_id: String(resolvedFileId) }
+            : {}),
+          ...(resolvedKind === "voice" && typeof item.duration_ms === "number"
             ? { duration_ms: Math.round(item.duration_ms) }
             : {}),
+          ...(resolvedKind === "image" && resolvedImageId ? { image_id: String(resolvedImageId) } : {}),
+          ...(resolvedKind === "image" && resolvedImageUrl ? { image_url: String(resolvedImageUrl) } : {}),
+          ...(resolvedKind === "image" && (item.max_prompt || item.maxPrompt)
+            ? { max_prompt: String(item.max_prompt || item.maxPrompt) }
+            : {}),
+          ...(resolvedKind === "image" && (item.image_action || item.imageAction)
+            ? { image_action: item.image_action || item.imageAction }
+            : {}),
+          ...(resolvedKind === "image" && item.width ? { width: Number(item.width) } : {}),
+          ...(resolvedKind === "image" && item.height ? { height: Number(item.height) } : {}),
+          ...(item.thinking ? { thinking: String(item.thinking).slice(0, 4000) } : {}),
         };
         await ztFetch("/v1/data/ai_messages", {
           method: "POST",
@@ -5890,6 +6629,18 @@ const server = http.createServer(async (req, res) => {
       }
       if (req.headers["range"]) {
         forwardHeaders["Range"] = req.headers["range"];
+      }
+      if (req.headers["x-owner"] || req.headers["x-user-email"]) {
+        forwardHeaders["X-Owner"] = String(
+          req.headers["x-owner"] || req.headers["x-user-email"]
+        )
+          .trim()
+          .toLowerCase();
+      }
+      if (req.headers["x-parent-id"] || req.headers["x-chat-id"]) {
+        forwardHeaders["X-Parent-Id"] = String(
+          req.headers["x-parent-id"] || req.headers["x-chat-id"]
+        ).trim();
       }
 
       const upstreamRes = await fetch(targetUrl, {

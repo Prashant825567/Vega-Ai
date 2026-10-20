@@ -13,9 +13,11 @@ import {
   ZentraGridError,
   ZtAudioUploadInput,
   ZtDocument,
+  ZtFileRecord,
   zentragridMediaSource,
   ztCreateDocument,
   ztDeleteDocument,
+  ztListFiles,
   ztPatchDocument,
   ztQueryDocuments,
   ztUploadFile,
@@ -28,7 +30,7 @@ export const AI_MESSAGES_COLLECTION = 'ai_messages';
 
 export type DevicePlatform = 'android' | 'ios' | 'web';
 export type AiMessageRole = 'user' | 'ai';
-export type AiMessageKind = 'text' | 'voice';
+export type AiMessageKind = 'text' | 'voice' | 'image';
 
 /**
  * Exact `ai_chats` document shape (§2).
@@ -68,12 +70,26 @@ export type AiMessageRecord = {
   text: string;
   /** ISO 8601 UTC — ascending IS the chat order */
   at: string;
-  /** `text` or `voice` */
+  /** `text`, `voice`, or `image` */
   kind: AiMessageKind;
-  /** Voice only: ZentraGrid file id of the audio */
+  /** Voice or Image: ZentraGrid file id (`/v1/files/{file_id}/download`) */
   file_id?: string;
   /** Voice only: length of the clip in milliseconds */
   duration_ms?: number;
+  /** Image only: deterministic/hosted image ID (`img_<fileId>.jpg`) */
+  image_id?: string;
+  /** Image only: permanent view URL (`https://vega-ai-6m2k.onrender.com/api/image/view/img_<fileId>.jpg`) */
+  image_url?: string;
+  /** Image only: enhanced visual director prompt crafted by DeepSeek */
+  max_prompt?: string;
+  /** Image only: `generate` or `edit` */
+  image_action?: 'generate' | 'edit';
+  /** Image only: width in pixels */
+  width?: number;
+  /** Image only: height in pixels */
+  height?: number;
+  /** Optional LLM reasoning/thinking trace */
+  thinking?: string;
 };
 
 export type SingleTurnInput = {
@@ -87,6 +103,17 @@ export type SingleTurnInput = {
   audio?: ZtAudioUploadInput;
   audioFilename?: string;
   audioMimeType?: string;
+  /** Optional generated/edited image fields or raw image to upload to `/v1/files` */
+  image?: ZtAudioUploadInput;
+  imageFilename?: string;
+  imageMimeType?: string;
+  image_id?: string;
+  image_url?: string;
+  max_prompt?: string;
+  image_action?: 'generate' | 'edit';
+  width?: number;
+  height?: number;
+  thinking?: string;
   /**
    * Optional explicit sequence number (1-based) or idempotency key so a
    * double-tap send or retried call maps to the exact same deterministic ID.
@@ -320,6 +347,12 @@ type QueuedWriteTask =
         name?: string;
         mimeType?: string;
       };
+      pendingImage?: {
+        base64?: string;
+        uri?: string;
+        name?: string;
+        mimeType?: string;
+      };
     }
   | {
       opId: string;
@@ -502,12 +535,13 @@ async function executeSingleTask(task: QueuedWriteTask): Promise<void> {
   if (task.kind === 'create_message') {
     const msg: AiMessageRecord = {...task.message};
 
-    // §2: Never store audio bytes inside a document: upload to /v1/files first and keep the id.
+    // §2: Never store raw audio/image bytes inside a document: upload to /v1/files first and keep the id.
     if (msg.kind === 'voice' && !msg.file_id && task.pendingAudio) {
       const uploaded = await ztUploadFile(
         task.pendingAudio,
         task.pendingAudio.name || `${msg.id}.wav`,
         task.pendingAudio.mimeType || 'audio/wav',
+        {owner: task.user, parentId: task.chatId},
       );
       msg.file_id = uploaded.id;
       task.message.file_id = uploaded.id;
@@ -517,6 +551,32 @@ async function executeSingleTask(task: QueuedWriteTask): Promise<void> {
       const bucket = await loadBucket(task.user);
       if (bucket.messagesByChat[task.chatId]?.[msg.id]) {
         bucket.messagesByChat[task.chatId][msg.id].file_id = uploaded.id;
+        await saveBucket(task.user);
+      }
+    }
+
+    if (msg.kind === 'image' && !msg.file_id && task.pendingImage) {
+      const uploaded = await ztUploadFile(
+        task.pendingImage,
+        task.pendingImage.name || `${msg.id}.jpg`,
+        task.pendingImage.mimeType || 'image/jpeg',
+        {owner: task.user, parentId: task.chatId},
+      );
+      msg.file_id = uploaded.id;
+      msg.image_id = msg.image_id || `img_${uploaded.id}.jpg`;
+      msg.image_url =
+        msg.image_url ||
+        `https://vega-ai-6m2k.onrender.com/api/image/view/${msg.image_id}`;
+      task.message.file_id = uploaded.id;
+      task.message.image_id = msg.image_id;
+      task.message.image_url = msg.image_url;
+      delete task.pendingImage;
+
+      const bucket = await loadBucket(task.user);
+      if (bucket.messagesByChat[task.chatId]?.[msg.id]) {
+        bucket.messagesByChat[task.chatId][msg.id].file_id = uploaded.id;
+        bucket.messagesByChat[task.chatId][msg.id].image_id = msg.image_id;
+        bucket.messagesByChat[task.chatId][msg.id].image_url = msg.image_url;
         await saveBucket(task.user);
       }
     }
@@ -535,6 +595,18 @@ async function executeSingleTask(task: QueuedWriteTask): Promise<void> {
       if (typeof msg.duration_ms === 'number') {
         payload.duration_ms = msg.duration_ms;
       }
+    }
+    if (msg.kind === 'image') {
+      if (msg.file_id) payload.file_id = msg.file_id;
+      if (msg.image_id) payload.image_id = msg.image_id;
+      if (msg.image_url) payload.image_url = msg.image_url;
+      if (msg.max_prompt) payload.max_prompt = msg.max_prompt;
+      if (msg.image_action) payload.image_action = msg.image_action;
+      if (typeof msg.width === 'number') payload.width = msg.width;
+      if (typeof msg.height === 'number') payload.height = msg.height;
+    }
+    if (msg.thinking) {
+      payload.thinking = String(msg.thinking).slice(0, 4000);
     }
 
     await ztCreateDocument(
@@ -1029,6 +1101,14 @@ export async function openChat(
     for (const doc of msgPage.documents) {
       const mData = doc.data || ({} as AiMessageRecord);
       if (normalizeEmail(mData.user) !== scopeUser) continue;
+      const resolvedKind: AiMessageKind =
+        mData.kind === 'voice'
+          ? 'voice'
+          : mData.kind === 'image' ||
+            Boolean(mData.image_url) ||
+            Boolean(mData.max_prompt)
+          ? 'image'
+          : 'text';
       const msgRecord: AiMessageRecord = {
         id: doc.id || mData.id,
         chat_id: mData.chat_id || cleanChatId,
@@ -1036,11 +1116,24 @@ export async function openChat(
         role: mData.role === 'ai' ? 'ai' : 'user',
         text: String(mData.text ?? ''),
         at: mData.at || doc.created_at || toIsoUtc(),
-        kind: mData.kind === 'voice' ? 'voice' : 'text',
+        kind: resolvedKind,
         ...(mData.file_id ? {file_id: mData.file_id} : {}),
         ...(typeof mData.duration_ms === 'number'
           ? {duration_ms: mData.duration_ms}
           : {}),
+        ...(mData.image_id ? {image_id: mData.image_id} : {}),
+        ...(mData.image_url
+          ? {image_url: mData.image_url}
+          : resolvedKind === 'image' && mData.file_id
+          ? {
+              image_url: `https://vega-ai-6m2k.onrender.com/api/image/view/img_${mData.file_id}.jpg`,
+            }
+          : {}),
+        ...(mData.max_prompt ? {max_prompt: mData.max_prompt} : {}),
+        ...(mData.image_action ? {image_action: mData.image_action} : {}),
+        ...(typeof mData.width === 'number' ? {width: mData.width} : {}),
+        ...(typeof mData.height === 'number' ? {height: mData.height} : {}),
+        ...(mData.thinking ? {thinking: mData.thinking} : {}),
       };
       bucket.messagesByChat[cleanChatId][msgRecord.id] = msgRecord;
     }
@@ -1129,6 +1222,46 @@ function extractPendingAudio(input: SingleTurnInput):
       base64: b64,
       name: input.audioFilename || 'voice.wav',
       mimeType: input.audioMimeType || 'audio/wav',
+    };
+  }
+  return undefined;
+}
+
+function extractPendingImage(input: SingleTurnInput):
+  | {
+      base64?: string;
+      uri?: string;
+      name?: string;
+      mimeType?: string;
+    }
+  | undefined {
+  if (!input.image) return undefined;
+  if (
+    typeof input.image === 'object' &&
+    !(input.image instanceof Uint8Array) &&
+    !(input.image instanceof ArrayBuffer) &&
+    !(typeof Blob !== 'undefined' && input.image instanceof Blob)
+  ) {
+    return {
+      base64: input.image.base64,
+      uri: input.image.uri,
+      name: input.image.name || input.imageFilename || 'generated_image.jpg',
+      mimeType: input.image.mimeType || input.imageMimeType || 'image/jpeg',
+    };
+  }
+  if (input.image instanceof Uint8Array || input.image instanceof ArrayBuffer) {
+    const bytes =
+      input.image instanceof Uint8Array
+        ? input.image
+        : new Uint8Array(input.image);
+    const b64 =
+      typeof Buffer !== 'undefined'
+        ? Buffer.from(bytes).toString('base64')
+        : btoa(String.fromCharCode(...bytes));
+    return {
+      base64: b64,
+      name: input.imageFilename || 'generated_image.jpg',
+      mimeType: input.imageMimeType || 'image/jpeg',
     };
   }
   return undefined;
@@ -1287,7 +1420,13 @@ async function appendSingleMessageInternal(
   // §3: Retried POST of the exact same seq must NEVER increment `turns` twice or create a second copy!
   const msgAtIso = toIsoUtc(turn.at);
   const messageKind: AiMessageKind =
-    turn.kind === 'voice' || Boolean(turn.file_id) || Boolean(turn.audio)
+    turn.kind === 'image' ||
+    Boolean(turn.image) ||
+    Boolean(turn.image_url) ||
+    Boolean(turn.image_id) ||
+    Boolean(turn.max_prompt)
+      ? 'image'
+      : turn.kind === 'voice' || Boolean(turn.file_id) || Boolean(turn.audio)
       ? 'voice'
       : 'text';
 
@@ -1303,6 +1442,19 @@ async function appendSingleMessageInternal(
     ...(typeof turn.duration_ms === 'number'
       ? {duration_ms: turn.duration_ms}
       : {}),
+    ...(turn.image_id ? {image_id: turn.image_id} : {}),
+    ...(turn.image_url
+      ? {image_url: turn.image_url}
+      : messageKind === 'image' && turn.file_id
+      ? {
+          image_url: `https://vega-ai-6m2k.onrender.com/api/image/view/img_${turn.file_id}.jpg`,
+        }
+      : {}),
+    ...(turn.max_prompt ? {max_prompt: turn.max_prompt} : {}),
+    ...(turn.image_action ? {image_action: turn.image_action} : {}),
+    ...(typeof turn.width === 'number' ? {width: turn.width} : {}),
+    ...(typeof turn.height === 'number' ? {height: turn.height} : {}),
+    ...(turn.thinking ? {thinking: turn.thinking} : {}),
   };
 
   if (!bucket.messagesByChat[targetChatId]) {
@@ -1342,6 +1494,7 @@ async function appendSingleMessageInternal(
     kind: 'create_message',
     message: messageRecord,
     pendingAudio: extractPendingAudio(turn),
+    pendingImage: extractPendingImage(turn),
   });
 
   if (!opts.deferChatPatch && !(isNewChat && seq === 1)) {
@@ -1518,3 +1671,106 @@ export async function deleteChat(
     deletedMessages,
   };
 }
+
+export type StoredUserImageRecord = {
+  imageId: string;
+  fileId: string | null;
+  user: string;
+  chatId: string | null;
+  imageUrl: string;
+  maxPrompt?: string;
+  reply?: string;
+  imageAction?: 'generate' | 'edit';
+  width?: number;
+  height?: number;
+  createdAt: string;
+};
+
+/**
+ * 6) `listUserImages(options?)`
+ *
+ * Returns all generated/edited images stored for the current signed-in user
+ * across local cache, `ai_messages` (`kind === 'image'`), and `/v1/files?owner=<email>`.
+ */
+export async function listUserImages(options: {
+  chatId?: string;
+  limit?: number;
+} = {}): Promise<StoredUserImageRecord[]> {
+  const scopeUser = currentScopeUser();
+  const bucket = await loadBucket(scopeUser);
+  const byKey = new Map<string, StoredUserImageRecord>();
+  const filterChatId = options.chatId ? String(options.chatId).trim() : '';
+
+  // 1) Local cache messages (`kind === 'image'`)
+  for (const [cId, msgMap] of Object.entries(bucket.messagesByChat)) {
+    if (filterChatId && cId !== filterChatId) continue;
+    for (const m of Object.values(msgMap)) {
+      if (m.user !== scopeUser) continue;
+      if (m.kind !== 'image' && !m.image_url && !m.file_id) continue;
+      if (m.role !== 'ai') continue;
+      const key = m.file_id || m.image_id || m.id;
+      const imgId = m.image_id || (m.file_id ? `img_${m.file_id}.jpg` : m.id);
+      byKey.set(key, {
+        imageId: imgId,
+        fileId: m.file_id || null,
+        user: scopeUser,
+        chatId: m.chat_id || cId,
+        imageUrl:
+          m.image_url ||
+          `https://vega-ai-6m2k.onrender.com/api/image/view/${imgId}`,
+        maxPrompt: m.max_prompt,
+        reply: m.text,
+        imageAction: m.image_action || 'generate',
+        width: m.width || 1024,
+        height: m.height || 1024,
+        createdAt: m.at,
+      });
+    }
+  }
+
+  // 2) Server `/v1/files?owner=<scopeUser>` when signed in and online
+  if (scopeUser !== GUEST_USER_KEY && !networkPausedForTest) {
+    try {
+      const files: ZtFileRecord[] = await ztListFiles({
+        owner: scopeUser,
+        parentId: filterChatId || undefined,
+      });
+      for (const f of files) {
+        const mime = String(f.mime || f.mime_type || '');
+        if (
+          !mime.startsWith('image/') &&
+          !/\.(jpg|jpeg|png|webp)$/i.test(String(f.name || ''))
+        ) {
+          continue;
+        }
+        const fId = String(f.id || '');
+        if (!fId) continue;
+        const ext = mime.includes('png') ? 'png' : 'jpg';
+        const imgId = `img_${fId}.${ext}`;
+        if (!byKey.has(fId)) {
+          byKey.set(fId, {
+            imageId: imgId,
+            fileId: fId,
+            user: scopeUser,
+            chatId:
+              f.parent_id && f.parent_id !== 'vega_ai_images'
+                ? f.parent_id
+                : null,
+            imageUrl: `https://vega-ai-6m2k.onrender.com/api/image/view/${imgId}`,
+            imageAction: String(f.name || '').includes('_edit_')
+              ? 'edit'
+              : 'generate',
+            createdAt: f.created_at || toIsoUtc(),
+          });
+        }
+      }
+    } catch {}
+  }
+
+  const out = Array.from(byKey.values()).sort((a, b) =>
+    String(b.createdAt || '').localeCompare(String(a.createdAt || '')),
+  );
+  const maxItems = Math.min(Math.max(Number(options.limit) || 50, 1), 200);
+  return out.slice(0, maxItems);
+}
+

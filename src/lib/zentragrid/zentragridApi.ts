@@ -48,7 +48,11 @@ export type ZtFileRecord = {
   id: string;
   name?: string;
   size?: number;
+  mime?: string;
   mime_type?: string;
+  owner?: string | null;
+  parent_id?: string | null;
+  created_at?: string;
   status?: string;
 };
 
@@ -413,11 +417,13 @@ function base64ToUint8Array(b64: string): Uint8Array {
 
 /**
  * POST /v1/files (multipart/form-data, field name "file")
+ * Accepts optional `metadata.owner` (`X-Owner: <email>`) and `metadata.parentId` (`X-Parent-Id: <chatId>`).
  */
 export async function ztUploadFile(
   input: ZtAudioUploadInput,
   filename = 'voice_turn.wav',
   mimeType = 'audio/wav',
+  metadata?: {owner?: string; parentId?: string},
 ): Promise<ZtFileRecord> {
   const form = new FormData();
 
@@ -456,13 +462,49 @@ export async function ztUploadFile(
     );
   }
 
+  const extraHeaders: Record<string, string> = {};
+  if (metadata?.owner) {
+    extraHeaders['X-Owner'] = metadata.owner.trim().toLowerCase();
+  }
+  if (metadata?.parentId) {
+    extraHeaders['X-Parent-Id'] = metadata.parentId.trim();
+  }
+
   const res = await ztFetch('/v1/files', {
     method: 'POST',
+    headers: extraHeaders,
     body: form,
     timeoutMs: 60_000,
   });
 
-  return (await res.json()) as ZtFileRecord;
+  const json = (await res.json()) as {data?: ZtFileRecord} & ZtFileRecord;
+  return (json.data || json) as ZtFileRecord;
+}
+
+/**
+ * GET /v1/files?owner=<email>&parent_id=<parentId>
+ * Lists files uploaded to Vega Vault for a given owner/chat.
+ */
+export async function ztListFiles(options: {
+  owner?: string;
+  parentId?: string;
+} = {}): Promise<ZtFileRecord[]> {
+  const qs = new URLSearchParams();
+  if (options.owner) {
+    qs.set('owner', options.owner.trim().toLowerCase());
+  }
+  if (options.parentId) {
+    qs.set('parent_id', options.parentId.trim());
+  }
+  const suffix = qs.toString() ? `?${qs.toString()}` : '';
+  const res = await ztFetch(`/v1/files${suffix}`, {
+    method: 'GET',
+  });
+  const json = (await res.json()) as {
+    files?: ZtFileRecord[];
+    data?: {files?: ZtFileRecord[]};
+  };
+  return json.files || json.data?.files || [];
 }
 
 /**
