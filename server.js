@@ -5494,32 +5494,55 @@ const server = http.createServer(async (req, res) => {
     }
   }
 
-  // 6b. Standalone OpenCode Web Search Endpoint: POST /api/websearch
-  if (req.method === "POST" && (pathname === "/api/websearch" || pathname === "/websearch")) {
-    let body;
-    try {
-      body = await readJsonBody(req);
-    } catch (err) {
-      return sendJson(res, 400, { success: false, error: err.message });
+  // 6b. Standalone OpenCode Web Search Endpoint: POST or GET /api/websearch (or /websearch, /api/search)
+  if (
+    (req.method === "POST" || req.method === "GET") &&
+    (pathname === "/api/websearch" ||
+      pathname === "/websearch" ||
+      pathname === "/api/search" ||
+      pathname === "/search")
+  ) {
+    let body = {};
+    if (req.method === "POST") {
+      try {
+        body = await readJsonBody(req);
+      } catch (err) {
+        return sendJson(res, 400, { success: false, error: err.message });
+      }
     }
-    const query = String(body.query || body.q || body.message || "").trim();
+    const query = String(
+      body.query ||
+        body.q ||
+        body.message ||
+        url.searchParams.get("query") ||
+        url.searchParams.get("q") ||
+        ""
+    ).trim();
+    const numResults =
+      Number(body.numResults || body.limit || url.searchParams.get("numResults") || url.searchParams.get("limit")) || 8;
+    const searchType = String(body.type || url.searchParams.get("type") || "auto").trim();
+
     if (!query) {
       return sendJson(res, 400, {
         success: false,
-        error: 'Please provide "query" (string) in the JSON body.',
+        error: 'Please provide "query" (or "q") in the JSON body or URL query string.',
       });
     }
     try {
       const resultsText = await executeOpenCodeWebSearch({
         query,
-        numResults: body.numResults || 8,
-        type: body.type || "auto",
+        numResults,
+        type: searchType,
       });
+      const sources = extractWebSearchSources(resultsText);
       return sendJson(res, 200, {
         success: true,
         ai: AI_NAME,
         app: APP_NAME,
         query,
+        count: sources.length,
+        sources,
+        webSearchSources: sources,
         results: resultsText,
       });
     } catch (err) {
