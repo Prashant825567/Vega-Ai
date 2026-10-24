@@ -26,6 +26,20 @@ const crypto = require("node:crypto");
 const fs = require("node:fs");
 const path = require("node:path");
 
+// Automatically re-exec under Bun 1.4.4 if Render starts the process with `node server.js`
+if (!process.versions.bun && !process.env.BUN_REEXEC_GUARD) {
+  const bunBin = path.join(__dirname, "node_modules", ".bin", "bun");
+  if (fs.existsSync(bunBin)) {
+    const { spawn } = require("node:child_process");
+    const child = spawn(bunBin, [__filename, ...process.argv.slice(2)], {
+      stdio: "inherit",
+      env: { ...process.env, BUN_REEXEC_GUARD: "1" },
+    });
+    child.on("exit", (code) => process.exit(code ?? 0));
+    return;
+  }
+}
+
 // Force IPv4-first DNS resolution so upstream endpoints never stall on unreachable IPv6 routes
 try {
   dns.setDefaultResultOrder("ipv4first");
@@ -266,7 +280,7 @@ let DEFAULT_SYSTEM_PROMPT =
     `Reply clearly, naturally, and in the same language (English, Hindi, Hinglish, etc.) that the user uses. ` +
     `WEB SEARCH RULE: You have real-time internet access via the 'websearch' and 'webfetch' tools. Whenever the user asks about current events, latest news, live prices/rates (crypto, stocks, gold), weather, sports scores, recent releases, or asks you to search/check something online, call the 'websearch' tool first and answer using the live results. ` +
     `IMAGE GENERATION & EDITING POWER: You ALSO have full real-time Image Generation ('generate' via NVIDIA NIM ${NVIDIA_IMAGE_MODEL} at 1024x1024 default + dynamic aspect ratios 9:16, 16:9, 4:5, 5:4, 2:3, 3:2) and Image Editing ('edit' via Cloudflare ${CLOUDFLARE_EDIT_MODEL} at 1024x1024). NEVER say that you cannot generate, create, draw, or edit images/photos! If asked whether you can generate or edit images, proudly say YES. Whenever the user asks you to generate/create/draw/make any image/photo/picture/art/logo/wallpaper OR edit/modify/change an uploaded image, output <IMAGE_TASK action="generate" status="Ek second bhai, aapke liye image bana raha hoon... 🎨" reply="Yeh lijiye bhai, aapki image ban kar taiyar hai! 🎨">Detailed 50-80 word visual English image prompt (describe cars/brands/characters visually by their appearance, shapes, and colors without trademarked brand names)</IMAGE_TASK> (use action="edit" if editing an uploaded image). ` +
-    `CRITICAL RULE: NEVER invoke or call local shell/file tools (bash, edit, glob, grep, or read)—they are unused gateway placeholders.`;
+    `CRITICAL RULE: NEVER invoke or call local shell/file/CLI tools (bash, edit, glob, grep, read, skill, task, todowrite, or write)—they are unused gateway placeholders. Never mention internal server paths (/home/user) or CLI metadata to the user.`;
 
 let VOICE_FAST_SYSTEM_PROMPT =
   process.env.VOICE_SYSTEM_PROMPT ||
@@ -877,10 +891,14 @@ async function executeOpenCodeWebFetch(args = {}) {
   }
 }
 
-function buildOpenCodeHeaders(sessionId) {
+function buildOpenCodeHeaders(sessionId, forcePublic = false) {
   const reqId = generateOpencodeRequestId();
+  const key =
+    !forcePublic && OPENCODE_API_KEY && OPENCODE_API_KEY.startsWith("oc_sk_")
+      ? OPENCODE_API_KEY
+      : "public";
   return {
-    Authorization: `Bearer ${OPENCODE_API_KEY || "public"}`,
+    Authorization: `Bearer ${key}`,
     "Content-Type": "application/json",
     "User-Agent": "opencode/1.19.4 ai-sdk/provider-utils/4.0.23 runtime/bun/1.4.4",
     "x-opencode-client": "cli",
@@ -1221,7 +1239,7 @@ async function callOpenCodeUpstream(payload) {
 
     const response = await fetch(upstreamUrl, {
       method: "POST",
-      headers: buildOpenCodeHeaders(sessionId),
+      headers: buildOpenCodeHeaders(sessionId, attempt > 0),
       body: bodyJson,
     });
 
@@ -5168,6 +5186,7 @@ const server = http.createServer(async (req, res) => {
     return sendJson(res, 200, {
       ok: true,
       status: "online",
+      runtime: process.versions.bun ? `bun/${process.versions.bun}` : `node/${process.version}`,
       service: `${AI_NAME} Backend & Voice Agent API`,
       app: APP_NAME,
       models: {
