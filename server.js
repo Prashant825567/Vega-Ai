@@ -1094,11 +1094,14 @@ async function callOpenCodeUpstream(payload) {
       return m;
     });
 
-    const realWebTools = existingTools.filter((t) => {
+    const realWebTools = [...existingTools, ...missingStubs].filter((t) => {
       const name = t?.function?.name || t?.name || "";
       return name === "websearch" || name === "webfetch";
     });
-    const wantsTools = payload.tool_choice !== "none" && realWebTools.length > 0;
+    const wantsTools =
+      payload.tool_choice !== "none" &&
+      payload.allowWebSearch !== false &&
+      realWebTools.length > 0;
 
     for (const nvModel of NVIDIA_FALLBACK_LLM_MODELS) {
       try {
@@ -3288,6 +3291,7 @@ async function runOpenCodeAgentWithTools(payload, streamOptions = null) {
   for (let turn = 0; turn < 3; turn++) {
     const upstream = await callOpenCodeUpstream({
       ...payload,
+      ...(shouldPreSearch && searchResultChunks.length > 0 ? { tool_choice: "none" } : {}),
       messages: workingMessages,
     });
 
