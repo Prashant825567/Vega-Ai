@@ -932,15 +932,7 @@ function normalizeMessages(body, defaultSystem = DEFAULT_SYSTEM_PROMPT) {
   return messages;
 }
 
-// ─── Step 2 (LLM): OpenCode Upstream Call (`deepseek-v4.1-flash-free`) + NVIDIA NIM Automatic Fallback ──
-let opencodeCooldownUntil = 0;
-const NVIDIA_CHAT_API_URL = "https://integrate.api.nvidia.com/v1/chat/completions";
-const NVIDIA_FALLBACK_LLM_MODELS = [
-  "nvidia/nemotron-3.5-super-vl-120b-a12b",
-  "minimaxai/minimax-m3.1-flash",
-  "openai/gpt-oss-20b",
-];
-
+// ─── Step 2 (LLM): OpenCode Upstream Call (`deepseek-v4.1-flash-free`) ───────
 async function callOpenCodeUpstream(payload) {
   const existingTools = Array.isArray(payload.tools) ? payload.tools : [];
   const existingNames = new Set(
@@ -1043,111 +1035,27 @@ async function callOpenCodeUpstream(payload) {
   let lastStatus = 502;
   let lastErrorText = "";
 
-  // 1) Try OpenCode gateway if not currently in a FreeUsageLimitError cooldown window
-  if (Date.now() >= opencodeCooldownUntil) {
-    for (let attempt = 0; attempt < 2; attempt++) {
-      const sessionId = getSessionId(attempt > 0);
-      const upstreamUrl = UPSTREAM_URLS[attempt % UPSTREAM_URLS.length];
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const sessionId = getSessionId(attempt > 0);
+    const upstreamUrl = UPSTREAM_URLS[attempt % UPSTREAM_URLS.length];
 
-      try {
-        const response = await fetch(upstreamUrl, {
-          method: "POST",
-          headers: buildOpenCodeHeaders(sessionId),
-          body: bodyJson,
-        });
-
-        if (response.ok) {
-          return { ok: true, response, model: upstreamBody.model, sessionId };
-        }
-
-        lastStatus = response.status;
-        lastErrorText = await response.text().catch(() => "");
-
-        // If OpenCode returns 429 FreeUsageLimitError, put OpenCode on a 5-minute cooldown and jump straight to NVIDIA NIM
-        if (response.status === 429 || lastErrorText.includes("FreeUsageLimitError")) {
-          opencodeCooldownUntil = Date.now() + 5 * 60 * 1000;
-          break;
-        }
-        if (response.status === 403 || response.status >= 500) {
-          continue;
-        }
-        break;
-      } catch (err) {
-        lastErrorText = err.message || "OpenCode fetch failed";
-      }
-    }
-  }
-
-  // 2) Automatic High-Speed Fallback to NVIDIA NIM (`https://integrate.api.nvidia.com/v1/chat/completions`)
-  //    Supports streaming `delta.reasoning_content` (`thinking`), `delta.content` (`reply`),
-  //    OpenCode `websearch` / `webfetch` tool calls, and Multimodal Vision (`image_url`).
-  const nvKey = getNvidiaApiKey();
-  if (nvKey) {
-    const cleanMessages = preparedMessages.map((m) => {
-      if (!m) return m;
-      if (typeof m.content === "string") {
-        return {
-          ...m,
-          content: m.content.replace(/^\/no_think\s*/i, "").replace(/\s*\/no_think\s*$/i, ""),
-        };
-      }
-      return m;
+    const response = await fetch(upstreamUrl, {
+      method: "POST",
+      headers: buildOpenCodeHeaders(sessionId),
+      body: bodyJson,
     });
 
-    const realWebTools = [...existingTools, ...missingStubs].filter((t) => {
-      const name = t?.function?.name || t?.name || "";
-      return name === "websearch" || name === "webfetch";
-    });
-    const wantsTools =
-      payload.tool_choice !== "none" &&
-      payload.allowWebSearch !== false &&
-      realWebTools.length > 0;
-
-    for (const nvModel of NVIDIA_FALLBACK_LLM_MODELS) {
-      try {
-        const nvBody = {
-          model: nvModel,
-          messages: cleanMessages,
-          stream: true,
-          max_tokens: Math.max(Number(payload.max_tokens) || 2048, 1536),
-          ...(typeof payload.temperature === "number" ? { temperature: payload.temperature } : {}),
-          ...(wantsTools
-            ? {
-                tools: realWebTools,
-                tool_choice:
-                  payload.tool_choice && payload.tool_choice !== "none"
-                    ? payload.tool_choice
-                    : "auto",
-              }
-            : {}),
-        };
-
-        const nvRes = await fetch(NVIDIA_CHAT_API_URL, {
-          method: "POST",
-          headers: {
-            Authorization: `Bearer ${nvKey}`,
-            "Content-Type": "application/json",
-            Accept: "text/event-stream",
-          },
-          body: JSON.stringify(nvBody),
-        });
-
-        if (nvRes.ok) {
-          return {
-            ok: true,
-            response: nvRes,
-            model: DEFAULT_MODEL,
-            upstreamModel: nvModel,
-            sessionId: `nv_${Date.now()}`,
-          };
-        }
-
-        lastStatus = nvRes.status;
-        lastErrorText = await nvRes.text().catch(() => "");
-      } catch (nvErr) {
-        lastErrorText = nvErr.message || "NVIDIA NIM fallback fetch failed";
-      }
+    if (response.ok) {
+      return { ok: true, response, model: upstreamBody.model, sessionId };
     }
+
+    lastStatus = response.status;
+    lastErrorText = await response.text().catch(() => "");
+
+    if (response.status === 403 || response.status === 429 || response.status >= 500) {
+      continue;
+    }
+    break;
   }
 
   return {
