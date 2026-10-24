@@ -91,8 +91,8 @@ function getGeminiApiKey() {
 }
 
 const UPSTREAM_URLS = [
-  process.env.OPENCODE_UPSTREAM_URL || "https://opencode.ai/inference/openai/v1/chat/completions",
-  "https://opencode.ai/inference/v1/chat/completions",
+  "https://opencode.ai/inference/openai/v1/chat/completions",
+  "https://opencode.ai/inference/openai/v1/chat/completions",
   "https://opencode.ai/zen/v1/chat/completions",
 ];
 
@@ -1232,14 +1232,16 @@ async function callOpenCodeUpstream(payload) {
 
   let lastStatus = 502;
   let lastErrorText = "";
+  const attemptTrace = [];
 
   for (let attempt = 0; attempt < 3; attempt++) {
     const sessionId = getSessionId(attempt > 0);
     const upstreamUrl = UPSTREAM_URLS[attempt % UPSTREAM_URLS.length];
+    const forcePublic = attempt !== 1;
 
     const response = await fetch(upstreamUrl, {
       method: "POST",
-      headers: buildOpenCodeHeaders(sessionId, attempt > 0),
+      headers: buildOpenCodeHeaders(sessionId, forcePublic),
       body: bodyJson,
     });
 
@@ -1249,8 +1251,15 @@ async function callOpenCodeUpstream(payload) {
 
     lastStatus = response.status;
     lastErrorText = await response.text().catch(() => "");
+    attemptTrace.push({
+      attempt,
+      url: upstreamUrl,
+      forcePublic,
+      status: response.status,
+      runtime: process.versions.bun ? `bun/${process.versions.bun}` : `node/${process.version}`,
+    });
 
-    if (response.status === 403 || response.status === 429 || response.status >= 500) {
+    if (response.status === 400 || response.status === 403 || response.status === 429 || response.status >= 500) {
       continue;
     }
     break;
@@ -1260,6 +1269,7 @@ async function callOpenCodeUpstream(payload) {
     ok: false,
     status: lastStatus,
     errorText: lastErrorText || `Upstream returned HTTP ${lastStatus}`,
+    attemptTrace,
   };
 }
 
@@ -3405,7 +3415,9 @@ async function runOpenCodeAgentWithTools(payload, streamOptions = null) {
       return {
         ok: false,
         status: upstream.status,
-        errorText: upstream.errorText,
+        errorText: upstream.attemptTrace
+          ? `${upstream.errorText} | trace=${JSON.stringify(upstream.attemptTrace)}`
+          : upstream.errorText,
         usedWebSearch,
         searchQueries,
         webSearchSources,
