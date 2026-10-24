@@ -77,7 +77,8 @@ function getGeminiApiKey() {
 }
 
 const UPSTREAM_URLS = [
-  process.env.OPENCODE_UPSTREAM_URL || "https://opencode.ai/inference/v1/chat/completions",
+  process.env.OPENCODE_UPSTREAM_URL || "https://opencode.ai/inference/openai/v1/chat/completions",
+  "https://opencode.ai/inference/v1/chat/completions",
   "https://opencode.ai/zen/v1/chat/completions",
 ];
 
@@ -346,7 +347,7 @@ function getSessionId() {
 }
 
 // ─── Required OpenCode Gateway Tool Stubs ────────────────────────────────────
-const REQUIRED_TOOL_NAMES = ["bash", "edit", "glob", "grep", "read"];
+const REQUIRED_TOOL_NAMES = ["bash", "edit", "glob", "grep", "read", "skill", "task", "todowrite", "write"];
 const GATEWAY_STUB_TOOLS = [
   {
     "type": "function",
@@ -500,6 +501,106 @@ const GATEWAY_STUB_TOOLS = [
   {
     "type": "function",
     "function": {
+      "name": "skill",
+      "description": "Load a specialized skill when the task at hand matches one of the skills listed in the system prompt.\n\nUse this tool to inject the skill's instructions and resources into current conversation. The output may contain detailed workflow guidance as well as references to scripts, files, etc in the same directory as the skill.\n\nThe skill name must match one of the skills listed in your system prompt.\n",
+      "parameters": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "The name of the skill from available_skills"
+          }
+        },
+        "required": [
+          "name"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "task",
+      "description": "Launch a new agent to handle complex, multistep tasks autonomously.\n\nWhen using the Task tool, you must specify a subagent_type parameter to select which agent type to use.\n\nWhen NOT to use the Task tool:\n- If you want to read a specific file path, use the Read or Glob tool instead of the Task tool, to find the match more quickly\n- If you are searching for a specific class definition like \"class Foo\", use the Grep tool instead, to find the match more quickly\n- If you are searching for code within a specific file or set of 2-3 files, use the Read tool instead of the Task tool, to find the match more quickly\n- If no available agent is a good fit for the task, use other tools directly\n\n\nUsage notes:\n1. Launch multiple agents concurrently whenever possible, to maximize performance; to do that, use a single message with multiple tool uses\n2. Once you have delegated work to an agent, do not duplicate that work yourself. Continue with non-overlapping tasks, or wait for the result. For background tasks, you will be notified automatically when the result is ready.\n3. When the agent is done, it will return a single message back to you. The result returned by the agent is not visible to the user. To show the user the result, you should send a text message back to the user with a concise summary of the result. The output includes a task_id you can reuse later to continue the same subagent session.\n4. Each agent invocation starts with a fresh context unless you provide task_id to resume the same subagent session (which continues with its previous messages and tool outputs). When starting fresh, your prompt should contain a highly detailed task description for the agent to perform autonomously and you should specify exactly what information the agent should return back to you in its final and only message to you.\n5. The agent's outputs should generally be trusted\n6. Clearly tell the agent whether you expect it to write code or just to do research (search, file reads, web fetches, etc.), since it is not aware of the user's intent. Tell it how to verify its work if possible (e.g., relevant test commands).\n7. If the agent description mentions that it should be used proactively, then you should try your best to use it without the user having to ask for it first. Use your judgement.\n\nAvailable agent types and the tools they have access to:\n- explore: Fast agent specialized for exploring codebases. Use this when you need to quickly find files by patterns (eg. \"src/components/**/*.tsx\"), search code for keywords (eg. \"API endpoints\"), or answer questions about the codebase (eg. \"how do API endpoints work?\"). When calling this agent, specify the desired thoroughness level: \"quick\" for basic searches, \"medium\" for moderate exploration, or \"very thorough\" for comprehensive analysis across multiple locations and naming conventions.\n- general: General-purpose agent for researching complex questions and executing multi-step tasks. Use this agent to execute multiple units of work in parallel.",
+      "parameters": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "description": {
+            "type": "string",
+            "description": "A short (3-5 words) description of the task"
+          },
+          "prompt": {
+            "type": "string",
+            "description": "The task for the agent to perform"
+          },
+          "subagent_type": {
+            "type": "string",
+            "description": "The type of specialized agent to use for this task"
+          },
+          "task_id": {
+            "type": "string",
+            "description": "This should only be set if you mean to resume a previous task (you can pass a prior task_id and the task will continue the same subagent session as before instead of creating a fresh one)"
+          },
+          "command": {
+            "type": "string",
+            "description": "The command that triggered this task"
+          }
+        },
+        "required": [
+          "description",
+          "prompt",
+          "subagent_type"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "todowrite",
+      "description": "Create and maintain a structured task list for the current coding session. Tracks progress, organizes multi-step work, and surfaces status to the user.\n\n## When to use\nUse proactively when:\n- The task requires 3+ distinct steps or actions (not just 3 tool calls for a single conceptual step)\n- The work is non-trivial and benefits from planning\n- The user provides multiple tasks (numbered or comma-separated) or explicitly asks for a todo list\n- New instructions arrive - capture them as todos\n- You start a task - mark it `in_progress` (only one at a time) before working\n- You finish a task - mark it `completed` and add any follow-ups discovered during the work\n\n## When NOT to use\nSkip when:\n- The work is a single, straightforward task (or <3 trivial steps)\n- The request is purely informational or conversational\n- Tracking adds no organizational value\n\n## States\n- `pending` - not started\n- `in_progress` - actively working (exactly ONE at a time)\n- `completed` - finished successfully\n- `cancelled` - no longer needed\n\n## Rules\n- Update status in real time; don't batch completions\n- Mark `completed` only after the required work is actually done, including any required verification. Never based on intent.\n- Keep exactly one `in_progress` while work remains\n- If blocked or partial, keep it `in_progress` and add a follow-up todo describing the blocker\n- Preserve user-provided commands verbatim (flags, args, order)\n- Items should be specific and actionable; break large work into smaller steps\n\n## Examples\n\nUse it:\n- \"Add a dark mode toggle and run the tests\" -> multi-step feature + explicit verification\n- \"Rename getCwd -> getCurrentWorkingDirectory across the repo\" -> grep reveals 15 occurrences in 8 files\n- \"Implement registration, catalog, cart, checkout\" -> multiple complex features\n\nSkip it:\n- \"How do I print Hello World in Python?\" -> informational\n- \"Add a comment to calculateTotal\" -> single edit\n- \"Run npm install and tell me what happened\" -> one command\n\nWhen in doubt, use it.\n",
+      "parameters": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "todos": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "content": {
+                  "type": "string",
+                  "description": "Brief description of the task"
+                },
+                "status": {
+                  "type": "string",
+                  "description": "Current status of the task: pending, in_progress, completed, cancelled"
+                },
+                "priority": {
+                  "type": "string",
+                  "description": "Priority level of the task: high, medium, low"
+                }
+              },
+              "required": [
+                "content",
+                "status",
+                "priority"
+              ]
+            },
+            "description": "The updated todo list"
+          }
+        },
+        "required": [
+          "todos"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
       "name": "webfetch",
       "description": "- Fetches content from a specified URL\n- Takes a URL and optional format as input\n- Fetches the URL content, converts to requested format (markdown by default)\n- Returns the content in the specified format\n- Use this tool when you need to retrieve and analyze web content\n\nUsage notes:\n  - IMPORTANT: if another tool is present that offers better web fetching capabilities, is more targeted to the task, or has fewer restrictions, prefer using that tool instead of this one.\n  - The URL must be a fully-formed valid URL\n  - HTTP URLs will be automatically upgraded to HTTPS\n  - Format options: \"markdown\" (default), \"text\", or \"html\"\n  - This tool is read-only and does not modify any files\n  - Results may be summarized if the content is very large\n",
       "parameters": {
@@ -512,7 +613,11 @@ const GATEWAY_STUB_TOOLS = [
           },
           "format": {
             "type": "string",
-            "enum": ["text", "markdown", "html"],
+            "enum": [
+              "text",
+              "markdown",
+              "html"
+            ],
             "description": "The format to return the content in (text, markdown, or html). Defaults to markdown.",
             "default": "markdown"
           },
@@ -521,7 +626,9 @@ const GATEWAY_STUB_TOOLS = [
             "description": "Optional timeout in seconds (max 120)"
           }
         },
-        "required": ["url"]
+        "required": [
+          "url"
+        ]
       }
     }
   },
@@ -544,12 +651,19 @@ const GATEWAY_STUB_TOOLS = [
           },
           "livecrawl": {
             "type": "string",
-            "enum": ["fallback", "preferred"],
+            "enum": [
+              "fallback",
+              "preferred"
+            ],
             "description": "Live crawl mode - 'fallback': use live crawling as backup if cached content unavailable, 'preferred': prioritize live crawling (default: 'fallback')"
           },
           "type": {
             "type": "string",
-            "enum": ["auto", "fast", "deep"],
+            "enum": [
+              "auto",
+              "fast",
+              "deep"
+            ],
             "description": "Search type - 'auto': balanced search (default), 'fast': quick results, 'deep': comprehensive search"
           },
           "contextMaxCharacters": {
@@ -557,7 +671,34 @@ const GATEWAY_STUB_TOOLS = [
             "description": "Maximum characters for context string optimized for LLMs (default: 10000)"
           }
         },
-        "required": ["query"]
+        "required": [
+          "query"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "write",
+      "description": "Writes a file to the local filesystem.\n\nUsage:\n- This tool will overwrite the existing file if there is one at the provided path.\n- If this is an existing file, you MUST use the Read tool first to read the file's contents. This tool will fail if you did not read the file first.\n- ALWAYS prefer editing existing files in the codebase. NEVER write new files unless explicitly required.\n- NEVER proactively create documentation files (*.md) or README files. Only create documentation files if explicitly requested by the User.\n- Only use emojis if the user explicitly requests it. Avoid writing emojis to files unless asked.\n",
+      "parameters": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "content": {
+            "type": "string",
+            "description": "The content to write to the file"
+          },
+          "filePath": {
+            "type": "string",
+            "description": "The absolute path to the file to write (must be absolute, not relative)"
+          }
+        },
+        "required": [
+          "content",
+          "filePath"
+        ]
       }
     }
   }
@@ -741,14 +882,37 @@ function buildOpenCodeHeaders(sessionId) {
   return {
     Authorization: `Bearer ${OPENCODE_API_KEY || "public"}`,
     "Content-Type": "application/json",
-    "User-Agent": "opencode/1.19.0 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14",
+    "User-Agent": "opencode/1.19.4 ai-sdk/provider-utils/4.0.23 runtime/bun/1.4.4",
     "x-opencode-client": "cli",
     "x-opencode-project": "a070fc6ab60b2140452f8e06012ae52a1ed73781",
+    "x-opencode-request": reqId,
     "x-opencode-session": sessionId,
     "x-opencode-session-id": sessionId,
-    "x-opencode-request": reqId,
-    Accept: "text/event-stream",
+    Accept: "*/*",
   };
+}
+
+function buildOpenCodeEnvTail(modelId) {
+  return (
+    `\n\nYou are powered by the model named ${modelId}. The exact model ID is opencode/${modelId}\n` +
+    `Here is some useful information about the environment you are running in:\n` +
+    `<env>\n` +
+    `  Working directory: /home/user\n` +
+    `  Workspace root folder: /home/user\n` +
+    `  Is directory a git repo: yes\n` +
+    `  Platform: linux\n` +
+    `  Today's date: ${new Date().toDateString()}\n` +
+    `</env>\n` +
+    `Skills provide specialized instructions and workflows for specific tasks.\n` +
+    `Use the skill tool to load a skill when a task matches its description.\n` +
+    `<available_skills>\n` +
+    `  <skill>\n` +
+    `    <name>customize-opencode</name>\n` +
+    `    <description>Use ONLY when the user is editing or creating opencode's own configuration: opencode.json, opencode.jsonc, files under .opencode/, or files under ~/.config/opencode/. Also use when creating or fixing opencode agents, subagents, skills, plugins, MCP servers, or permission rules. Do not use for the user's own application code, or for any project that is not configuring opencode itself.</description>\n` +
+    `    <location>&lt;built-in&gt;</location>\n` +
+    `  </skill>\n` +
+    `</available_skills>`
+  );
 }
 
 function resolveModel(requestedModel) {
@@ -1008,12 +1172,31 @@ async function callOpenCodeUpstream(payload) {
       })
     : [];
 
+  if (
+    preparedMessages.length > 0 &&
+    preparedMessages[0] &&
+    (preparedMessages[0].role === "system" || preparedMessages[0].role === "developer") &&
+    typeof preparedMessages[0].content === "string" &&
+    !preparedMessages[0].content.includes("<available_skills>")
+  ) {
+    preparedMessages[0] = {
+      ...preparedMessages[0],
+      content: preparedMessages[0].content + buildOpenCodeEnvTail(resolvedTargetModel),
+    };
+  }
+
+  const allTools = [...existingTools, ...missingStubs].sort((a, b) =>
+    String(a?.function?.name || "").localeCompare(String(b?.function?.name || ""))
+  );
+
   const upstreamBody = {
     model: resolvedTargetModel,
+    max_tokens: typeof payload.max_tokens === "number" ? payload.max_tokens : 32000,
     messages: preparedMessages,
-    stream: true,
-    tools: [...existingTools, ...missingStubs],
+    tools: allTools,
     tool_choice: payload.tool_choice && payload.tool_choice !== "none" ? payload.tool_choice : "auto",
+    stream: true,
+    stream_options: { include_usage: true },
   };
 
   recordSentPrompt({
@@ -1025,9 +1208,6 @@ async function callOpenCodeUpstream(payload) {
 
   if (typeof payload.temperature === "number") {
     upstreamBody.temperature = payload.temperature;
-  }
-  if (typeof payload.max_tokens === "number") {
-    upstreamBody.max_tokens = payload.max_tokens;
   }
 
   const bodyJson = JSON.stringify(upstreamBody);
