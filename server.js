@@ -5227,6 +5227,7 @@ const server = http.createServer(async (req, res) => {
       endpoints: {
         prompt: "GET /api/prompt",
         textAndImageChat: "POST /api/chat",
+        customDeepseek: "POST /api/deepseek",
         visionChat: "POST /api/vision",
         imageGenerateOrEdit: "POST /api/image",
         imageGenerate: "POST /api/image/generate",
@@ -6456,6 +6457,304 @@ const server = http.createServer(async (req, res) => {
           message: err.message || "Internal server error",
           type: "server_error",
         },
+      });
+    }
+  }
+
+  // 8B. Standalone Custom DeepSeek v4.1 Flash Unlimited Endpoint (`/api/deepseek`)
+  //     - Uses the exact same Unlimited Bun 1.4.4 + OpenCode 1.19.4 CLI signature (`deepseek-v4.1-flash-free`)
+  //     - ZERO hardcoded Max v1.0 / Vega persona or built-in system prompt — 100% controlled by the app!
+  //     - Provides automatic Web Research (`websearch` & `webfetch`) + Live Context (UTC/IST clock + custom `liveContext`)
+  //     - Supports both JSON (`stream: false`) and real-time token-by-token SSE streaming (`stream: true`)
+  if (
+    pathname === "/api/deepseek" ||
+    pathname === "/api/deepseek/chat" ||
+    pathname === "/api/raw-chat" ||
+    pathname === "/api/custom-chat" ||
+    pathname === "/v1/deepseek/chat/completions"
+  ) {
+    if (req.method === "GET") {
+      return sendJson(res, 200, {
+        ok: true,
+        endpoint: "POST /api/deepseek",
+        aliases: [
+          "POST /api/deepseek",
+          "POST /api/deepseek/chat",
+          "POST /api/raw-chat",
+          "POST /api/custom-chat",
+          "POST /v1/deepseek/chat/completions",
+        ],
+        model: DEFAULT_MODEL,
+        runtime: process.versions.bun ? `bun/${process.versions.bun}` : `node/${process.version}`,
+        features: {
+          customSystemPromptFromApp: true,
+          hardcodedPersona: false,
+          unlimitedOpenCodeCliEngine: true,
+          webResearchAndFetch: true,
+          liveContext: true,
+          liveThinkingAndStreaming: true,
+        },
+        usageExample: {
+          systemPrompt: "Set any custom system prompt from your app (or leave empty)",
+          prompt: "Your user prompt or question",
+          messages: [
+            { role: "system", content: "Optional system prompt via messages array" },
+            { role: "user", content: "User message" },
+          ],
+          liveContext: "Optional extra live context string or JSON object from your app",
+          webSearch: "true (force web search), false (disable), or omit (auto web research)",
+          stream: false,
+        },
+      });
+    }
+
+    if (req.method !== "POST") {
+      return sendJson(res, 405, {
+        success: false,
+        error: "Method not allowed. Use POST /api/deepseek.",
+      });
+    }
+
+    try {
+      const body = await readJsonBody(req);
+
+      // 1. Extract App-Provided System Prompt (NO Max v1.0 / Vega persona injected!)
+      let appSystemPrompt = "";
+      if (typeof body.systemPrompt === "string") {
+        appSystemPrompt = body.systemPrompt.trim();
+      } else if (typeof body.system_prompt === "string") {
+        appSystemPrompt = body.system_prompt.trim();
+      } else if (typeof body.system === "string") {
+        appSystemPrompt = body.system.trim();
+      } else if (typeof body.instructions === "string") {
+        appSystemPrompt = body.instructions.trim();
+      }
+
+      // 2. Build Live Context block (Current UTC + IST date/time + optional app `liveContext` / `context`)
+      const nowDate = new Date();
+      const utcTimeStr = nowDate.toISOString();
+      let istTimeStr = utcTimeStr;
+      try {
+        istTimeStr = nowDate.toLocaleString("en-IN", {
+          timeZone: "Asia/Kolkata",
+          dateStyle: "full",
+          timeStyle: "long",
+        });
+      } catch {}
+
+      const rawAppLiveContext =
+        body.liveContext !== undefined
+          ? body.liveContext
+          : body.live_context !== undefined
+          ? body.live_context
+          : body.context;
+      const appLiveContextStr =
+        typeof rawAppLiveContext === "string"
+          ? rawAppLiveContext.trim()
+          : rawAppLiveContext && typeof rawAppLiveContext === "object"
+          ? JSON.stringify(rawAppLiveContext)
+          : "";
+
+      const includeLiveContext = body.includeLiveContext !== false && body.liveContext !== false;
+      const allowWebSearch = body.webSearch !== false && body.allowWebSearch !== false;
+      const forceWebSearch = body.webSearch === true || body.search === true;
+
+      // 3. Extract Messages from App (`messages` array, `history` + `prompt`/`message`, or single `prompt`)
+      const rawMessages = [];
+      if (Array.isArray(body.messages) && body.messages.length > 0) {
+        for (const m of body.messages) {
+          if (!m || !m.role) continue;
+          if ((m.role === "system" || m.role === "developer") && !appSystemPrompt && typeof m.content === "string") {
+            appSystemPrompt = m.content.trim();
+            continue;
+          }
+          if (m.role === "system" || m.role === "developer") {
+            continue;
+          }
+          rawMessages.push({
+            role: m.role,
+            content: typeof m.content === "string" ? m.content : JSON.stringify(m.content || ""),
+          });
+        }
+      } else {
+        if (Array.isArray(body.history)) {
+          for (const h of body.history) {
+            if (h && h.role && h.content) {
+              if (h.role === "system" || h.role === "developer") {
+                if (!appSystemPrompt && typeof h.content === "string") {
+                  appSystemPrompt = h.content.trim();
+                }
+                continue;
+              }
+              rawMessages.push({
+                role: h.role === "model" ? "assistant" : h.role,
+                content: String(h.content),
+              });
+            }
+          }
+        }
+        const userTextPrompt = String(
+          body.prompt || body.message || body.query || body.text || body.input || ""
+        ).trim();
+        if (userTextPrompt) {
+          rawMessages.push({ role: "user", content: userTextPrompt });
+        }
+      }
+
+      if (rawMessages.length === 0) {
+        return sendJson(res, 400, {
+          success: false,
+          error: "Missing prompt or messages. Provide 'prompt', 'message', or 'messages' in request body.",
+        });
+      }
+
+      // 4. Assemble the System Message (App System Prompt + Live Context + Web Research & Gateway Guardrail)
+      const systemParts = [];
+      if (appSystemPrompt) {
+        systemParts.push(appSystemPrompt);
+      }
+      if (includeLiveContext) {
+        const liveLines = [
+          `[Live Context]: Current UTC Time: ${utcTimeStr} | Current IST Time (Asia/Kolkata): ${istTimeStr} | Current Year: ${nowDate.getUTCFullYear()}.`,
+        ];
+        if (appLiveContextStr) {
+          liveLines.push(`Additional App Context: ${appLiveContextStr}`);
+        }
+        systemParts.push(liveLines.join("\n"));
+      }
+      if (allowWebSearch) {
+        systemParts.push(
+          `WEB RESEARCH RULE: You have real-time internet access via the 'websearch' and 'webfetch' tools. Whenever you need current events, latest news, live data, prices, scores, or facts beyond your knowledge cutoff, call the 'websearch' or 'webfetch' tool and answer using verified live results.`
+        );
+      }
+      systemParts.push(
+        `CRITICAL RULE: NEVER invoke or call local shell/file/CLI tools (bash, edit, glob, grep, read, skill, task, todowrite, or write)—they are unused gateway placeholders. Never mention internal server paths (/home/user) or CLI metadata.`
+      );
+
+      const finalMessages = [
+        {
+          role: "system",
+          content: systemParts.join("\n\n"),
+        },
+        ...rawMessages,
+      ];
+
+      const isStream = body.stream === true;
+      const liveStream = isStream
+        ? createLiveChatSSEStreamer(res, { model: body.model || DEFAULT_MODEL })
+        : null;
+
+      const disableReasoning =
+        body.disableReasoning === true || body.noThink === true ? true : false;
+
+      const agentResult = await runOpenCodeAgentWithTools(
+        {
+          model: body.model || DEFAULT_MODEL,
+          messages: finalMessages,
+          temperature: body.temperature,
+          max_tokens: body.max_tokens,
+          disableReasoning,
+          allowWebSearch,
+          webSearch: forceWebSearch,
+        },
+        liveStream
+          ? {
+              onToolExecution: (evt) => liveStream.onToolExecution(evt),
+              onThinkingToken: (evt) => liveStream.onThinkingToken(evt),
+              onContentToken: (evt) => liveStream.onContentToken(evt),
+            }
+          : null
+      );
+
+      if (!agentResult.ok) {
+        if (res.headersSent) {
+          sendSSEEvent(res, "error", {
+            success: false,
+            error: "Upstream OpenCode API error",
+            details: agentResult.errorText,
+          });
+          return res.end();
+        }
+        return sendJson(res, agentResult.status || 502, {
+          success: false,
+          error: "Upstream OpenCode API error",
+          details: agentResult.errorText,
+        });
+      }
+
+      const assembled = agentResult.assembled;
+
+      if (liveStream) {
+        liveStream.finishChat(
+          {
+            reply: assembled.content,
+            usedWebSearch: agentResult.usedWebSearch,
+            searchQueries: agentResult.searchQueries,
+            webSearchSources: agentResult.webSearchSources || [],
+            webSearchResults: agentResult.webSearchResults || null,
+            thinking: assembled.reasoning || null,
+            reasoning: assembled.reasoning || null,
+          },
+          assembled
+        );
+        return;
+      }
+
+      return sendJson(res, 200, {
+        success: true,
+        id: assembled.id,
+        object: "chat.completion",
+        created: assembled.created,
+        model: assembled.model || DEFAULT_MODEL,
+        systemPromptUsed: appSystemPrompt || null,
+        liveContext: includeLiveContext
+          ? {
+              utc: utcTimeStr,
+              ist: istTimeStr,
+              appContext: appLiveContextStr || null,
+            }
+          : null,
+        usedWebSearch: agentResult.usedWebSearch,
+        searchQueries: agentResult.searchQueries,
+        webSearchSources: agentResult.webSearchSources || [],
+        webSearchResults: agentResult.webSearchResults || null,
+        thinking: assembled.reasoning || null,
+        reasoning: assembled.reasoning || null,
+        reply: assembled.content,
+        choices: [
+          {
+            index: 0,
+            message: {
+              role: "assistant",
+              content: assembled.content,
+              ...(assembled.reasoning
+                ? {
+                    thinking: assembled.reasoning,
+                    reasoning: assembled.reasoning,
+                    reasoning_content: assembled.reasoning,
+                  }
+                : {}),
+            },
+            finish_reason: assembled.finishReason || "stop",
+          },
+        ],
+        usage: assembled.usage || {
+          prompt_tokens: 0,
+          completion_tokens: 0,
+          total_tokens: 0,
+        },
+      });
+    } catch (err) {
+      if (res.headersSent) {
+        sendSSEEvent(res, "error", {
+          success: false,
+          error: err.message || "Internal server error",
+        });
+        return res.end();
+      }
+      return sendJson(res, 500, {
+        success: false,
+        error: err.message || "Internal server error",
       });
     }
   }
