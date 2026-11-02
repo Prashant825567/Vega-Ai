@@ -18,6 +18,43 @@ const crypto = require("node:crypto");
 
 const GRACE_AI_NAME = "Grace";
 const GRACE_APP_NAME = "Intridium";
+const GRACE_PUBLIC_MODEL = "Grace";
+
+function hideProviderLeak(text) {
+  return String(text || "")
+    .replace(/deepseek-v[\w.\-]*/gi, "Grace")
+    .replace(/mimo-v[\w.\-]*/gi, "Grace")
+    .replace(/\bopencode(?:\.ai)?\b/gi, "Grace")
+    .replace(/\b(?:I am|I'm|main)\s+DeepSeek\b/gi, "Main Grace")
+    .replace(/\bpowered by\s+DeepSeek\b/gi, "powered by Grace")
+    .replace(/\bDeepSeek\s+(?:v?\d[\w.\-]*|model|LLM)\b/gi, "Grace");
+}
+
+function publicizeGracePayload(payload = {}) {
+  const out = { ...payload };
+  out.ai = GRACE_AI_NAME;
+  out.app = GRACE_APP_NAME;
+  out.model = GRACE_PUBLIC_MODEL;
+  if (out.usage && typeof out.usage === "object") {
+    const usage = { ...out.usage };
+    delete usage.opencode;
+    out.usage = usage;
+  }
+  if (typeof out.reply === "string") out.reply = hideProviderLeak(out.reply);
+  if (typeof out.thinking === "string") out.thinking = hideProviderLeak(out.thinking);
+  if (typeof out.reasoning === "string") out.reasoning = hideProviderLeak(out.reasoning);
+  if (out.choices && out.choices[0] && out.choices[0].message) {
+    const msg = { ...out.choices[0].message };
+    if (typeof msg.content === "string") msg.content = hideProviderLeak(msg.content);
+    if (typeof msg.thinking === "string") msg.thinking = hideProviderLeak(msg.thinking);
+    if (typeof msg.reasoning === "string") msg.reasoning = hideProviderLeak(msg.reasoning);
+    if (typeof msg.reasoning_content === "string") msg.reasoning_content = hideProviderLeak(msg.reasoning_content);
+    out.choices = [{ ...out.choices[0], message: msg }];
+  }
+  if (typeof out.error === "string") out.error = hideProviderLeak(out.error).replace(/Upstream Grace API error/gi, "Grace AI error");
+  if (typeof out.details === "string") out.details = hideProviderLeak(out.details);
+  return out;
+}
 const GRACE_STORE_DIR = path.join(__dirname, "data", "intridium_grace");
 const GRACE_CHATS_DIR = path.join(GRACE_STORE_DIR, "chats");
 const GRACE_IMAGES_DIR = path.join(GRACE_STORE_DIR, "images");
@@ -337,6 +374,7 @@ function buildGraceSystemPrompt(live = {}, extraInstructions = "") {
     `You are ${GRACE_AI_NAME}, a fast, smart, warm, and helpful AI assistant built into the ${GRACE_APP_NAME} app. ` +
       `When asked who you are or what your name/version is, always introduce yourself as ${GRACE_AI_NAME} (the AI assistant of ${GRACE_APP_NAME}). ` +
       `Never say you are Max, Vega, OpenCode, DeepSeek, or any other assistant. ` +
+      `Never mention, reveal, or hint at any underlying model name, provider, or model ID. If asked what model you use or who built your brain, only say you are Grace, the AI assistant of Intridium. ` +
       `Reply clearly, naturally, and in the same language (English, Hindi, Hinglish, etc.) that the user uses.`,
     `WEB SEARCH RULE: You have real-time internet access via the 'websearch' and 'webfetch' tools. Whenever the user asks about current events, latest news, live prices/rates (crypto, stocks, gold), weather, sports scores, recent releases, or asks you to search/check something online, call the 'websearch' tool first and answer using the live results.`,
     `IMAGE GENERATION POWER: You ALSO have real-time Image Generation via NVIDIA NIM black-forest-labs/flux-3-image-klein (1024x1024 default + dynamic aspect ratios 9:16, 16:9, 4:5, 5:4, 2:3, 3:2). NEVER say that you cannot generate, create, or draw images/photos. If asked whether you can generate images, proudly say YES. Whenever the user asks you to generate/create/draw/make any image/photo/picture/art/logo/wallpaper, output <IMAGE_TASK action="generate" status="Ek second, aapke liye image bana rahi hoon... 🎨" reply="Yeh lijiye, aapki image ban kar taiyar hai! 🎨">Detailed 50-80 word visual English image prompt (describe cars/brands/characters visually by appearance, shapes, and colors without trademarked brand names)</IMAGE_TASK>.`,
@@ -781,7 +819,7 @@ function docsPayload() {
       "POST /api/intridium/grace",
       "POST /v1/grace/chat/completions",
     ],
-    model: "deepseek-v4.1-flash-free",
+    model: GRACE_PUBLIC_MODEL,
     features: {
       persona: GRACE_AI_NAME,
       webResearchAndFetch: true,
@@ -1036,7 +1074,7 @@ async function handleGraceRequest({ req, res, url, pathname, deps }) {
           disableImageGen: body.disableImageGen,
         });
 
-    const liveStream = isStream ? deps.createLiveStreamEmitter(res, body.model || deps.DEFAULT_MODEL) : null;
+    const liveStream = isStream ? deps.createLiveStreamEmitter(res, GRACE_PUBLIC_MODEL) : null;
 
     const persistAndMeta = (payload, extraTurns = []) => {
       let savedChat = null;
@@ -1047,12 +1085,12 @@ async function handleGraceRequest({ req, res, url, pathname, deps }) {
         ];
         savedChat = appendGraceTurns(identity, requestedChatId, turns);
       }
-      return {
+      return publicizeGracePayload({
         ...payload,
         success: true,
         ai: GRACE_AI_NAME,
         app: GRACE_APP_NAME,
-        model: payload.model || deps.DEFAULT_MODEL,
+        model: GRACE_PUBLIC_MODEL,
         store: "intridium_grace",
         userKey: identity.userKey,
         isGuest: identity.isGuest,
@@ -1063,7 +1101,7 @@ async function handleGraceRequest({ req, res, url, pathname, deps }) {
         liveContext: live.includeLiveContext
           ? { utc: live.utcTimeStr, ist: live.istTimeStr, appContext: live.appLiveContextStr || null }
           : null,
-      };
+      });
     };
 
     // Image editing is intentionally NOT supported for Grace.
@@ -1093,7 +1131,15 @@ async function handleGraceRequest({ req, res, url, pathname, deps }) {
         const imgResult = await runGraceImageGenerate({
           userText: extracted.userText,
           deps,
-          onStatus: liveStream ? (evt) => liveStream.onImageStatus(evt) : null,
+          onStatus: liveStream
+            ? (evt) =>
+                liveStream.onImageStatus({
+                  ...evt,
+                  token: hideProviderLeak(evt.token || ""),
+                  thinking: hideProviderLeak(evt.thinking || ""),
+                  reasoning: hideProviderLeak(evt.reasoning || ""),
+                })
+            : null,
           options: {
             ...body,
             model: body.model || deps.DEFAULT_MODEL,
@@ -1153,8 +1199,19 @@ async function handleGraceRequest({ req, res, url, pathname, deps }) {
       liveStream
         ? {
             onToolExecution: (evt) => liveStream.onToolExecution(evt),
-            onThinkingToken: (evt) => liveStream.onThinkingToken(evt),
-            onContentToken: (evt) => liveStream.onContentToken(evt),
+            onThinkingToken: (evt) =>
+              liveStream.onThinkingToken({
+                ...evt,
+                token: hideProviderLeak(evt.token || ""),
+                thinking: hideProviderLeak(evt.thinking || ""),
+                reasoning: hideProviderLeak(evt.reasoning || ""),
+              }),
+            onContentToken: (evt) =>
+              liveStream.onContentToken({
+                ...evt,
+                token: hideProviderLeak(evt.token || ""),
+                content: hideProviderLeak(evt.content || ""),
+              }),
           }
         : null
     );
@@ -1163,8 +1220,7 @@ async function handleGraceRequest({ req, res, url, pathname, deps }) {
       if (res.headersSent) {
         deps.sendSSEEvent(res, "error", {
           success: false,
-          error: "Upstream OpenCode API error",
-          details: agentResult.errorText,
+          error: "Grace AI error",
         });
         res.end();
         return true;
@@ -1173,8 +1229,8 @@ async function handleGraceRequest({ req, res, url, pathname, deps }) {
         success: false,
         ai: GRACE_AI_NAME,
         app: GRACE_APP_NAME,
-        error: "Upstream OpenCode API error",
-        details: agentResult.errorText,
+        model: GRACE_PUBLIC_MODEL,
+        error: "Grace AI error",
       });
       return true;
     }
@@ -1192,7 +1248,15 @@ async function handleGraceRequest({ req, res, url, pathname, deps }) {
         const imgResult = await runGraceImageGenerate({
           userText: extracted.userText,
           deps,
-          onStatus: liveStream ? (evt) => liveStream.onImageStatus(evt) : null,
+          onStatus: liveStream
+            ? (evt) =>
+                liveStream.onImageStatus({
+                  ...evt,
+                  token: hideProviderLeak(evt.token || ""),
+                  thinking: hideProviderLeak(evt.thinking || ""),
+                  reasoning: hideProviderLeak(evt.reasoning || ""),
+                })
+            : null,
           options: {
             ...body,
             model: body.model || deps.DEFAULT_MODEL,
@@ -1234,7 +1298,7 @@ async function handleGraceRequest({ req, res, url, pathname, deps }) {
       id: assembled.id,
       object: "chat.completion",
       created: assembled.created,
-      model: assembled.model || deps.DEFAULT_MODEL,
+      model: GRACE_PUBLIC_MODEL,
       usedWebSearch: agentResult.usedWebSearch,
       searchQueries: agentResult.searchQueries,
       webSearchSources: agentResult.webSearchSources || [],
