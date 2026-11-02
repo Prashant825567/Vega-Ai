@@ -8,7 +8,8 @@
  *  - Chat + image data stored ONLY under data/intridium_grace/
  *    (never ai_chats / ai_messages / Vega Storage)
  *
- * Guest (unsigned) chats are saved as userKey = guest_<guestId>.
+ * Unsigned / no-email chats are always saved as userKey = "guest".
+ * No email or guest identity is required to hit the API — data still stores.
  */
 
 const fs = require("node:fs");
@@ -64,6 +65,8 @@ function resolveGraceIdentity(body = {}, req = null) {
   )
     .trim()
     .toLowerCase();
+  // Only a real email is treated as signed-in identity.
+  // No email / no guestId / direct API hit → store everything under the name "guest".
   if (email && email.includes("@") && email.length <= 120) {
     return {
       userKey: email,
@@ -72,31 +75,11 @@ function resolveGraceIdentity(body = {}, req = null) {
       signedInEmail: email,
     };
   }
-
-  const headerGuest =
-    (req &&
-      req.headers &&
-      (req.headers["x-guest-id"] || req.headers["x-device-id"] || req.headers["x-anonymous-id"])) ||
-    "";
-  const rawGuest = String(
-    (body &&
-      (body.guestId ||
-        body.guest_id ||
-        body.deviceId ||
-        body.device_id ||
-        body.anonymousId ||
-        body.anonymous_id)) ||
-      headerGuest ||
-      ""
-  ).trim();
-  const cleaned = rawGuest.replace(/[^A-Za-z0-9_-]/g, "").slice(0, 64);
-  const generated = !cleaned;
-  const guestId = cleaned || `g${crypto.randomBytes(8).toString("hex")}`;
   return {
-    userKey: `guest_${guestId}`,
+    userKey: "guest",
     isGuest: true,
-    guestId,
-    guestIdGenerated: generated,
+    guestId: "guest",
+    guestIdGenerated: false,
     signedInEmail: null,
   };
 }
@@ -811,20 +794,19 @@ function docsPayload() {
     storage: {
       location: "Isolated Grace/Intridium store — data/intridium_grace/ (NOT Vega ai_chats / ai_messages / Vega Storage)",
       signedInUserKey: "lowercase email, e.g. user@example.com",
-      guestUserKey: "guest_<guestId>",
+      guestUserKey: "guest",
       guestRule:
-        "Bina sign-in wale users ka data `guest_<guestId>` naam se save hota hai. App `guestId` / `deviceId` / header `X-Guest-Id` bheje; warna server naya guestId generate karke response me lautata hai. App us guestId ko local storage me rakh kar har request par bheje.",
+        "Bina email / bina identity ke bhi POST /api/grace directly hit kar sakte ho — data store hota hai. Unsigned chats ka naam sirf `guest` hota hai (koi guest email nahi). Signed-in chats email se save hoti hain.",
       historyRoutes: {
-        list: "GET /api/grace/history/chats?user=<email>|guestId=<id>",
-        open: "GET /api/grace/history/chats/:chatId?user=<email>|guestId=<id>",
-        delete: "DELETE /api/grace/history/chats/:chatId?user=<email>|guestId=<id>",
-        images: "GET /api/grace/images?user=<email>|guestId=<id>",
+        list: "GET /api/grace/history/chats  (guest)  |  ?user=<email> (signed-in)",
+        open: "GET /api/grace/history/chats/:chatId",
+        delete: "DELETE /api/grace/history/chats/:chatId",
+        images: "GET /api/grace/images",
         imageView: "GET /api/grace/image/view/:imageId",
       },
     },
     usageExample: {
       prompt: "Tum kaun ho?",
-      guestId: "optional-device-or-guest-id",
       user: "optional-signed-in-email@example.com",
       liveContext: "Optional extra live context from Intridium",
       webSearch: true,
@@ -836,12 +818,10 @@ function docsPayload() {
 
 function identityFromQuery(url, body = {}, req = null) {
   const qUser = url.searchParams.get("user") || url.searchParams.get("email") || "";
-  const qGuest = url.searchParams.get("guestId") || url.searchParams.get("guest_id") || url.searchParams.get("deviceId") || "";
   return resolveGraceIdentity(
     {
       ...body,
       user: body.user || qUser,
-      guestId: body.guestId || qGuest,
     },
     req
   );
