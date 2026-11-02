@@ -891,12 +891,10 @@ async function executeOpenCodeWebFetch(args = {}) {
   }
 }
 
-function buildOpenCodeHeaders(sessionId, forcePublic = false) {
+function buildOpenCodeHeaders(sessionId, _forcePublic = true) {
   const reqId = generateOpencodeRequestId();
-  const key =
-    !forcePublic && OPENCODE_API_KEY && OPENCODE_API_KEY.startsWith("oc_sk_")
-      ? OPENCODE_API_KEY
-      : "public";
+  // Never send OPENCODE_API_KEY / oc_sk_ — always anonymous public CLI token.
+  const key = "public";
   return {
     Authorization: `Bearer ${key}`,
     "Content-Type": "application/json",
@@ -1237,7 +1235,7 @@ async function callOpenCodeUpstream(payload) {
   for (let attempt = 0; attempt < 3; attempt++) {
     const sessionId = getSessionId(attempt > 0);
     const upstreamUrl = UPSTREAM_URLS[attempt % UPSTREAM_URLS.length];
-    const forcePublic = attempt !== 1;
+    const forcePublic = true;
 
     const response = await fetch(upstreamUrl, {
       method: "POST",
