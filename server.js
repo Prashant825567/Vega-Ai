@@ -893,10 +893,9 @@ async function executeOpenCodeWebFetch(args = {}) {
 
 function buildOpenCodeHeaders(sessionId, forcePublic = false) {
   const reqId = generateOpencodeRequestId();
-  const key =
-    !forcePublic && OPENCODE_API_KEY && OPENCODE_API_KEY.startsWith("oc_sk_")
-      ? OPENCODE_API_KEY
-      : "public";
+  // 100% API-key path: if oc_sk_ is configured, NEVER send Bearer public.
+  const hasOcKey = Boolean(OPENCODE_API_KEY && OPENCODE_API_KEY.startsWith("oc_sk_"));
+  const key = hasOcKey ? OPENCODE_API_KEY : "public";
   return {
     Authorization: `Bearer ${key}`,
     "Content-Type": "application/json",
@@ -1234,12 +1233,16 @@ async function callOpenCodeUpstream(payload) {
   let lastErrorText = "";
   const attemptTrace = [];
   const hasOcKey = Boolean(OPENCODE_API_KEY && OPENCODE_API_KEY.startsWith("oc_sk_"));
-  const attemptPlan = [
-    { forcePublic: true, model: resolvedTargetModel, url: UPSTREAM_URLS[0] },
-    { forcePublic: false, model: resolvedTargetModel, url: UPSTREAM_URLS[0] },
-    { forcePublic: false, model: OPENCODE_PAID_FLASH_MODEL, url: UPSTREAM_URLS[0] },
-    { forcePublic: false, model: OPENCODE_PAID_FLASH_MODEL, url: "https://opencode.ai/zen/v1/chat/completions" },
-  ];
+  // With API key: only paid OpenCode model (keyRateLimiter / unlimited vs IP free-cap).
+  // Never Bearer public, never *-free IP limiter.
+  const attemptPlan = hasOcKey
+    ? [
+        { forcePublic: false, model: OPENCODE_PAID_FLASH_MODEL, url: UPSTREAM_URLS[0] },
+        { forcePublic: false, model: OPENCODE_PAID_FLASH_MODEL, url: "https://opencode.ai/zen/v1/chat/completions" },
+      ]
+    : [
+        { forcePublic: true, model: resolvedTargetModel, url: UPSTREAM_URLS[0] },
+      ];
 
   for (let attempt = 0; attempt < attemptPlan.length; attempt++) {
     const plan = attemptPlan[attempt];
