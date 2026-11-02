@@ -1233,16 +1233,14 @@ async function callOpenCodeUpstream(payload) {
   let lastErrorText = "";
   const attemptTrace = [];
   const hasOcKey = Boolean(OPENCODE_API_KEY && OPENCODE_API_KEY.startsWith("oc_sk_"));
-  // With API key: only paid OpenCode model (keyRateLimiter / unlimited vs IP free-cap).
-  // Never Bearer public, never *-free IP limiter.
-  const attemptPlan = hasOcKey
-    ? [
-        { forcePublic: false, model: OPENCODE_PAID_FLASH_MODEL, url: UPSTREAM_URLS[0] },
-        { forcePublic: false, model: OPENCODE_PAID_FLASH_MODEL, url: "https://opencode.ai/zen/v1/chat/completions" },
-      ]
-    : [
-        { forcePublic: true, model: resolvedTargetModel, url: UPSTREAM_URLS[0] },
-      ];
+  // Free model only (`*-free`, cost: 0). Paid flash is NOT used — that would bill OpenCode Go.
+  const attemptPlan = [
+    {
+      forcePublic: !hasOcKey,
+      model: resolvedTargetModel,
+      url: UPSTREAM_URLS[0],
+    },
+  ];
 
   for (let attempt = 0; attempt < attemptPlan.length; attempt++) {
     const plan = attemptPlan[attempt];
