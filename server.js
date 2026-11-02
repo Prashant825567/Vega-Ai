@@ -5251,6 +5251,7 @@ const server = http.createServer(async (req, res) => {
         textAndImageChat: "POST /api/chat",
         customDeepseek: "POST /api/deepseek",
         graceIntridiumChat: "POST /api/grace",
+        graceChatUI: "GET /grace",
         visionChat: "POST /api/vision",
         imageGenerateOrEdit: "POST /api/image",
         imageGenerate: "POST /api/image/generate",
@@ -6785,6 +6786,12 @@ const server = http.createServer(async (req, res) => {
   // 8C. Grace (Intridium) isolated agent (`/api/grace`, `/api/intridium`)
   //     Separate persona + separate chat/image store. Does not touch Vega/Max endpoints or ai_chats.
   if (
+    pathname === "/grace" ||
+    pathname === "/grace/ui" ||
+    pathname === "/grace/chat" ||
+    pathname === "/intridium" ||
+    pathname === "/intridium/ui" ||
+    pathname === "/intridium/chat" ||
     pathname === "/api/grace" ||
     pathname === "/api/intridium" ||
     pathname === "/v1/grace/chat/completions" ||

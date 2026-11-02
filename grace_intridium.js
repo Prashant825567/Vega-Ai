@@ -827,8 +827,31 @@ function identityFromQuery(url, body = {}, req = null) {
   );
 }
 
+const GRACE_UI_PATHS = new Set([
+  "/grace",
+  "/grace/ui",
+  "/grace/chat",
+  "/intridium",
+  "/intridium/ui",
+  "/intridium/chat",
+]);
+
+function serveGraceChatUI(res) {
+  const htmlPath = path.join(__dirname, "public", "grace-chat.html");
+  if (!fs.existsSync(htmlPath)) return false;
+  const html = fs.readFileSync(htmlPath);
+  res.writeHead(200, {
+    "Content-Type": "text/html; charset=utf-8",
+    "Cache-Control": "no-cache",
+    "Content-Length": String(html.length),
+  });
+  res.end(html);
+  return true;
+}
+
 async function handleGraceRequest({ req, res, url, pathname, deps }) {
   const isGracePath =
+    GRACE_UI_PATHS.has(pathname) ||
     pathname === "/api/grace" ||
     pathname === "/api/grace/chat" ||
     pathname === "/api/intridium" ||
@@ -838,6 +861,12 @@ async function handleGraceRequest({ req, res, url, pathname, deps }) {
     pathname.startsWith("/api/grace/") ||
     pathname.startsWith("/api/intridium/");
   if (!isGracePath) return false;
+
+  if (req.method === "GET" && GRACE_UI_PATHS.has(pathname)) {
+    if (serveGraceChatUI(res)) return true;
+    deps.sendJson(res, 500, { success: false, error: "Grace chat UI file missing" });
+    return true;
+  }
 
   // Image view
   const imgViewMatch = pathname.match(/^\/api\/(?:grace|intridium)\/image\/view\/([^/]+)$/);

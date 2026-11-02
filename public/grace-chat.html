@@ -1,0 +1,505 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <title>Grace · Intridium</title>
+  <style>
+    :root {
+      --ink: #0b0712;
+      --ink-2: #140c1c;
+      --panel: rgba(28, 16, 38, 0.72);
+      --line: rgba(245, 214, 176, 0.14);
+      --gold: #e8c48a;
+      --gold-2: #f3d7a8;
+      --rose: #d4a0b8;
+      --mist: #efe6dc;
+      --dim: #9b8ea3;
+      --ok: #8ad4b8;
+      --user: #2a1b38;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body { height: 100%; }
+    body {
+      font-family: "Iowan Old Style", "Palatino Linotype", Palatino, Georgia, serif;
+      background:
+        radial-gradient(1200px 600px at 12% -10%, rgba(212, 160, 184, 0.18), transparent 55%),
+        radial-gradient(900px 500px at 100% 0%, rgba(232, 196, 138, 0.12), transparent 50%),
+        linear-gradient(180deg, #120814 0%, var(--ink) 45%, #07050b 100%);
+      color: var(--mist);
+      overflow: hidden;
+    }
+    body::before {
+      content: "";
+      position: fixed; inset: 0; pointer-events: none; opacity: 0.07;
+      background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='140' height='140'><filter id='n'><feTurbulence type='fractalNoise' baseFrequency='.8' numOctaves='2'/></filter><rect width='100%' height='100%' filter='url(%23n)'/></svg>");
+    }
+    .app {
+      height: 100%;
+      display: grid;
+      grid-template-rows: auto 1fr auto;
+      max-width: 880px;
+      margin: 0 auto;
+      position: relative;
+    }
+    header {
+      display: flex; align-items: center; justify-content: space-between;
+      padding: 16px 20px 12px;
+      border-bottom: 1px solid var(--line);
+      backdrop-filter: blur(16px);
+    }
+    .brand { display: flex; gap: 12px; align-items: center; }
+    .mark {
+      width: 40px; height: 40px; border-radius: 14px;
+      background: linear-gradient(145deg, #f3d7a8, #c989a6 58%, #6e4a86);
+      display: grid; place-items: center;
+      box-shadow: 0 8px 24px rgba(201, 137, 166, 0.28);
+      color: #2a1320; font-weight: 700; font-size: 18px;
+    }
+    .brand h1 {
+      font-size: 20px; font-weight: 600; letter-spacing: 0.04em;
+      background: linear-gradient(90deg, var(--gold-2), var(--rose));
+      -webkit-background-clip: text; background-clip: text; color: transparent;
+    }
+    .brand p { font-size: 11px; letter-spacing: 0.22em; text-transform: uppercase; color: var(--dim); font-family: ui-sans-serif, system-ui, sans-serif; }
+    .hdr-actions { display: flex; gap: 8px; }
+    button.ghost, button.send, button.icon {
+      font-family: ui-sans-serif, system-ui, sans-serif;
+      border: 1px solid var(--line); background: transparent; color: var(--mist);
+      border-radius: 999px; cursor: pointer;
+    }
+    button.ghost { padding: 8px 14px; font-size: 12px; letter-spacing: 0.08em; text-transform: uppercase; }
+    button.ghost:hover, button.icon:hover { border-color: var(--gold); color: var(--gold-2); }
+    .log {
+      overflow-y: auto; padding: 22px 18px 12px;
+      display: flex; flex-direction: column; gap: 18px;
+      scrollbar-width: thin; scrollbar-color: rgba(232,196,138,.25) transparent;
+    }
+    .empty {
+      margin: auto; text-align: center; max-width: 420px; padding: 40px 16px; color: var(--dim);
+    }
+    .empty h2 { color: var(--gold-2); font-weight: 500; font-size: 28px; margin-bottom: 8px; }
+    .empty p { font-family: ui-sans-serif, system-ui, sans-serif; font-size: 14px; line-height: 1.6; }
+    .chips { display: flex; flex-wrap: wrap; gap: 8px; justify-content: center; margin-top: 18px; }
+    .chips button {
+      font-family: ui-sans-serif, system-ui, sans-serif;
+      background: var(--panel); border: 1px solid var(--line); color: var(--mist);
+      padding: 8px 12px; border-radius: 999px; cursor: pointer; font-size: 12px;
+    }
+    .chips button:hover { border-color: var(--gold); }
+    .msg { display: flex; gap: 10px; max-width: 100%; }
+    .msg.user { flex-direction: row-reverse; }
+    .avatar {
+      width: 32px; height: 32px; border-radius: 11px; flex: none;
+      display: grid; place-items: center; font-family: ui-sans-serif, system-ui, sans-serif;
+      font-size: 11px; letter-spacing: 0.06em;
+    }
+    .msg.assistant .avatar { background: linear-gradient(145deg, #f3d7a8, #c989a6); color: #2a1320; }
+    .msg.user .avatar { background: #3a2948; color: var(--gold-2); }
+    .bubble { max-width: min(640px, calc(100% - 48px)); }
+    .user .bubble .text {
+      background: var(--user); border: 1px solid var(--line);
+      padding: 12px 14px; border-radius: 16px 16px 4px 16px;
+      font-family: ui-sans-serif, system-ui, sans-serif; font-size: 14.5px; line-height: 1.55;
+      white-space: pre-wrap;
+    }
+    .panel {
+      background: var(--panel); border: 1px solid var(--line); border-radius: 16px;
+      padding: 10px 12px; margin-bottom: 8px;
+      font-family: ui-sans-serif, system-ui, sans-serif;
+    }
+    .panel h3 {
+      font-size: 10px; letter-spacing: 0.18em; text-transform: uppercase; color: var(--gold);
+      display: flex; align-items: center; gap: 8px; margin-bottom: 6px;
+    }
+    .dot {
+      width: 7px; height: 7px; border-radius: 50%; background: var(--gold);
+      box-shadow: 0 0 0 0 rgba(232,196,138,.7);
+      animation: pulse 1.4s infinite;
+    }
+    @keyframes pulse {
+      70% { box-shadow: 0 0 0 8px rgba(232,196,138,0); }
+    }
+    .thinking {
+      color: #cbb8d4; font-size: 12.5px; line-height: 1.55; white-space: pre-wrap;
+      max-height: 180px; overflow: auto;
+    }
+    .sources { display: flex; flex-direction: column; gap: 6px; }
+    .sources a {
+      color: var(--gold-2); text-decoration: none; font-size: 12px;
+      border: 1px solid var(--line); border-radius: 10px; padding: 8px 10px; display: block;
+    }
+    .sources a:hover { border-color: var(--gold); }
+    .sources .sn { color: var(--dim); font-size: 11px; margin-top: 3px; display: block; }
+    .text.ai {
+      font-family: ui-sans-serif, system-ui, sans-serif;
+      font-size: 15px; line-height: 1.65; white-space: pre-wrap;
+      padding: 4px 2px 0;
+    }
+    .img-card { margin-top: 10px; }
+    .img-card img {
+      display: block; width: 100%; max-width: 420px; border-radius: 14px;
+      border: 1px solid var(--line);
+    }
+    .dl {
+      margin-top: 8px; display: inline-flex; align-items: center; gap: 6px;
+      font-family: ui-sans-serif, system-ui, sans-serif; font-size: 12px;
+      color: var(--ink); background: linear-gradient(90deg, var(--gold-2), var(--rose));
+      border: 0; border-radius: 999px; padding: 8px 12px; cursor: pointer; font-weight: 600;
+    }
+    .status { color: var(--rose); font-size: 12px; font-family: ui-sans-serif, system-ui, sans-serif; margin-top: 6px; }
+    .err { color: #ffb3b3; font-size: 13px; font-family: ui-sans-serif, system-ui, sans-serif; }
+    .composer-wrap {
+      padding: 10px 16px 18px;
+      background: linear-gradient(180deg, transparent, rgba(7,5,11,.85) 30%);
+    }
+    .composer {
+      display: flex; gap: 8px; align-items: flex-end;
+      border: 1px solid var(--line); background: rgba(20,12,28,.88);
+      border-radius: 18px; padding: 8px 8px 8px 14px;
+    }
+    textarea {
+      flex: 1; resize: none; max-height: 140px; min-height: 44px;
+      background: transparent; border: 0; outline: none; color: var(--mist);
+      font-family: ui-sans-serif, system-ui, sans-serif; font-size: 15px; line-height: 1.45;
+      padding: 10px 0;
+    }
+    button.send {
+      width: 44px; height: 44px; border: 0; border-radius: 14px;
+      background: linear-gradient(145deg, #f3d7a8, #c989a6);
+      color: #2a1320; font-size: 18px; flex: none;
+    }
+    button.send:disabled { opacity: 0.45; cursor: not-allowed; }
+    .hint { text-align: center; font-size: 11px; color: var(--dim); margin-top: 8px; font-family: ui-sans-serif, system-ui, sans-serif; }
+  </style>
+</head>
+<body>
+  <div class="app">
+    <header>
+      <div class="brand">
+        <div class="mark">G</div>
+        <div>
+          <h1>Grace</h1>
+          <p>Intridium</p>
+        </div>
+      </div>
+      <div class="hdr-actions">
+        <button class="ghost" id="newChat" type="button">New chat</button>
+      </div>
+    </header>
+    <div class="log" id="log">
+      <div class="empty" id="empty">
+        <h2>Hi, I’m Grace.</h2>
+        <p>Intridium ke andar aapki AI. Live thinking, web research, aur image generation — generated image download bhi kar sakte ho. Bina login ke bhi chat save hoti hai as <b>guest</b>.</p>
+        <div class="chips">
+          <button type="button" data-q="Tum kaun ho?">Tum kaun ho?</button>
+          <button type="button" data-q="Aaj Bitcoin ka price kya hai?">Live Bitcoin price</button>
+          <button type="button" data-q="Generate an image of a golden retriever puppy in a sunlit garden">Image generate</button>
+        </div>
+      </div>
+    </div>
+    <div class="composer-wrap">
+      <form class="composer" id="form">
+        <textarea id="input" rows="1" placeholder="Grace se kuch poocho… image bhi manga sakte ho"></textarea>
+        <button class="send" id="send" type="submit" title="Send">↑</button>
+      </form>
+      <div class="hint">Enter bhejo · Shift+Enter new line · POST /api/grace</div>
+    </div>
+  </div>
+  <script>
+    const logEl = document.getElementById("log");
+    const emptyEl = document.getElementById("empty");
+    const form = document.getElementById("form");
+    const input = document.getElementById("input");
+    const sendBtn = document.getElementById("send");
+    const state = { chatId: null, history: [], busy: false, abort: null };
+
+    function el(tag, cls, text) {
+      const n = document.createElement(tag);
+      if (cls) n.className = cls;
+      if (text != null) n.textContent = text;
+      return n;
+    }
+
+    function addUser(text) {
+      emptyEl?.remove();
+      const row = el("div", "msg user");
+      row.appendChild(el("div", "avatar", "You"));
+      const b = el("div", "bubble");
+      const t = el("div", "text");
+      t.textContent = text;
+      b.appendChild(t);
+      row.appendChild(b);
+      logEl.appendChild(row);
+      logEl.scrollTop = logEl.scrollHeight;
+    }
+
+    function addAssistantShell() {
+      emptyEl?.remove();
+      const row = el("div", "msg assistant");
+      row.appendChild(el("div", "avatar", "G"));
+      const b = el("div", "bubble");
+      const thinkWrap = el("div", "panel");
+      thinkWrap.hidden = true;
+      const th = el("h3");
+      th.appendChild(el("span", "dot"));
+      th.appendChild(document.createTextNode(" Live thinking"));
+      const thinkBody = el("div", "thinking");
+      thinkWrap.appendChild(th);
+      thinkWrap.appendChild(thinkBody);
+
+      const researchWrap = el("div", "panel");
+      researchWrap.hidden = true;
+      const rh = el("h3", null, "Web research");
+      const sources = el("div", "sources");
+      researchWrap.appendChild(rh);
+      researchWrap.appendChild(sources);
+
+      const status = el("div", "status");
+      const text = el("div", "text ai");
+      const imgCard = el("div", "img-card");
+      const err = el("div", "err");
+      b.append(thinkWrap, researchWrap, status, text, imgCard, err);
+      row.appendChild(b);
+      logEl.appendChild(row);
+      return { thinkWrap, thinkBody, researchWrap, sources, status, text, imgCard, err, row };
+    }
+
+    function renderSources(box, list) {
+      box.innerHTML = "";
+      (list || []).forEach((s) => {
+        const a = document.createElement("a");
+        a.href = s.url || "#";
+        a.target = "_blank";
+        a.rel = "noopener";
+        a.textContent = s.title || s.url || "Source";
+        if (s.snippet) {
+          const sn = el("span", "sn", s.snippet.slice(0, 160));
+          a.appendChild(sn);
+        }
+        box.appendChild(a);
+      });
+    }
+
+    function attachImage(card, url, id) {
+      card.innerHTML = "";
+      if (!url) return;
+      const img = document.createElement("img");
+      img.src = url;
+      img.alt = "Generated by Grace";
+      const btn = el("button", "dl", "Download image");
+      btn.type = "button";
+      btn.addEventListener("click", async () => {
+        try {
+          const res = await fetch(url);
+          const blob = await res.blob();
+          const a = document.createElement("a");
+          a.href = URL.createObjectURL(blob);
+          a.download = id || "grace-image.jpg";
+          document.body.appendChild(a);
+          a.click();
+          a.remove();
+          setTimeout(() => URL.revokeObjectURL(a.href), 1500);
+        } catch {
+          window.open(url, "_blank");
+        }
+      });
+      card.append(img, btn);
+    }
+
+    function autosize() {
+      input.style.height = "auto";
+      input.style.height = Math.min(input.scrollHeight, 140) + "px";
+    }
+    input.addEventListener("input", autosize);
+    input.addEventListener("keydown", (e) => {
+      if (e.key === "Enter" && !e.shiftKey) {
+        e.preventDefault();
+        form.requestSubmit();
+      }
+    });
+    document.querySelectorAll("[data-q]").forEach((b) => {
+      b.addEventListener("click", () => {
+        input.value = b.getAttribute("data-q");
+        form.requestSubmit();
+      });
+    });
+    document.getElementById("newChat").addEventListener("click", () => {
+      if (state.abort) state.abort.abort();
+      state.chatId = null;
+      state.history = [];
+      state.busy = false;
+      sendBtn.disabled = false;
+      logEl.innerHTML = "";
+      logEl.appendChild(emptyEl);
+    });
+
+    async function readSSE(res, onEvent) {
+      const reader = res.body.getReader();
+      const dec = new TextDecoder();
+      let buf = "";
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buf += dec.decode(value, { stream: true });
+        buf = buf.replace(/\r\n/g, "\n");
+        let idx;
+        while ((idx = buf.indexOf("\n\n")) !== -1) {
+          const raw = buf.slice(0, idx);
+          buf = buf.slice(idx + 2);
+          if (!raw.trim()) continue;
+          let event = "message";
+          const dataLines = [];
+          for (const line of raw.split("\n")) {
+            if (line.startsWith("event:")) event = line.slice(6).trim();
+            else if (line.startsWith("data:")) dataLines.push(line.slice(5).trim());
+          }
+          const dataStr = dataLines.join("\n");
+          if (dataStr === "[DONE]") {
+            onEvent("done", {});
+            continue;
+          }
+          let payload = dataStr;
+          try { payload = JSON.parse(dataStr); } catch {}
+          onEvent(event, payload);
+        }
+      }
+    }
+
+    async function send(text) {
+      if (!text || state.busy) return;
+      state.busy = true;
+      sendBtn.disabled = true;
+      addUser(text);
+      const ui = addAssistantShell();
+      const history = state.history.map((m) => ({ role: m.role, content: m.content }));
+      const ac = new AbortController();
+      state.abort = ac;
+      let reply = "";
+      let thinking = "";
+      try {
+        const res = await fetch("/api/grace", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Accept: "text/event-stream" },
+          signal: ac.signal,
+          body: JSON.stringify({
+            prompt: text,
+            history,
+            chatId: state.chatId || undefined,
+            stream: true,
+          }),
+        });
+        if (!res.ok) {
+          const err = await res.json().catch(() => ({ error: res.statusText }));
+          throw new Error(err.error || err.details || ("HTTP " + res.status));
+        }
+        const ct = res.headers.get("content-type") || "";
+        const applyFinal = (p) => {
+          if (!p || typeof p !== "object") return;
+          if (p.chatId) state.chatId = p.chatId;
+          if (p.thinking || p.reasoning) {
+            thinking = p.thinking || p.reasoning;
+            ui.thinkWrap.hidden = !thinking;
+            if (thinking) ui.thinkBody.textContent = thinking;
+          }
+          if (p.usedWebSearch || (p.webSearchSources && p.webSearchSources.length)) {
+            ui.researchWrap.hidden = false;
+            renderSources(ui.sources, p.webSearchSources || []);
+          }
+          if (p.reply) {
+            reply = p.reply;
+            ui.text.textContent = reply;
+          }
+          const url = p.imageUrl || (p.image && (p.image.url || p.image.imageUrl));
+          const id = p.imageId || (p.image && p.image.id);
+          if (url) {
+            attachImage(ui.imgCard, url, id);
+            ui.status.textContent = "";
+          }
+          if (p.error) ui.err.textContent = String(p.error);
+        };
+
+        if (ct.includes("text/event-stream")) {
+          await readSSE(res, (event, payload) => {
+            const p = payload && typeof payload === "object" ? payload : {};
+            const delta = (p.choices && p.choices[0] && p.choices[0].delta) || {};
+            const tokThink = p.token || p.thinkingDelta || delta.thinking || delta.reasoning || delta.reasoning_content || "";
+            const tokText = p.replyDelta || p.delta || delta.content || "";
+
+            if (event === "thinking" || p.type === "thinking_delta" || p.type === "prompt_delta") {
+              if (tokThink) thinking += tokThink;
+              else if (p.thinking) thinking = p.thinking;
+              ui.thinkWrap.hidden = false;
+              ui.thinkBody.textContent = thinking || p.thinking || "";
+              logEl.scrollTop = logEl.scrollHeight;
+            }
+            if (event === "websearch" || p.type === "websearch" || p.tool === "websearch") {
+              ui.researchWrap.hidden = false;
+              ui.status.textContent = p.statusMessage || "Searching the web…";
+              if (p.searchQueries && p.searchQueries.length) {
+                ui.sources.innerHTML = "";
+                p.searchQueries.forEach((q) => ui.sources.appendChild(el("div", "sn", "Query: " + q)));
+              }
+              if (p.webSearchSources && p.webSearchSources.length) {
+                renderSources(ui.sources, p.webSearchSources);
+                ui.status.textContent = "";
+              }
+            }
+            if (event === "image_status" || event === "tool_call" || p.isImageTask) {
+              ui.status.textContent = p.statusMessage || p.imageStatus || "Image taiyar ho rahi hai…";
+              if (p.maxPrompt && p.type === "prompt_delta") {
+                ui.thinkWrap.hidden = false;
+                ui.thinkBody.textContent = p.thinking || p.maxPrompt;
+              }
+            }
+            if (event === "image_ready") {
+              applyFinal(p);
+            }
+            if (tokText && event !== "thinking") {
+              reply += tokText;
+              ui.text.textContent = reply;
+              logEl.scrollTop = logEl.scrollHeight;
+            }
+            if (event === "error") {
+              ui.err.textContent = p.error || p.details || "Stream error";
+            }
+            if (event === "done" || event === "message") {
+              applyFinal(p);
+            }
+            logEl.scrollTop = logEl.scrollHeight;
+          });
+        } else {
+          const data = await res.json();
+          applyFinal(data);
+        }
+        const shown = (ui.text.textContent || "").trim() || reply;
+        state.history.push({ role: "user", content: text });
+        state.history.push({ role: "assistant", content: shown || (ui.imgCard.querySelector("img") ? "Generated an image." : "") });
+        ui.querySelector?.();
+        const liveDot = ui.thinkWrap.querySelector(".dot");
+        if (liveDot) liveDot.style.animation = "none";
+        if (!shown && !ui.imgCard.querySelector("img") && !ui.err.textContent) {
+          ui.err.textContent = "Koi reply nahi aaya.";
+        }
+      } catch (err) {
+        if (err.name !== "AbortError") ui.err.textContent = err.message || String(err);
+      } finally {
+        state.busy = false;
+        state.abort = null;
+        sendBtn.disabled = false;
+        input.focus();
+        logEl.scrollTop = logEl.scrollHeight;
+      }
+    }
+
+    form.addEventListener("submit", (e) => {
+      e.preventDefault();
+      const text = input.value.trim();
+      if (!text) return;
+      input.value = "";
+      autosize();
+      send(text);
+    });
+  </script>
+</body>
+</html>
