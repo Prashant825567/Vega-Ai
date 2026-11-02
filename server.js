@@ -5178,6 +5178,28 @@ function checkAuth(req) {
   return token === BACKEND_API_KEY;
 }
 
+// ─── Grace (Intridium) isolated agent — separate store, no edits to Vega/Max ──
+const { handleGraceRequest } = require("./grace_intridium");
+const GRACE_DEPS = {
+  sendJson,
+  sendSSEEvent,
+  readJsonBody,
+  runOpenCodeAgentWithTools,
+  callOpenCodeUpstream,
+  collectSSEStream,
+  detectImageTaskIntent,
+  parseModelImageFallback,
+  resolveFlux3Dimensions,
+  sanitizePromptForNvidiaFlux3,
+  debrandForNvidiaCosmos,
+  rewritePromptForNvidiaGuardrail,
+  getNvidiaApiKey,
+  createLiveStreamEmitter,
+  DEFAULT_MODEL,
+  NVIDIA_IMAGE_MODEL,
+  NVIDIA_IMAGE_API_URL,
+};
+
 // ─── Pure Headless HTTP Server ───────────────────────────────────────────────
 const server = http.createServer(async (req, res) => {
   setCorsHeaders(res);
@@ -5228,6 +5250,7 @@ const server = http.createServer(async (req, res) => {
         prompt: "GET /api/prompt",
         textAndImageChat: "POST /api/chat",
         customDeepseek: "POST /api/deepseek",
+        graceIntridiumChat: "POST /api/grace",
         visionChat: "POST /api/vision",
         imageGenerateOrEdit: "POST /api/image",
         imageGenerate: "POST /api/image/generate",
@@ -6757,6 +6780,19 @@ const server = http.createServer(async (req, res) => {
         error: err.message || "Internal server error",
       });
     }
+  }
+
+  // 8C. Grace (Intridium) isolated agent (`/api/grace`, `/api/intridium`)
+  //     Separate persona + separate chat/image store. Does not touch Vega/Max endpoints or ai_chats.
+  if (
+    pathname === "/api/grace" ||
+    pathname === "/api/intridium" ||
+    pathname === "/v1/grace/chat/completions" ||
+    pathname.startsWith("/api/grace/") ||
+    pathname.startsWith("/api/intridium/")
+  ) {
+    const handled = await handleGraceRequest({ req, res, url, pathname, deps: GRACE_DEPS });
+    if (handled) return;
   }
 
   // 9. High-Level Chat History Backend Routes (`/api/history/*`)
