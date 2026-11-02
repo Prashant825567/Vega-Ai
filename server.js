@@ -1112,6 +1112,72 @@ function normalizeMessages(body, defaultSystem = DEFAULT_SYSTEM_PROMPT) {
   return messages;
 }
 
+const NVIDIA_CHAT_URL = "https://integrate.api.nvidia.com/v1/chat/completions";
+const NVIDIA_CHAT_MODELS = [
+  (process.env.NVIDIA_CHAT_MODEL || "deepseek-ai/deepseek-v4-flash").trim(),
+  "minimaxai/minimax-m3.1-flash",
+  "openai/gpt-oss-20b",
+].filter(Boolean);
+
+function messagesForNvidiaChat(preparedMessages) {
+  return (preparedMessages || [])
+    .filter((m) => m && m.role && m.role !== "tool")
+    .map((m, i) => {
+      let content = "";
+      if (typeof m.content === "string") content = m.content;
+      else if (Array.isArray(m.content)) {
+        content = m.content.map((p) => (p && (p.text || p.content)) || "").join("\n");
+      } else if (m.content != null) {
+        content = JSON.stringify(m.content);
+      }
+      if (i === 0 && (m.role === "system" || m.role === "developer")) {
+        content = content.split("You are powered by the model named")[0].trim();
+      }
+      return {
+        role: m.role === "developer" ? "system" : m.role,
+        content,
+      };
+    });
+}
+
+/**
+ * OpenCode-key-free fallback. Used only when OpenCode `Bearer public` is rate-limited.
+ * Never sends OPENCODE_API_KEY.
+ */
+async function callNvidiaChatFallback(preparedMessages, payload) {
+  const nvidiaApiKey = getNvidiaApiKey();
+  if (!nvidiaApiKey) return null;
+  const messages = messagesForNvidiaChat(preparedMessages);
+  if (messages.length === 0) return null;
+  const maxTokens =
+    typeof payload.max_tokens === "number" ? Math.min(payload.max_tokens, 4096) : 2048;
+  const bodyBase = {
+    messages,
+    stream: true,
+    max_tokens: maxTokens,
+  };
+  if (typeof payload.temperature === "number") bodyBase.temperature = payload.temperature;
+
+  for (const model of NVIDIA_CHAT_MODELS) {
+    try {
+      const response = await fetch(NVIDIA_CHAT_URL, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${nvidiaApiKey}`,
+          Accept: "text/event-stream",
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ ...bodyBase, model }),
+      });
+      if (response.ok && response.body) {
+        return { ok: true, response, model, sessionId: "nvidia-fallback" };
+      }
+      await response.text().catch(() => "");
+    } catch {}
+  }
+  return null;
+}
+
 // ─── Step 2 (LLM): OpenCode Upstream Call (`deepseek-v4.1-flash-free`) ───────
 async function callOpenCodeUpstream(payload) {
   const existingTools = Array.isArray(payload.tools) ? payload.tools : [];
@@ -1261,6 +1327,12 @@ async function callOpenCodeUpstream(payload) {
       continue;
     }
     break;
+  }
+
+  // OpenCode public IP limit (429) — never use OPENCODE_API_KEY; fall back to NVIDIA chat.
+  const nvidiaFallback = await callNvidiaChatFallback(preparedMessages, payload);
+  if (nvidiaFallback && nvidiaFallback.ok) {
+    return nvidiaFallback;
   }
 
   return {
