@@ -891,10 +891,12 @@ async function executeOpenCodeWebFetch(args = {}) {
   }
 }
 
-function buildOpenCodeHeaders(sessionId, _forcePublic = true) {
+function buildOpenCodeHeaders(sessionId, forcePublic = false) {
   const reqId = generateOpencodeRequestId();
-  // Never send OPENCODE_API_KEY / oc_sk_ — always anonymous public CLI token.
-  const key = "public";
+  const key =
+    !forcePublic && OPENCODE_API_KEY && OPENCODE_API_KEY.startsWith("oc_sk_")
+      ? OPENCODE_API_KEY
+      : "public";
   return {
     Authorization: `Bearer ${key}`,
     "Content-Type": "application/json",
@@ -1112,71 +1114,7 @@ function normalizeMessages(body, defaultSystem = DEFAULT_SYSTEM_PROMPT) {
   return messages;
 }
 
-const NVIDIA_CHAT_URL = "https://integrate.api.nvidia.com/v1/chat/completions";
-const NVIDIA_CHAT_MODELS = [
-  (process.env.NVIDIA_CHAT_MODEL || "deepseek-ai/deepseek-v4-flash").trim(),
-  "minimaxai/minimax-m3.1-flash",
-  "openai/gpt-oss-20b",
-].filter(Boolean);
-
-function messagesForNvidiaChat(preparedMessages) {
-  return (preparedMessages || [])
-    .filter((m) => m && m.role && m.role !== "tool")
-    .map((m, i) => {
-      let content = "";
-      if (typeof m.content === "string") content = m.content;
-      else if (Array.isArray(m.content)) {
-        content = m.content.map((p) => (p && (p.text || p.content)) || "").join("\n");
-      } else if (m.content != null) {
-        content = JSON.stringify(m.content);
-      }
-      if (i === 0 && (m.role === "system" || m.role === "developer")) {
-        content = content.split("You are powered by the model named")[0].trim();
-      }
-      return {
-        role: m.role === "developer" ? "system" : m.role,
-        content,
-      };
-    });
-}
-
-/**
- * OpenCode-key-free fallback. Used only when OpenCode `Bearer public` is rate-limited.
- * Never sends OPENCODE_API_KEY.
- */
-async function callNvidiaChatFallback(preparedMessages, payload) {
-  const nvidiaApiKey = getNvidiaApiKey();
-  if (!nvidiaApiKey) return null;
-  const messages = messagesForNvidiaChat(preparedMessages);
-  if (messages.length === 0) return null;
-  const maxTokens =
-    typeof payload.max_tokens === "number" ? Math.min(payload.max_tokens, 4096) : 2048;
-  const bodyBase = {
-    messages,
-    stream: true,
-    max_tokens: maxTokens,
-  };
-  if (typeof payload.temperature === "number") bodyBase.temperature = payload.temperature;
-
-  for (const model of NVIDIA_CHAT_MODELS) {
-    try {
-      const response = await fetch(NVIDIA_CHAT_URL, {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${nvidiaApiKey}`,
-          Accept: "text/event-stream",
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({ ...bodyBase, model }),
-      });
-      if (response.ok && response.body) {
-        return { ok: true, response, model, sessionId: "nvidia-fallback" };
-      }
-      await response.text().catch(() => "");
-    } catch {}
-  }
-  return null;
-}
+const OPENCODE_PAID_FLASH_MODEL = "deepseek-v4.1-flash";
 
 // ─── Step 2 (LLM): OpenCode Upstream Call (`deepseek-v4.1-flash-free`) ───────
 async function callOpenCodeUpstream(payload) {
@@ -1292,33 +1230,39 @@ async function callOpenCodeUpstream(payload) {
     upstreamBody.temperature = payload.temperature;
   }
 
-  const bodyJson = JSON.stringify(upstreamBody);
-
   let lastStatus = 502;
   let lastErrorText = "";
   const attemptTrace = [];
+  const hasOcKey = Boolean(OPENCODE_API_KEY && OPENCODE_API_KEY.startsWith("oc_sk_"));
+  const attemptPlan = [
+    { forcePublic: true, model: resolvedTargetModel, url: UPSTREAM_URLS[0] },
+    { forcePublic: false, model: resolvedTargetModel, url: UPSTREAM_URLS[0] },
+    { forcePublic: false, model: OPENCODE_PAID_FLASH_MODEL, url: UPSTREAM_URLS[0] },
+    { forcePublic: false, model: OPENCODE_PAID_FLASH_MODEL, url: "https://opencode.ai/zen/v1/chat/completions" },
+  ];
 
-  for (let attempt = 0; attempt < 3; attempt++) {
+  for (let attempt = 0; attempt < attemptPlan.length; attempt++) {
+    const plan = attemptPlan[attempt];
+    if (!plan.forcePublic && !hasOcKey) continue;
     const sessionId = getSessionId(attempt > 0);
-    const upstreamUrl = UPSTREAM_URLS[attempt % UPSTREAM_URLS.length];
-    const forcePublic = true;
-
-    const response = await fetch(upstreamUrl, {
+    const bodyForAttempt = { ...upstreamBody, model: plan.model };
+    const response = await fetch(plan.url, {
       method: "POST",
-      headers: buildOpenCodeHeaders(sessionId, forcePublic),
-      body: bodyJson,
+      headers: buildOpenCodeHeaders(sessionId, plan.forcePublic),
+      body: JSON.stringify(bodyForAttempt),
     });
 
     if (response.ok) {
-      return { ok: true, response, model: upstreamBody.model, sessionId };
+      return { ok: true, response, model: plan.model, sessionId };
     }
 
     lastStatus = response.status;
     lastErrorText = await response.text().catch(() => "");
     attemptTrace.push({
       attempt,
-      url: upstreamUrl,
-      forcePublic,
+      url: plan.url,
+      forcePublic: plan.forcePublic,
+      model: plan.model,
       status: response.status,
       runtime: process.versions.bun ? `bun/${process.versions.bun}` : `node/${process.version}`,
     });
@@ -1327,12 +1271,6 @@ async function callOpenCodeUpstream(payload) {
       continue;
     }
     break;
-  }
-
-  // OpenCode public IP limit (429) — never use OPENCODE_API_KEY; fall back to NVIDIA chat.
-  const nvidiaFallback = await callNvidiaChatFallback(preparedMessages, payload);
-  if (nvidiaFallback && nvidiaFallback.ok) {
-    return nvidiaFallback;
   }
 
   return {
