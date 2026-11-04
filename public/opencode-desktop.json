@@ -1,0 +1,24 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "model": "vega/deepseek-v4.1-flash-free",
+  "provider": {
+    "opencode": {
+      "options": {
+        "baseURL": "https://vega-ai-6m2k.onrender.com/inference/openai/v1"
+      }
+    },
+    "vega": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "Vega Render OpenCode Proxy",
+      "options": {
+        "baseURL": "https://vega-ai-6m2k.onrender.com/v1/deepseek",
+        "apiKey": "public"
+      },
+      "models": {
+        "deepseek-v4.1-flash-free": {
+          "name": "DeepSeek V4.1 Flash Free (via Render)"
+        }
+      }
+    }
+  }
+}

@@ -5187,6 +5187,110 @@ function checkAuth(req) {
   return token === BACKEND_API_KEY;
 }
 
+async function proxyOpenCodeDesktopGateway(req, res) {
+  const body = await readJsonBody(req);
+  if (!body || typeof body !== "object") {
+    return sendJson(res, 400, { error: { message: "JSON body required", type: "invalid_request" } });
+  }
+  if (!body.model) body.model = DEFAULT_MODEL;
+  const hasOcKey = Boolean(OPENCODE_API_KEY && OPENCODE_API_KEY.startsWith("oc_sk_"));
+  const urls = [
+    "https://opencode.ai/inference/openai/v1/chat/completions",
+    "https://opencode.ai/zen/v1/chat/completions",
+  ];
+  let lastStatus = 502;
+  let lastText = "";
+  for (let i = 0; i < urls.length; i++) {
+    const sessionId = getSessionId(i > 0);
+    const upstream = await fetch(urls[i], {
+      method: "POST",
+      headers: buildOpenCodeHeaders(sessionId, !hasOcKey),
+      body: JSON.stringify(body),
+    });
+    if (upstream.ok && upstream.body) {
+      const ct = upstream.headers.get("content-type") || "text/event-stream; charset=utf-8";
+      setCorsHeaders(res);
+      res.writeHead(upstream.status, {
+        "Content-Type": ct,
+        "Cache-Control": "no-cache, no-transform",
+        Connection: "keep-alive",
+        "X-Accel-Buffering": "no",
+      });
+      if (typeof res.flushHeaders === "function") {
+        try {
+          res.flushHeaders();
+        } catch {}
+      }
+      const reader = upstream.body.getReader();
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          if (value && !res.writableEnded) res.write(Buffer.from(value));
+        }
+      } finally {
+        try {
+          await reader.cancel();
+        } catch {}
+      }
+      if (!res.writableEnded) res.end();
+      return;
+    }
+    lastStatus = upstream.status;
+    lastText = await upstream.text().catch(() => "");
+    if (!(upstream.status === 429 || upstream.status === 403 || upstream.status >= 500)) break;
+  }
+  return sendJson(res, lastStatus || 502, {
+    error: {
+      message: "OpenCode gateway error via Render proxy",
+      type: "upstream_error",
+      status: lastStatus,
+    },
+  });
+}
+
+const OPENCODE_DESKTOP_PROXY_PATHS = new Set([
+  "/inference/openai/v1/chat/completions",
+  "/zen/v1/chat/completions",
+  "/opencode/v1/chat/completions",
+]);
+
+function opencodeDesktopConfigPayload() {
+  return {
+    ok: true,
+    flow: "OpenCode Desktop -> https://vega-ai-6m2k.onrender.com -> OpenCode gateway (Render public IP)",
+    desktopConfigFile: {
+      mac_linux: "~/.config/opencode/opencode.json",
+      windows: "%USERPROFILE%\\.config\\opencode\\opencode.json",
+    },
+    opencodeJson: {
+      $schema: "https://opencode.ai/config.json",
+      model: "vega/deepseek-v4.1-flash-free",
+      provider: {
+        opencode: {
+          options: {
+            baseURL: "https://vega-ai-6m2k.onrender.com/inference/openai/v1",
+          },
+        },
+        vega: {
+          npm: "@ai-sdk/openai-compatible",
+          name: "Vega Render OpenCode Proxy",
+          options: {
+            baseURL: "https://vega-ai-6m2k.onrender.com/v1/deepseek",
+            apiKey: "public",
+          },
+          models: {
+            "deepseek-v4.1-flash-free": {
+              name: "DeepSeek V4.1 Flash Free (via Render)",
+            },
+          },
+        },
+      },
+    },
+    note: "OpenCode Desktop restart ke baad model picker se 'vega/deepseek-v4.1-flash-free' ya OpenCode provider select karo. Direct opencode.ai mat hit karo.",
+  };
+}
+
 // ─── Grace (Intridium) isolated agent — separate store, no edits to Vega/Max ──
 const { handleGraceRequest } = require("./grace_intridium");
 const GRACE_DEPS = {
@@ -6495,6 +6599,27 @@ const server = http.createServer(async (req, res) => {
     }
   }
 
+  // 8A. OpenCode Desktop proxy: Desktop -> this Render server -> OpenCode gateway
+  if (OPENCODE_DESKTOP_PROXY_PATHS.has(pathname)) {
+    if (req.method === "GET") {
+      return sendJson(res, 200, opencodeDesktopConfigPayload());
+    }
+    if (req.method !== "POST") {
+      return sendJson(res, 405, { error: { message: "Use POST" } });
+    }
+    try {
+      return await proxyOpenCodeDesktopGateway(req, res);
+    } catch (err) {
+      if (res.headersSent) {
+        try {
+          res.end();
+        } catch {}
+        return;
+      }
+      return sendJson(res, 500, { error: { message: err.message || "Proxy error" } });
+    }
+  }
+
   // 8B. Standalone Custom DeepSeek v4.1 Flash Unlimited Endpoint (`/api/deepseek`)
   //     - Uses the exact same Unlimited Bun 1.4.4 + OpenCode 1.19.4 CLI signature (`deepseek-v4.1-flash-free`)
   //     - ZERO hardcoded Max v1.0 / Vega persona or built-in system prompt — 100% controlled by the app!
@@ -6506,9 +6631,7 @@ const server = http.createServer(async (req, res) => {
     pathname === "/api/raw-chat" ||
     pathname === "/api/custom-chat" ||
     pathname === "/api/opencode" ||
-    pathname === "/v1/deepseek/chat/completions" ||
-    pathname === "/opencode/v1/chat/completions" ||
-    pathname === "/inference/openai/v1/chat/completions"
+    pathname === "/v1/deepseek/chat/completions"
   ) {
     if (req.method === "GET") {
       return sendJson(res, 200, {
