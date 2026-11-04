@@ -6805,7 +6805,7 @@ const server = http.createServer(async (req, res) => {
 
       const isStream = body.stream === true;
       const liveStream = isStream
-        ? createLiveChatSSEStreamer(res, { model: body.model || DEFAULT_MODEL })
+        ? createLiveStreamEmitter(res, body.model || DEFAULT_MODEL)
         : null;
 
       const disableReasoning =
