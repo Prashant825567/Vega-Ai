@@ -5259,6 +5259,7 @@ const server = http.createServer(async (req, res) => {
         prompt: "GET /api/prompt",
         textAndImageChat: "POST /api/chat",
         customDeepseek: "POST /api/deepseek",
+        opencodeProxy: "POST /v1/deepseek/chat/completions",
         graceIntridiumChat: "POST /api/grace",
         graceChatUI: "GET /grace",
         visionChat: "POST /api/vision",
@@ -6504,18 +6505,25 @@ const server = http.createServer(async (req, res) => {
     pathname === "/api/deepseek/chat" ||
     pathname === "/api/raw-chat" ||
     pathname === "/api/custom-chat" ||
-    pathname === "/v1/deepseek/chat/completions"
+    pathname === "/api/opencode" ||
+    pathname === "/v1/deepseek/chat/completions" ||
+    pathname === "/opencode/v1/chat/completions" ||
+    pathname === "/inference/openai/v1/chat/completions"
   ) {
     if (req.method === "GET") {
       return sendJson(res, 200, {
         ok: true,
         endpoint: "POST /api/deepseek",
+        flow: "Your app -> Render (this API) -> OpenCode (Render public IP)",
         aliases: [
           "POST /api/deepseek",
           "POST /api/deepseek/chat",
           "POST /api/raw-chat",
           "POST /api/custom-chat",
+          "POST /api/opencode",
           "POST /v1/deepseek/chat/completions",
+          "POST /opencode/v1/chat/completions",
+          "POST /inference/openai/v1/chat/completions",
         ],
         model: DEFAULT_MODEL,
         runtime: process.versions.bun ? `bun/${process.versions.bun}` : `node/${process.version}`,
